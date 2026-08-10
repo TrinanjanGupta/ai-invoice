@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-gray-50 text-gray-900 antialiased;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center gap-2 px-4 py-2 bg-brand-600 text-white
+           rounded-lg font-medium text-sm hover:bg-brand-700 transition-colors
+           disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center gap-2 px-4 py-2 bg-white text-gray-700
+           border border-gray-200 rounded-lg font-medium text-sm
+           hover:bg-gray-50 transition-colors;
+  }
+  .card {
+    @apply bg-white rounded-xl border border-gray-200 shadow-sm;
+  }
+  .field-input {
+    @apply w-full px-3 py-2 text-sm border border-gray-200 rounded-lg
+           focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent
+           bg-white transition-shadow;
+  }
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+}
+
+/* Confidence bar */
+.conf-bar { @apply h-1.5 rounded-full bg-gray-100 overflow-hidden; }
+.conf-bar-fill { @apply h-full rounded-full transition-all duration-500; }
+
+/* Upload drop zone */
+.dropzone-active { @apply border-brand-500 bg-brand-50; }
+
+/* Spinner */
+@keyframes spin { to { transform: rotate(360deg); } }
+.spinner { animation: spin 0.8s linear infinite; }
+
+/* Fade in */
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.fade-in { animation: fadeIn 0.25s ease; }

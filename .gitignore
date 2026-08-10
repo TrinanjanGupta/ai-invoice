@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+
+# Environment
+.env
+*.env.local
+
+# ML Models (large files — store separately)
+data/models/
+data/runs/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Data
+data/raw/
+data/outputs/
+data/layoutlm_dataset/
+
+# Node
+review_ui/node_modules/
+review_ui/dist/
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/
