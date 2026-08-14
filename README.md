@@ -73,8 +73,10 @@ cp .env.example .env
 # Terminal 1: API server
 uvicorn api.main:app --reload --port 8000
 
-# Terminal 2: Celery worker
+# Terminal 2: Celery worker (Linux/macOS)
 celery -A worker.celery_app worker --loglevel=info
+# On Windows PowerShell:
+celery -A worker.celery_app worker --loglevel=info --pool=solo
 
 # Terminal 3: Frontend
 cd review_ui && npm install && npm run dev

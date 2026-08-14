@@ -85,10 +85,26 @@ FIELD_PROMPTS = {
         "Extract the bank name from the payment details in the text. "
         "Return ONLY the bank name. If not found, return UNKNOWN."
     ),
-    "ifsc_code": (
-        "Extract the IFSC code (bank branch code) from the text. "
-        "Format: 4 letters + 0 + 6 alphanumeric. "
-        "Return ONLY the IFSC code. If not found, return UNKNOWN."
+    "place_of_supply": (
+        "Extract the Place of Supply (state name or 2-digit GST state code + state) from the header text. "
+        "Return ONLY the place of supply (e.g. 19-West Bengal or Maharashtra). "
+        "If not found, return UNKNOWN."
+    ),
+    "branch_name": (
+        "Extract the bank branch name from the payment/bank details in the text. "
+        "Return ONLY the branch name. If not found, return UNKNOWN."
+    ),
+    "account_name": (
+        "Extract the beneficiary / account holder name from the bank details in the text. "
+        "Return ONLY the account name. If not found, return UNKNOWN."
+    ),
+    "amount_in_words": (
+        "Extract the total amount written in words from the invoice (e.g. INR Ten Thousand Only). "
+        "Return ONLY the words. If not found, return UNKNOWN."
+    ),
+    "round_off": (
+        "Extract the round off / rounding adjustment amount from the totals. "
+        "Return ONLY the numeric value (e.g. 0.45 or -0.20). If not found, return UNKNOWN."
     ),
 }
 
@@ -279,11 +295,13 @@ class OllamaClient:
             return
 
         fields_to_check = [
-            "invoice_number", "invoice_date", "due_date",
+            "invoice_number", "invoice_date", "due_date", "place_of_supply",
             "vendor_name", "vendor_gstin",
             "buyer_name", "buyer_gstin",
             "grand_total", "subtotal", "tax_amount",
-            "cgst", "sgst", "igst",
+            "cgst", "sgst", "igst", "round_off",
+            "bank_name", "branch_name", "account_name", "account_number", "ifsc_code",
+            "amount_in_words",
         ]
 
         # Collect fields that need LLM help

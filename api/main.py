@@ -176,11 +176,21 @@ async def get_invoice_status(job_id: str):
     if not record:
         raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
 
+    builder_data = None
+    if record.output_json:
+        try:
+            from validation.validator import InvoiceSchema
+            schema_obj = InvoiceSchema(**record.output_json)
+            builder_data = schema_obj.to_invoice_builder_json()
+        except Exception:
+            pass
+
     return JobStatusResponse(
         job_id=record.job_id,
         status=record.status,
         filename=record.filename,
         invoice=record.output_json,
+        invoice_builder_data=builder_data,
         overall_confidence=record.overall_confidence,
         needs_review=record.needs_review,
         review_reasons=record.review_reasons or [],

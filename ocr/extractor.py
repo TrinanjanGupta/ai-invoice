@@ -56,7 +56,7 @@ class InvoiceOCR:
             logger.warning(f"PaddleOCR initialisation failed/not installed ({e}). Trying EasyOCR fallback...")
             try:
                 import easyocr
-                self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu)
+                self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
                 logger.info(f"EasyOCR initialised (lang={self.lang}, gpu={self.use_gpu}) as fallback")
             except ImportError:
                 logger.error("Neither PaddleOCR nor EasyOCR is installed. Run: pip install easyocr")

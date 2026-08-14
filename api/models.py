@@ -17,6 +17,7 @@ class JobStatusResponse(BaseModel):
     status: str
     filename: str
     invoice: Optional[dict] = None
+    invoice_builder_data: Optional[dict] = None
     overall_confidence: Optional[float] = None
     needs_review: bool = False
     review_reasons: list[str] = []

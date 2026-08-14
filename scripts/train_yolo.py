@@ -111,7 +111,13 @@ def main():
     )
 
     # Copy best weights to configured path
-    best_weights = Path("data/runs/invoice_yolo/weights/best.pt")
+    best_weights = Path(results.save_dir) / "weights" / "best.pt"
+    if not best_weights.exists():
+        # Fallback search
+        found = list(Path("runs").rglob("best.pt")) + list(Path("data/runs").rglob("best.pt"))
+        if found:
+            best_weights = found[-1]
+
     if best_weights.exists():
         output = Path(args.output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +126,7 @@ def main():
         print(f"\n✓ Best weights saved to: {output}")
         print(f"  Update YOLO_MODEL_PATH={output} in your .env")
     else:
-        print("\nWARNING: best.pt not found — check data/runs/invoice_yolo/weights/")
+        print(f"\nWARNING: best.pt not found in {results.save_dir}")
 
     # Print results summary
     print(f"\nFinal metrics:")

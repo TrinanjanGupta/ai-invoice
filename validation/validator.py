@@ -29,48 +29,162 @@ from understanding.layoutlm import ExtractedInvoice, ExtractedField
 class LineItem(BaseModel):
     description: str
     quantity: float = 1.0
+    unit: Optional[str] = "NOS"
     rate: float = 0.0
+    discount: Optional[float] = 0.0
+    taxable_value: Optional[float] = None
     amount: float = 0.0
     hsn_code: Optional[str] = None
+    cgst_rate: Optional[float] = 0.0
+    cgst_amount: Optional[float] = 0.0
+    sgst_rate: Optional[float] = 0.0
+    sgst_amount: Optional[float] = 0.0
+    igst_rate: Optional[float] = 0.0
+    igst_amount: Optional[float] = 0.0
 
 
 class InvoiceSchema(BaseModel):
-    """Canonical standardised invoice format."""
+    """Canonical standardised invoice format aligned with InvoiceBuilderComponent."""
+    # Meta / Header
     invoice_number: Optional[str] = None
     invoice_date: Optional[str] = None
     due_date: Optional[str] = None
     po_number: Optional[str] = None
+    place_of_supply: Optional[str] = None
+    category: Optional[str] = None
+    subcategory: Optional[str] = None
 
+    # Company / Vendor (Biller)
     vendor_name: Optional[str] = None
     vendor_address: Optional[str] = None
+    vendor_address_line1: Optional[str] = None
+    vendor_address_line2: Optional[str] = None
     vendor_gstin: Optional[str] = None
     vendor_pan: Optional[str] = None
     vendor_email: Optional[str] = None
     vendor_phone: Optional[str] = None
 
+    # Client / Buyer (Bill To)
     buyer_name: Optional[str] = None
     buyer_address: Optional[str] = None
+    buyer_address_line1: Optional[str] = None
+    buyer_address_line2: Optional[str] = None
     buyer_gstin: Optional[str] = None
+    buyer_phone: Optional[str] = None
+    sls_code: Optional[str] = None
 
+    # Line items
     line_items: list[LineItem] = Field(default_factory=list)
 
+    # Totals & Tax
     subtotal: Optional[float] = None
     cgst: Optional[float] = None
     sgst: Optional[float] = None
     igst: Optional[float] = None
     tax_amount: Optional[float] = None
     discount: Optional[float] = None
+    round_off: Optional[float] = 0.0
     grand_total: Optional[float] = None
+    amount_in_words: Optional[str] = None
     currency: str = "INR"
 
+    # Bank Details
     bank_name: Optional[str] = None
+    branch_name: Optional[str] = None
+    account_name: Optional[str] = None
     account_number: Optional[str] = None
     ifsc_code: Optional[str] = None
     payment_terms: Optional[str] = None
+    remarks: Optional[str] = None
 
     overall_confidence: float = 0.0
     needs_review: bool = False
     review_reasons: list[str] = Field(default_factory=list)
+
+    def to_invoice_builder_json(self) -> dict:
+        """
+        Transforms the extracted invoice data into the exact structure
+        used by ui/src/app/pages/invoice/invoice-builder/invoice-builder.component.ts.
+        Allows direct form patching via `this.invoiceForm.patchValue(data)`.
+        """
+        v_lines = (self.vendor_address or "").strip().split("\n")
+        v_addr1 = self.vendor_address_line1 or (v_lines[0] if v_lines else "")
+        v_addr2 = self.vendor_address_line2 or ("\n".join(v_lines[1:]) if len(v_lines) > 1 else "")
+
+        b_lines = (self.buyer_address or "").strip().split("\n")
+        b_addr1 = self.buyer_address_line1 or (b_lines[0] if b_lines else "")
+        b_addr2 = self.buyer_address_line2 or ("\n".join(b_lines[1:]) if len(b_lines) > 1 else "")
+
+        return {
+            "company": {
+                "name": self.vendor_name or "",
+                "addressLine1": v_addr1,
+                "addressLine2": v_addr2,
+                "email": self.vendor_email or "",
+                "phone": self.vendor_phone or "",
+                "gstin": self.vendor_gstin or "",
+                "pan": self.vendor_pan or "",
+            },
+            "client": {
+                "slsCode": self.sls_code or "",
+                "name": self.buyer_name or "",
+                "addressLine1": b_addr1,
+                "addressLine2": b_addr2,
+                "gstin": self.buyer_gstin or "",
+                "phone": self.buyer_phone or "",
+            },
+            "meta": {
+                "invoiceNo": self.invoice_number or "",
+                "category": self.category or "",
+                "subcategory": self.subcategory or "",
+                "date": self.invoice_date or "",
+                "placeOfSupply": self.place_of_supply or "",
+                "dueDate": self.due_date or "",
+            },
+            "items": [
+                {
+                    "description": item.description or "",
+                    "hsnSac": item.hsn_code or "",
+                    "quantity": item.quantity or 1,
+                    "unit": item.unit or "NOS",
+                    "rate": item.rate or 0,
+                    "discount": item.discount or 0,
+                    "taxableValue": item.taxable_value if item.taxable_value is not None else item.amount,
+                    "cgstRate": item.cgst_rate or 0,
+                    "cgstAmount": item.cgst_amount or 0,
+                    "sgstRate": item.sgst_rate or 0,
+                    "sgstAmount": item.sgst_amount or 0,
+                    "igstRate": item.igst_rate or 0,
+                    "igstAmount": item.igst_amount or 0,
+                }
+                for item in self.line_items
+            ],
+            "totals": {
+                "taxableAmount": self.subtotal or 0,
+                "totalDiscount": self.discount or 0,
+                "netTaxable": (self.subtotal or 0) - (self.discount or 0),
+                "globalDiscount": 0,
+                "totalCgst": self.cgst or 0,
+                "totalSgst": self.sgst or 0,
+                "totalIgst": self.igst or 0,
+                "globalCgstRate": 0,
+                "globalSgstRate": 0,
+                "globalIgstRate": 0,
+                "roundOff": self.round_off or 0,
+                "grandTotal": self.grand_total or 0,
+                "amountInWords": self.amount_in_words or "",
+            },
+            "bankDetails": {
+                "ifsc": self.ifsc_code or "",
+                "branchName": self.branch_name or "",
+                "bankName": self.bank_name or "",
+                "accountName": self.account_name or self.vendor_name or "",
+                "accountNumber": self.account_number or "",
+                "confirmAccountNumber": self.account_number or "",
+            },
+            "remarks": self.remarks or "",
+            "certifiedRemarks": [],
+        }
 
 
 # -------------------------------------------------------------------
@@ -170,8 +284,18 @@ class InvoiceValidator:
                         line_items.append(LineItem(
                             description=item.get("description", ""),
                             quantity=float(item.get("quantity", 1) or 1),
+                            unit=str(item.get("unit", "NOS") or "NOS"),
                             rate=float(item.get("rate", 0) or 0),
+                            discount=float(item.get("discount", 0) or 0),
+                            taxable_value=float(item.get("taxable_value", item.get("amount", 0)) or 0),
                             amount=float(item.get("amount", 0) or 0),
+                            hsn_code=item.get("hsn_code") or item.get("hsnSac"),
+                            cgst_rate=float(item.get("cgst_rate", item.get("cgstRate", 0)) or 0),
+                            cgst_amount=float(item.get("cgst_amount", item.get("cgstAmount", 0)) or 0),
+                            sgst_rate=float(item.get("sgst_rate", item.get("sgstRate", 0)) or 0),
+                            sgst_amount=float(item.get("sgst_amount", item.get("sgstAmount", 0)) or 0),
+                            igst_rate=float(item.get("igst_rate", item.get("igstRate", 0)) or 0),
+                            igst_amount=float(item.get("igst_amount", item.get("igstAmount", 0)) or 0),
                         ))
                     except (ValueError, TypeError):
                         pass
@@ -181,6 +305,7 @@ class InvoiceValidator:
             invoice_date=self._get_val(inv.invoice_date),
             due_date=self._get_val(inv.due_date),
             po_number=self._get_val(inv.po_number),
+            place_of_supply=self._get_val(getattr(inv, "place_of_supply", None)),
             vendor_name=self._get_val(inv.vendor_name),
             vendor_address=self._get_val(inv.vendor_address),
             vendor_gstin=self._get_val(inv.vendor_gstin),
@@ -190,6 +315,7 @@ class InvoiceValidator:
             buyer_name=self._get_val(inv.buyer_name),
             buyer_address=self._get_val(inv.buyer_address),
             buyer_gstin=self._get_val(inv.buyer_gstin),
+            sls_code=self._get_val(getattr(inv, "sls_code", None)),
             line_items=line_items,
             subtotal=self._get_float(inv.subtotal),
             cgst=self._get_float(inv.cgst),
@@ -197,12 +323,17 @@ class InvoiceValidator:
             igst=self._get_float(inv.igst),
             tax_amount=self._get_float(inv.tax_amount),
             discount=self._get_float(inv.discount),
+            round_off=self._get_float(getattr(inv, "round_off", None)) or 0.0,
             grand_total=self._get_float(inv.grand_total),
+            amount_in_words=self._get_val(getattr(inv, "amount_in_words", None)),
             currency=self._get_val(inv.currency) or "INR",
             bank_name=self._get_val(inv.bank_name),
+            branch_name=self._get_val(getattr(inv, "branch_name", None)),
+            account_name=self._get_val(getattr(inv, "account_name", None)),
             account_number=self._get_val(inv.account_number),
             ifsc_code=self._get_val(inv.ifsc_code),
             payment_terms=self._get_val(inv.payment_terms),
+            remarks=self._get_val(getattr(inv, "remarks", None)),
             overall_confidence=inv.overall_confidence,
         )
 

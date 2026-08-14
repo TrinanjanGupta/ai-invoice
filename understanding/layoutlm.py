@@ -29,6 +29,7 @@ class ExtractedInvoice:
     invoice_date: Optional[ExtractedField] = None
     due_date: Optional[ExtractedField] = None
     po_number: Optional[ExtractedField] = None
+    place_of_supply: Optional[ExtractedField] = None
 
     # Vendor
     vendor_name: Optional[ExtractedField] = None
@@ -42,6 +43,8 @@ class ExtractedInvoice:
     buyer_name: Optional[ExtractedField] = None
     buyer_address: Optional[ExtractedField] = None
     buyer_gstin: Optional[ExtractedField] = None
+    buyer_phone: Optional[ExtractedField] = None
+    sls_code: Optional[ExtractedField] = None
 
     # Line items
     line_items: list[dict] = field(default_factory=list)
@@ -51,7 +54,9 @@ class ExtractedInvoice:
     tax_rate: Optional[ExtractedField] = None
     tax_amount: Optional[ExtractedField] = None
     discount: Optional[ExtractedField] = None
+    round_off: Optional[ExtractedField] = None
     grand_total: Optional[ExtractedField] = None
+    amount_in_words: Optional[ExtractedField] = None
     currency: Optional[ExtractedField] = None
 
     # Tax details
@@ -59,11 +64,14 @@ class ExtractedInvoice:
     sgst: Optional[ExtractedField] = None
     igst: Optional[ExtractedField] = None
 
-    # Payment
+    # Payment / Bank
     bank_name: Optional[ExtractedField] = None
+    branch_name: Optional[ExtractedField] = None
+    account_name: Optional[ExtractedField] = None
     account_number: Optional[ExtractedField] = None
     ifsc_code: Optional[ExtractedField] = None
     payment_terms: Optional[ExtractedField] = None
+    remarks: Optional[ExtractedField] = None
 
     # Meta
     overall_confidence: float = 0.0
@@ -262,6 +270,20 @@ class LayoutLMExtractor:
                 inv.invoice_date = ExtractedField(m.group(0).strip(), 0.68, "heuristic")
                 break
 
+        pos_match = re.search(r"(?:place\s*of\s*supply|pos)[\s:]*([A-Za-z0-9\s-]+)", header_text + " " + all_text, re.IGNORECASE)
+        if pos_match:
+            pos_val = pos_match.group(1).split("\n")[0].strip()
+            if len(pos_val) < 40:
+                inv.place_of_supply = ExtractedField(pos_val, 0.75, "heuristic")
+
+        due_match = re.search(r"(?:due\s*date)[\s:]*([0-9A-Za-z/ -]+)", header_text + " " + all_text, re.IGNORECASE)
+        if due_match:
+            for pat in self.DATE_PATTERNS:
+                dm = pat.search(due_match.group(0))
+                if dm:
+                    inv.due_date = ExtractedField(dm.group(0).strip(), 0.70, "heuristic")
+                    break
+
         # --- Vendor block ---
         vendor_text = region_texts.get("vendor_block", "")
         if vendor_text:
@@ -314,6 +336,18 @@ class LayoutLMExtractor:
         if subtotal:
             inv.subtotal = ExtractedField(subtotal, 0.72, "heuristic")
 
+        round_off = self._find_amount_near_keyword(
+            totals_text, ["round off", "roundoff", "rounding"]
+        )
+        if round_off:
+            inv.round_off = ExtractedField(round_off, 0.70, "heuristic")
+
+        words_match = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:]*([A-Za-z\s/-]+(?:only)?)", totals_text + " " + all_text, re.IGNORECASE)
+        if words_match:
+            words_val = words_match.group(1).split("\n")[0].strip()
+            if len(words_val) > 5 and len(words_val) < 150:
+                inv.amount_in_words = ExtractedField(words_val, 0.80, "heuristic")
+
         # --- Tax block ---
         tax_text = region_texts.get("tax_block", totals_text)
         cgst = self._find_amount_near_keyword(tax_text, ["cgst"])
@@ -342,15 +376,27 @@ class LayoutLMExtractor:
         else:
             inv.currency = ExtractedField("INR", 0.50, "heuristic")
 
-        # --- Payment block ---
+        # --- Payment / Bank block ---
         pay_text = region_texts.get("payment_terms", "")
         ifsc = self.IFSC_PATTERN.search(pay_text + " " + all_text)
         if ifsc:
             inv.ifsc_code = ExtractedField(ifsc.group(0), 0.90, "heuristic")
 
-        acc_match = re.search(r"(?:a/c|account|acct)[\s:]*(\d{9,18})", pay_text, re.IGNORECASE)
+        acc_match = re.search(r"(?:a/c|account|acct|acc\s*no)[\s:#.]*(\d{9,18})", pay_text + " " + all_text, re.IGNORECASE)
         if acc_match:
             inv.account_number = ExtractedField(acc_match.group(1), 0.82, "heuristic")
+
+        bank_match = re.search(r"(?:bank\s*name|bank)[\s:]*([A-Za-z\s&]+(?:bank|ltd|limited)?)", pay_text, re.IGNORECASE)
+        if bank_match:
+            b_val = bank_match.group(1).split("\n")[0].strip()
+            if len(b_val) < 40:
+                inv.bank_name = ExtractedField(b_val, 0.75, "heuristic")
+
+        branch_match = re.search(r"(?:branch\s*name|branch)[\s:]*([A-Za-z0-9\s,-]+)", pay_text, re.IGNORECASE)
+        if branch_match:
+            br_val = branch_match.group(1).split("\n")[0].strip()
+            if len(br_val) < 40:
+                inv.branch_name = ExtractedField(br_val, 0.70, "heuristic")
 
         # --- Line items (simplified) ---
         inv.line_items = self._extract_line_items(region_texts.get("line_items", ""))
