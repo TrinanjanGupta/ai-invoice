@@ -11,13 +11,15 @@ redis>=5.0.7
 # Image & PDF processing
 opencv-python-headless>=4.10.0.84
 Pillow>=10.4.0
-PyMuPDF>=1.24.7
+pymupdf>=1.24.7
 pdf2image>=1.17.0
 numpy>=1.26.4
 
-# OCR (PaddleOCR does not support Python 3.14.6; easyocr is used as the fallback)
-# paddlepaddle>=2.6.1
-# paddleocr>=2.7.3
+# OCR
+paddlepaddle>=3.3.1
+paddleocr>=3.7.0
+paddlex>=3.7.2
+aiohttp>=3.11.0
 easyocr>=1.7.1
 
 # ML / Layout understanding

@@ -4,45 +4,139 @@
 
 @layer base {
   body {
-    @apply bg-gray-50 text-gray-900 antialiased;
+    @apply bg-slate-50 text-slate-900 antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
 }
 
 @layer components {
   .btn-primary {
-    @apply inline-flex items-center gap-2 px-4 py-2 bg-brand-600 text-white
-           rounded-lg font-medium text-sm hover:bg-brand-700 transition-colors
-           disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white
+           rounded-lg font-medium text-sm hover:bg-blue-700 active:bg-blue-800 transition-all
+           shadow-sm hover:shadow disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .btn-secondary {
-    @apply inline-flex items-center gap-2 px-4 py-2 bg-white text-gray-700
-           border border-gray-200 rounded-lg font-medium text-sm
-           hover:bg-gray-50 transition-colors;
+    @apply inline-flex items-center gap-2 px-4 py-2 bg-white text-slate-700
+           border border-slate-200 rounded-lg font-medium text-sm
+           hover:bg-slate-50 hover:border-slate-300 active:bg-slate-100 transition-all
+           shadow-sm disabled:opacity-50;
+  }
+  .btn-success {
+    @apply inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white
+           rounded-lg font-medium text-sm hover:bg-emerald-700 active:bg-emerald-800 transition-all
+           shadow-sm hover:shadow disabled:opacity-50 disabled:cursor-not-allowed;
   }
   .card {
-    @apply bg-white rounded-xl border border-gray-200 shadow-sm;
+    @apply bg-white rounded-xl border border-slate-200/90 shadow-sm transition-all;
   }
   .field-input {
-    @apply w-full px-3 py-2 text-sm border border-gray-200 rounded-lg
-           focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent
-           bg-white transition-shadow;
+    @apply w-full px-3 py-2 text-sm border border-slate-200 rounded-lg
+           focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500
+           bg-white text-slate-800 transition-all placeholder:text-slate-400;
+  }
+  .field-input-sm {
+    @apply px-2.5 py-1.5 text-xs rounded-md border border-slate-200
+           focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500
+           bg-white text-slate-800 transition-all placeholder:text-slate-400;
   }
   .badge {
-    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold;
   }
 }
 
 /* Confidence bar */
-.conf-bar { @apply h-1.5 rounded-full bg-gray-100 overflow-hidden; }
+.conf-bar { @apply h-1.5 rounded-full bg-slate-100 overflow-hidden; }
 .conf-bar-fill { @apply h-full rounded-full transition-all duration-500; }
 
 /* Upload drop zone */
-.dropzone-active { @apply border-brand-500 bg-brand-50; }
+.dropzone-active { @apply border-blue-500 bg-blue-50/50; }
 
 /* Spinner */
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinner { animation: spin 0.8s linear infinite; }
 
-/* Fade in */
-@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-.fade-in { animation: fadeIn 0.25s ease; }
+/* Animations */
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.fade-in { animation: fadeIn 0.25s ease-out; }
+
+@keyframes popIn {
+  0% { transform: scale(0); opacity: 0; }
+  70% { transform: scale(1.2); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.animate-pop-in {
+  animation: popIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+}
+
+@keyframes ringPulse {
+  0%, 100% { box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.25); }
+  50% { box-shadow: 0 0 0 6px rgba(37, 99, 235, 0.08); }
+}
+
+/* Stepper Bar */
+.wizard-stepper-bar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  position: relative;
+}
+
+.wizard-step-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  position: relative;
+  z-index: 10;
+  cursor: pointer;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  flex: 1;
+}
+
+.wizard-step-item:hover .wizard-step-circle {
+  transform: translateY(-1px);
+}
+
+.wizard-step-circle {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 12px;
+  border: 2px solid #cbd5e1;
+  background-color: #ffffff;
+  color: #64748b;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.wizard-step-item.active .wizard-step-circle {
+  border-color: #2563eb;
+  background-color: #2563eb;
+  color: #ffffff;
+  animation: ringPulse 2.5s infinite ease-in-out;
+  transform: scale(1.06);
+}
+
+.wizard-step-item.completed .wizard-step-circle {
+  border-color: #10b981;
+  background-color: #10b981;
+  color: #ffffff;
+}
+
+.wizard-step-line {
+  position: absolute;
+  top: 16px;
+  left: 10%;
+  right: 10%;
+  height: 2.5px;
+  background-color: #e2e8f0;
+  z-index: 1;
+}
+
+.wizard-step-line-progress {
+  height: 100%;
+  background-color: #10b981;
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}

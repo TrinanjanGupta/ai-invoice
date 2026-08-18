@@ -6,7 +6,7 @@ Usage:
 """
 
 import argparse
-import fitz  # PyMuPDF
+import pymupdf
 from pathlib import Path
 from loguru import logger
 
@@ -21,7 +21,7 @@ def convert_pdfs_to_images(input_dir: str | Path, output_dir: str | Path, dpi: i
         return
 
     zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
+    mat = pymupdf.Matrix(zoom, zoom)
 
     # Deduplicate in case filesystem is case-insensitive
     all_pdfs = set(input_path.glob("*.pdf")).union(set(input_path.glob("*.PDF")))
@@ -35,7 +35,7 @@ def convert_pdfs_to_images(input_dir: str | Path, output_dir: str | Path, dpi: i
 
     for pdf_file in pdf_files:
         try:
-            doc = fitz.open(str(pdf_file))
+            doc = pymupdf.open(str(pdf_file))
             page_count = len(doc)
             stem = pdf_file.stem.replace(" ", "_").replace("(", "").replace(")", "")
             for page_num in range(page_count):

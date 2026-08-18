@@ -142,13 +142,16 @@ class LayoutLMExtractor:
         return self._extract_heuristic(ocr_results)
 
     def _extract_layoutlm(self, ocr_results: dict, image) -> ExtractedInvoice:
-        """LayoutLMv3 token classification extraction."""
+        """LayoutLMv3 token classification extraction with subword alignment and heuristic fallback fusion."""
         import torch
 
         all_words, all_boxes = [], []
         for region_label, ocr_result in ocr_results.items():
             for block in ocr_result.text_blocks:
-                all_words.append(block.text)
+                text_clean = block.text.strip()
+                if not text_clean:
+                    continue
+                all_words.append(text_clean)
                 # Normalise bbox to 0-1000 for LayoutLMv3
                 bbox = block.bbox
                 xs = [p[0] for p in bbox]
@@ -156,47 +159,129 @@ class LayoutLMExtractor:
                 x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
                 w, h = image.size
                 norm_bbox = [
-                    int(1000 * x1 / w), int(1000 * y1 / h),
-                    int(1000 * x2 / w), int(1000 * y2 / h),
+                    max(0, min(1000, int(1000 * x1 / max(1, w)))),
+                    max(0, min(1000, int(1000 * y1 / max(1, h)))),
+                    max(0, min(1000, int(1000 * x2 / max(1, w)))),
+                    max(0, min(1000, int(1000 * y2 / max(1, h)))),
                 ]
                 all_boxes.append(norm_bbox)
 
+        # If no words detected, fall back to heuristic
         if not all_words:
-            return ExtractedInvoice()
+            return self._extract_heuristic(ocr_results)
 
-        encoding = self.processor(
-            image,
-            all_words,
-            boxes=all_boxes,
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
+        try:
+            encoding = self.processor(
+                image,
+                all_words,
+                boxes=all_boxes,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+            )
+
+            with torch.no_grad():
+                outputs = self.model(**encoding)
+
+            logits = outputs.logits
+            probs = torch.softmax(logits, dim=-1)
+            predictions = logits.argmax(-1).squeeze().tolist()
+            confidences = probs.max(-1).values.squeeze().tolist()
+
+            id2label = self.model.config.id2label
+            token_labels = [id2label.get(p, "O") for p in predictions] if isinstance(predictions, list) else [id2label.get(predictions, "O")]
+            token_confs = confidences if isinstance(confidences, list) else [confidences]
+
+            # Map BPE subword tokens back to original words using word_ids
+            word_ids = encoding.word_ids(0) if hasattr(encoding, "word_ids") else None
+            word_labels = ["O"] * len(all_words)
+            word_confs = [0.0] * len(all_words)
+
+            if word_ids:
+                for token_idx, word_idx in enumerate(word_ids):
+                    if word_idx is None or word_idx >= len(all_words):
+                        continue
+                    lbl = token_labels[token_idx] if token_idx < len(token_labels) else "O"
+                    cnf = float(token_confs[token_idx]) if token_idx < len(token_confs) else 0.0
+                    if lbl != "O":
+                        if word_labels[word_idx] == "O" or cnf > word_confs[word_idx]:
+                            word_labels[word_idx] = lbl
+                            word_confs[word_idx] = cnf
+                    elif word_labels[word_idx] == "O":
+                        word_confs[word_idx] = cnf
+            else:
+                for i in range(min(len(all_words), len(token_labels))):
+                    word_labels[i] = token_labels[i]
+                    word_confs[i] = float(token_confs[i])
+
+            # Group tokens by label to build field values
+            fields = self._group_token_labels(all_words, word_labels, word_confs)
+            layoutlm_inv = self._fields_to_invoice(fields, source="layoutlm")
+        except Exception as e:
+            logger.warning(f"LayoutLM inference warning: {e} — relying on heuristic extraction")
+            layoutlm_inv = ExtractedInvoice()
+
+        # FUSION: Merge with heuristic regex & geometric extraction
+        heuristic_inv = self._extract_heuristic(ocr_results)
+        return self._merge_invoices(layoutlm_inv, heuristic_inv)
+
+    def _merge_invoices(self, primary: ExtractedInvoice, secondary: ExtractedInvoice) -> ExtractedInvoice:
+        """Merge primary (LayoutLM) with secondary (Heuristic/Regex) extraction, picking higher confidence."""
+        merged = ExtractedInvoice()
+        all_field_names = [
+            "invoice_number", "invoice_date", "due_date", "po_number", "place_of_supply",
+            "vendor_name", "vendor_address", "vendor_gstin", "vendor_pan", "vendor_email", "vendor_phone",
+            "buyer_name", "buyer_address", "buyer_gstin", "buyer_phone", "sls_code",
+            "subtotal", "tax_rate", "tax_amount", "discount", "round_off", "grand_total", "amount_in_words", "currency",
+            "cgst", "sgst", "igst",
+            "bank_name", "branch_name", "account_name", "account_number", "ifsc_code", "payment_terms", "remarks"
+        ]
+
+        for fname in all_field_names:
+            p_val = getattr(primary, fname, None)
+            s_val = getattr(secondary, fname, None)
+            p_valid = p_val is not None and getattr(p_val, "value", None) and len(str(p_val.value).strip()) > 0
+            s_valid = s_val is not None and getattr(s_val, "value", None) and len(str(s_val.value).strip()) > 0
+
+            if p_valid and s_valid:
+                # Pick the higher confidence prediction
+                chosen = p_val if p_val.confidence >= s_val.confidence else s_val
+                setattr(merged, fname, chosen)
+            elif p_valid and p_val.confidence >= 0.35:
+                setattr(merged, fname, p_val)
+            elif s_valid:
+                setattr(merged, fname, s_val)
+
+        # Line items: use primary if available and non-empty, else secondary
+        if primary.line_items and len(primary.line_items) > 0:
+            merged.line_items = primary.line_items
+        else:
+            merged.line_items = secondary.line_items
+
+        # Overall confidence calculation
+        core_fields = [
+            merged.invoice_number, merged.invoice_date, merged.vendor_name,
+            merged.buyer_name, merged.grand_total, merged.subtotal,
+            merged.vendor_gstin
+        ]
+        filled = [f for f in core_fields if f is not None and getattr(f, "value", None)]
+        merged.overall_confidence = (
+            sum(f.confidence for f in filled) / len(filled) if filled else 0.0
         )
-
-        with torch.no_grad():
-            outputs = self.model(**encoding)
-
-        logits = outputs.logits
-        probs = torch.softmax(logits, dim=-1)
-        predictions = logits.argmax(-1).squeeze().tolist()
-        confidences = probs.max(-1).values.squeeze().tolist()
-
-        id2label = self.model.config.id2label
-        token_labels = [id2label.get(p, "O") for p in predictions]
-        token_confs = confidences if isinstance(confidences, list) else [confidences]
-
-        # Group tokens by label to build field values
-        fields = self._group_token_labels(all_words, token_labels, token_confs)
-        return self._fields_to_invoice(fields, source="layoutlm")
+        return merged
 
     def _group_token_labels(self, words, labels, confidences) -> dict:
-        """Convert BIO token labels to grouped field values."""
+        """Convert BIO token labels to grouped field values, ignoring low-confidence noise."""
         fields = {}
         current_label = None
         current_words = []
         current_confs = []
 
         for word, label, conf in zip(words, labels, confidences):
+            # Ignore ultra-low confidence raw predictions
+            if conf < 0.40:
+                label = "O"
+
             if label.startswith("B-"):
                 if current_label and current_words:
                     key = current_label[2:]
@@ -204,7 +289,7 @@ class LayoutLMExtractor:
                 current_label = label
                 current_words = [word]
                 current_confs = [conf]
-            elif label.startswith("I-") and current_label:
+            elif label.startswith("I-") and current_label and label[2:] == current_label[2:]:
                 current_words.append(word)
                 current_confs.append(conf)
             else:
@@ -227,6 +312,8 @@ class LayoutLMExtractor:
             "INVOICE_NUMBER": "invoice_number",
             "INVOICE_DATE": "invoice_date",
             "DUE_DATE": "due_date",
+            "PO_NUMBER": "po_number",
+            "PLACE_OF_SUPPLY": "place_of_supply",
             "VENDOR_NAME": "vendor_name",
             "BILLER_NAME": "vendor_name",
             "VENDOR_ADDRESS": "vendor_address",
@@ -238,8 +325,14 @@ class LayoutLMExtractor:
             "BUYER_GSTIN": "buyer_gstin",
             "SUBTOTAL": "subtotal",
             "TAX_AMOUNT": "tax_amount",
+            "CGST": "cgst",
+            "SGST": "sgst",
+            "IGST": "igst",
             "GRAND_TOTAL": "grand_total",
             "TOTAL": "grand_total",
+            "BANK_NAME": "bank_name",
+            "ACCOUNT_NUMBER": "account_number",
+            "IFSC_CODE": "ifsc_code",
         }
         for label_key, field_name in mapping.items():
             if label_key in fields:
@@ -258,25 +351,26 @@ class LayoutLMExtractor:
         all_text = " ".join(region_texts.values())
 
         # --- Header region ---
-        header_text = region_texts.get("header", all_text)
+        header_text = region_texts.get("header", "")
+        search_scope = (header_text + "\n" + all_text).strip()
 
-        inv_num = self.INVOICE_NUM_PATTERN.search(header_text)
+        inv_num = self.INVOICE_NUM_PATTERN.search(search_scope)
         if inv_num:
-            inv.invoice_number = ExtractedField(inv_num.group(1).strip(), 0.72, "heuristic")
+            inv.invoice_number = ExtractedField(inv_num.group(1).strip(), 0.75, "heuristic")
 
         for pat in self.DATE_PATTERNS:
-            m = pat.search(header_text)
+            m = pat.search(search_scope)
             if m:
-                inv.invoice_date = ExtractedField(m.group(0).strip(), 0.68, "heuristic")
+                inv.invoice_date = ExtractedField(m.group(0).strip(), 0.70, "heuristic")
                 break
 
-        pos_match = re.search(r"(?:place\s*of\s*supply|pos)[\s:]*([A-Za-z0-9\s-]+)", header_text + " " + all_text, re.IGNORECASE)
+        pos_match = re.search(r"(?:place\s*of\s*supply|pos)[\s:]*([A-Za-z0-9\s-]+)", search_scope, re.IGNORECASE)
         if pos_match:
             pos_val = pos_match.group(1).split("\n")[0].strip()
             if len(pos_val) < 40:
                 inv.place_of_supply = ExtractedField(pos_val, 0.75, "heuristic")
 
-        due_match = re.search(r"(?:due\s*date)[\s:]*([0-9A-Za-z/ -]+)", header_text + " " + all_text, re.IGNORECASE)
+        due_match = re.search(r"(?:due\s*date)[\s:]*([0-9A-Za-z/ -]+)", search_scope, re.IGNORECASE)
         if due_match:
             for pat in self.DATE_PATTERNS:
                 dm = pat.search(due_match.group(0))
@@ -289,15 +383,21 @@ class LayoutLMExtractor:
         if vendor_text:
             lines = [l.strip() for l in vendor_text.split("\n") if l.strip()]
             if lines:
-                inv.vendor_name = ExtractedField(lines[0], 0.65, "heuristic")
+                inv.vendor_name = ExtractedField(lines[0], 0.68, "heuristic")
             if len(lines) > 1:
                 inv.vendor_address = ExtractedField(" ".join(lines[1:4]), 0.60, "heuristic")
+        elif header_text:
+            lines = [l.strip() for l in header_text.split("\n") if l.strip() and not any(k in l.lower() for k in ["invoice", "tax", "gstin", "date", "bill"])]
+            if lines:
+                inv.vendor_name = ExtractedField(lines[0], 0.60, "heuristic")
 
-        gstin = self.GSTIN_PATTERN.search(vendor_text + " " + all_text)
-        if gstin:
-            inv.vendor_gstin = ExtractedField(gstin.group(0), 0.90, "heuristic")
+        all_gstins = self.GSTIN_PATTERN.findall(all_text)
+        if all_gstins:
+            inv.vendor_gstin = ExtractedField(all_gstins[0], 0.92, "heuristic")
+            if len(all_gstins) > 1:
+                inv.buyer_gstin = ExtractedField(all_gstins[1], 0.90, "heuristic")
 
-        pan = self.PAN_PATTERN.search(vendor_text)
+        pan = self.PAN_PATTERN.search(vendor_text + " " + all_text)
         if pan:
             inv.vendor_pan = ExtractedField(pan.group(0), 0.88, "heuristic")
 
@@ -314,27 +414,23 @@ class LayoutLMExtractor:
         if buyer_text:
             lines = [l.strip() for l in buyer_text.split("\n") if l.strip()]
             if lines:
-                inv.buyer_name = ExtractedField(lines[0], 0.63, "heuristic")
+                inv.buyer_name = ExtractedField(lines[0], 0.65, "heuristic")
             if len(lines) > 1:
                 inv.buyer_address = ExtractedField(" ".join(lines[1:4]), 0.58, "heuristic")
 
-        buyer_gstin_matches = self.GSTIN_PATTERN.findall(buyer_text)
-        if buyer_gstin_matches and len(buyer_gstin_matches) > 1:
-            inv.buyer_gstin = ExtractedField(buyer_gstin_matches[1], 0.88, "heuristic")
-
         # --- Totals block ---
-        totals_text = region_texts.get("totals_block", "")
+        totals_text = region_texts.get("totals_block", "") + " " + region_texts.get("tax_block", "") + " " + all_text
         grand_total = self._find_amount_near_keyword(
-            totals_text, ["grand total", "total amount", "amount due", "net amount", "total"]
+            totals_text, ["grand total", "total amount", "amount due", "net amount", "invoice total", "total value", "total"]
         )
         if grand_total:
-            inv.grand_total = ExtractedField(grand_total, 0.75, "heuristic")
+            inv.grand_total = ExtractedField(grand_total, 0.80, "heuristic")
 
         subtotal = self._find_amount_near_keyword(
-            totals_text, ["subtotal", "sub-total", "taxable value", "taxable amount"]
+            totals_text, ["subtotal", "sub-total", "taxable value", "taxable amount", "total taxable", "net total"]
         )
         if subtotal:
-            inv.subtotal = ExtractedField(subtotal, 0.72, "heuristic")
+            inv.subtotal = ExtractedField(subtotal, 0.78, "heuristic")
 
         round_off = self._find_amount_near_keyword(
             totals_text, ["round off", "roundoff", "rounding"]
@@ -342,7 +438,7 @@ class LayoutLMExtractor:
         if round_off:
             inv.round_off = ExtractedField(round_off, 0.70, "heuristic")
 
-        words_match = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:]*([A-Za-z\s/-]+(?:only)?)", totals_text + " " + all_text, re.IGNORECASE)
+        words_match = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:]*([A-Za-z\s/-]+(?:only)?)", totals_text, re.IGNORECASE)
         if words_match:
             words_val = words_match.group(1).split("\n")[0].strip()
             if len(words_val) > 5 and len(words_val) < 150:
@@ -357,6 +453,10 @@ class LayoutLMExtractor:
         sgst = self._find_amount_near_keyword(tax_text, ["sgst"])
         if sgst:
             inv.sgst = ExtractedField(sgst, 0.78, "heuristic")
+
+        igst = self._find_amount_near_keyword(tax_text, ["igst"])
+        if igst:
+            inv.igst = ExtractedField(igst, 0.78, "heuristic")
 
         igst = self._find_amount_near_keyword(tax_text, ["igst"])
         if igst:

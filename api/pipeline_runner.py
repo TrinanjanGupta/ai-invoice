@@ -97,40 +97,51 @@ class InvoicePipeline:
         page_count = len(pages)
         logger.info(f"[{job_id}] {page_count} page(s) to process")
 
-        # For multi-page PDFs, use the first page that looks like an invoice
-        # (highest text density). For now, process page 1.
-        # TODO: merge multi-page results for split invoices.
-        primary_page = pages[0]
+        # --- Stage 3: Multi-Page Detection and OCR Extraction ---
+        combined_ocr_results = {}
+        all_raw_ocr_texts = {}
+        detected_models = []
+        extracted_per_page = []
 
-        # --- Stage 3a: Region detection ---
-        logger.info(f"[{job_id}] Stage 3a: Region detection")
-        detection_result = self.detector.detect(primary_page.image)
-        logger.info(
-            f"[{job_id}] Detected {len(detection_result.regions)} regions "
-            f"using {detection_result.model_used}"
-        )
+        for p_idx, p_obj in enumerate(pages):
+            logger.info(f"[{job_id}] Processing Page {p_idx + 1}/{page_count}...")
+            det_res = self.detector.detect(p_obj.image)
+            detected_models.append(det_res.model_used)
+            logger.info(f"[{job_id}] Page {p_idx + 1}: Detected {len(det_res.regions)} regions using {det_res.model_used}")
 
-        # --- Stage 3b: OCR ---
-        logger.info(f"[{job_id}] Stage 3b: OCR extraction")
-        if detection_result.regions:
-            ocr_results = self.ocr.extract_all_regions(detection_result.regions)
-        else:
-            # No regions detected — run OCR on full page
-            logger.warning(f"[{job_id}] No regions detected, running full-page OCR")
-            full_result = self.ocr.extract_full_page(primary_page.image)
-            ocr_results = {"full_page": full_result}
+            if det_res.regions:
+                p_ocr = self.ocr.extract_all_regions(det_res.regions)
+            else:
+                logger.info(f"[{job_id}] Page {p_idx + 1}: Running full-page OCR")
+                full_res = self.ocr.extract_full_page(p_obj.image)
+                p_ocr = {f"full_page_p{p_idx+1}": full_res}
 
-        raw_ocr_texts = {k: v.full_text for k, v in ocr_results.items()}
+            for k, v in p_ocr.items():
+                unique_key = k if k not in combined_ocr_results else f"{k}_p{p_idx+1}"
+                combined_ocr_results[unique_key] = v
+                all_raw_ocr_texts[unique_key] = v.full_text
 
-        # --- Stage 4a: Field extraction (LayoutLMv3 or heuristic) ---
-        logger.info(f"[{job_id}] Stage 4a: Field extraction")
-        extracted = self.extractor.extract(ocr_results, image=primary_page.pil_image)
+            # Run extraction on this page
+            p_extracted = self.extractor.extract(p_ocr, image=p_obj.pil_image)
+            extracted_per_page.append(p_extracted)
+
+        # --- Stage 4a: Merge Extracted Fields Across All Pages ---
+        logger.info(f"[{job_id}] Stage 4a: Multi-page field extraction & merging")
+        extracted = extracted_per_page[0]
+        for next_p in extracted_per_page[1:]:
+            extracted = self.extractor._merge_invoices(extracted, next_p)
+            if next_p.line_items:
+                extracted.line_items.extend(next_p.line_items)
+
+        # Merge with global heuristic over all aggregated text blocks
+        global_heuristic = self.extractor._extract_heuristic(combined_ocr_results)
+        extracted = self.extractor._merge_invoices(extracted, global_heuristic)
 
         # --- Stage 4b: LLM fallback for low-confidence fields ---
         logger.info(f"[{job_id}] Stage 4b: LLM confidence check")
         self.llm.enhance_low_confidence_fields(
             extracted,
-            raw_ocr_texts,
+            all_raw_ocr_texts,
             confidence_threshold=self.settings.llm_fallback_threshold,
         )
 
@@ -151,8 +162,8 @@ class InvoicePipeline:
             out.mkdir(parents=True, exist_ok=True)
             pdf_path = self.renderer.to_pdf(invoice_schema, out / f"{job_id}.pdf")
 
-        model_parts = []
-        model_parts.append(detection_result.model_used)
+        primary_model = detected_models[0] if detected_models else "yolo"
+        model_parts = [primary_model]
         model_parts.append("layoutlm" if self.extractor.model else "heuristic")
         if self.llm.is_available():
             model_parts.append("ollama")
@@ -169,7 +180,7 @@ class InvoicePipeline:
             validation_report=validation_report,
             html_output=html_output,
             pdf_path=pdf_path,
-            raw_ocr_texts=raw_ocr_texts,
+            raw_ocr_texts=all_raw_ocr_texts,
             page_count=page_count,
             model_used=model_used,
         )

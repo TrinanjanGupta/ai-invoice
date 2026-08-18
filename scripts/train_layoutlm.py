@@ -168,14 +168,12 @@ def main():
         per_device_eval_batch_size=args.batch_size,
         learning_rate=args.lr,
         weight_decay=0.01,
-        warmup_ratio=0.1,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
-        logging_dir=str(output_dir / "logs"),
-        logging_steps=10,
-        report_to="none",   # no wandb / tensorboard required
+        logging_steps=5,
+        report_to="none",   # no wandb required
         dataloader_num_workers=0,
         fp16=torch.cuda.is_available(),
     )
@@ -196,7 +194,7 @@ def main():
     trainer.train()
     trainer.save_model(str(output_dir))
     processor.save_pretrained(str(output_dir))
-    print(f"\n✓ Model saved to: {output_dir}")
+    print(f"\n[OK] LayoutLMv3 Model saved to: {output_dir}")
     print(f"  Update LAYOUTLM_MODEL_PATH={output_dir} in your .env")
 
 

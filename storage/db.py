@@ -50,6 +50,10 @@ class DatabaseManager:
         self.engine = create_async_engine(database_url, echo=False)
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
+    def session(self):
+        """Context manager helper for database sessions."""
+        return self.session_factory()
+
     async def init_db(self):
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

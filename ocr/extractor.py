@@ -44,13 +44,10 @@ class InvoiceOCR:
     def _init_ocr(self):
         try:
             from paddleocr import PaddleOCR
-            self._ocr = PaddleOCR(
-                use_angle_cls=True,     # handle rotated text
-                lang=self.lang,
-                use_gpu=self.use_gpu,
-                show_log=False,
-                enable_mkldnn=True,     # CPU performance optimisation
-            )
+            try:
+                self._ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, use_gpu=self.use_gpu)
+            except Exception:
+                self._ocr = PaddleOCR(lang=self.lang)
             logger.info(f"PaddleOCR initialised (lang={self.lang}, gpu={self.use_gpu})")
         except (ImportError, Exception) as e:
             logger.warning(f"PaddleOCR initialisation failed/not installed ({e}). Trying EasyOCR fallback...")
@@ -81,27 +78,42 @@ class InvoiceOCR:
         text_blocks = []
 
         if self._ocr is not None:
-            results = self._ocr.ocr(crop, cls=True)
-            if results and results[0]:
-                for line in results[0]:
-                    if line is None:
-                        continue
-                    bbox, (text, conf) = line
-                    text = text.strip()
-                    if text:
-                        text_blocks.append(TextBlock(
-                            text=text,
-                            confidence=float(conf),
-                            bbox=bbox,
-                            region_label=region_label,
-                        ))
-        elif self._easyocr is not None:
+            try:
+                results = self._ocr.ocr(crop)
+                if results and results[0]:
+                    for line in results[0]:
+                        if line is None:
+                            continue
+                        if isinstance(line, (list, tuple)) and len(line) >= 2:
+                            bbox = line[0]
+                            if isinstance(line[1], (list, tuple)) and len(line[1]) >= 2:
+                                text, conf = line[1][0], line[1][1]
+                            else:
+                                text, conf = str(line[1]), 0.9
+                            text = str(text).strip()
+                            if text:
+                                text_blocks.append(TextBlock(
+                                    text=text,
+                                    confidence=float(conf),
+                                    bbox=bbox,
+                                    region_label=region_label,
+                                ))
+            except Exception as e:
+                logger.debug(f"PaddleOCR extraction fallback triggered: {e}")
+                if self._easyocr is None:
+                    try:
+                        import easyocr
+                        self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
+                    except Exception:
+                        pass
+
+        if not text_blocks and self._easyocr is not None:
             results = self._easyocr.readtext(crop)
             for line in results:
                 if line is None:
                     continue
                 bbox, text, conf = line
-                text = text.strip()
+                text = str(text).strip()
                 if text:
                     text_blocks.append(TextBlock(
                         text=text,
@@ -142,8 +154,19 @@ class InvoiceOCR:
             )
         return results
 
-    def extract_full_page(self, image: np.ndarray) -> OCRResult:
+    def extract_full_page(self, image: np.ndarray | Image.Image) -> OCRResult:
         """
         Run OCR on the full page (used as fallback or for simple invoices).
         """
+        if isinstance(image, Image.Image):
+            image = np.array(image)
         return self.extract_region(image, region_label="full_page")
+
+    def extract_from_image(self, image: np.ndarray | Image.Image) -> OCRResult:
+        """Alias for full page image extraction."""
+        return self.extract_full_page(image)
+
+
+# Backward compatibility alias
+OCRExtractor = InvoiceOCR
+

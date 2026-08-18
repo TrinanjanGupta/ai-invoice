@@ -186,6 +186,94 @@ class InvoiceSchema(BaseModel):
             "certifiedRemarks": [],
         }
 
+    @classmethod
+    def from_invoice_builder_json(cls, data: dict) -> "InvoiceSchema":
+        """
+        Parses nested JSON from the Angular Invoice Builder or Review UI
+        back into an InvoiceSchema instance.
+        """
+        company = data.get("company") or {}
+        client = data.get("client") or {}
+        meta = data.get("meta") or {}
+        totals = data.get("totals") or {}
+        bank = data.get("bankDetails") or {}
+        raw_items = data.get("items") or []
+
+        line_items = []
+        for it in raw_items:
+            if isinstance(it, dict):
+                line_items.append(LineItem(
+                    description=it.get("description") or "",
+                    hsn_code=it.get("hsnSac") or it.get("hsn_code"),
+                    quantity=float(it.get("quantity", 1) or 1),
+                    unit=str(it.get("unit") or "NOS"),
+                    rate=float(it.get("rate", 0) or 0),
+                    discount=float(it.get("discount", 0) or 0),
+                    taxable_value=float(it.get("taxableValue", it.get("taxable_value", 0)) or 0),
+                    amount=float(it.get("taxableValue", it.get("amount", 0)) or 0),
+                    cgst_rate=float(it.get("cgstRate", it.get("cgst_rate", 0)) or 0),
+                    cgst_amount=float(it.get("cgstAmount", it.get("cgst_amount", 0)) or 0),
+                    sgst_rate=float(it.get("sgstRate", it.get("sgst_rate", 0)) or 0),
+                    sgst_amount=float(it.get("sgstAmount", it.get("sgst_amount", 0)) or 0),
+                    igst_rate=float(it.get("igstRate", it.get("igst_rate", 0)) or 0),
+                    igst_amount=float(it.get("igstAmount", it.get("igst_amount", 0)) or 0),
+                ))
+
+        v_lines = [l for l in [company.get("addressLine1"), company.get("addressLine2")] if l]
+        v_addr = "\n".join(v_lines) if v_lines else None
+
+        b_lines = [l for l in [client.get("addressLine1"), client.get("addressLine2")] if l]
+        b_addr = "\n".join(b_lines) if b_lines else None
+
+        subtotal = float(totals.get("taxableAmount", 0) or 0)
+        cgst = float(totals.get("totalCgst", 0) or 0)
+        sgst = float(totals.get("totalSgst", 0) or 0)
+        igst = float(totals.get("totalIgst", 0) or 0)
+        tax_amount = cgst + sgst + igst
+        discount = float(totals.get("totalDiscount", 0) or 0)
+        round_off = float(totals.get("roundOff", 0) or 0)
+        grand_total = float(totals.get("grandTotal", 0) or 0)
+
+        return cls(
+            invoice_number=meta.get("invoiceNo"),
+            category=meta.get("category"),
+            subcategory=meta.get("subcategory"),
+            invoice_date=meta.get("date"),
+            place_of_supply=meta.get("placeOfSupply"),
+            due_date=meta.get("dueDate"),
+            vendor_name=company.get("name"),
+            vendor_address=v_addr,
+            vendor_address_line1=company.get("addressLine1"),
+            vendor_address_line2=company.get("addressLine2"),
+            vendor_email=company.get("email"),
+            vendor_phone=company.get("phone"),
+            vendor_gstin=company.get("gstin"),
+            vendor_pan=company.get("pan"),
+            buyer_name=client.get("name"),
+            buyer_address=b_addr,
+            buyer_address_line1=client.get("addressLine1"),
+            buyer_address_line2=client.get("addressLine2"),
+            buyer_gstin=client.get("gstin"),
+            buyer_phone=client.get("phone"),
+            sls_code=client.get("slsCode"),
+            line_items=line_items,
+            subtotal=subtotal,
+            cgst=cgst,
+            sgst=sgst,
+            igst=igst,
+            tax_amount=tax_amount,
+            discount=discount,
+            round_off=round_off,
+            grand_total=grand_total,
+            amount_in_words=totals.get("amountInWords"),
+            bank_name=bank.get("bankName"),
+            branch_name=bank.get("branchName"),
+            account_name=bank.get("accountName"),
+            account_number=bank.get("accountNumber"),
+            ifsc_code=bank.get("ifsc"),
+            remarks=data.get("remarks"),
+        )
+
 
 # -------------------------------------------------------------------
 # Validation report

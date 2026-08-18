@@ -123,7 +123,7 @@ def main():
         output.parent.mkdir(parents=True, exist_ok=True)
         import shutil
         shutil.copy(best_weights, output)
-        print(f"\n✓ Best weights saved to: {output}")
+        print(f"\n[OK] Best weights saved to: {output}")
         print(f"  Update YOLO_MODEL_PATH={output} in your .env")
     else:
         print(f"\nWARNING: best.pt not found in {results.save_dir}")
