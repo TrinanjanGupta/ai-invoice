@@ -46,6 +46,7 @@ class InvoicePreprocessor:
         original_size = (img.shape[1], img.shape[0])
         logger.debug(f"Loaded image: {original_size[0]}x{original_size[1]}")
 
+        img, orient_angle = self._auto_orient(img)
         img = self._normalise_dpi(img)
         img = self._denoise(img)
         img, angle = self._deskew(img)
@@ -58,8 +59,9 @@ class InvoicePreprocessor:
 
         logger.info(
             f"Pre-processing done: {original_size} → {processed_size}, "
-            f"deskew={angle:.2f}°, binarized={binarized}"
+            f"orient={orient_angle}°, deskew={angle:.2f}°, binarized={binarized}"
         )
+
 
         return PreprocessResult(
             image=img,
@@ -69,6 +71,45 @@ class InvoicePreprocessor:
             deskew_angle=angle,
             was_binarized=binarized,
         )
+
+    def process_minimal(self, image_input) -> PreprocessResult:
+        """
+        Lightweight pre-processing for images that come from digital PDFs.
+
+        Digital PDF pages are already clean rasters — running denoise,
+        binarisation, and sharpen on them *degrades* quality and wastes ~10s
+        of CPU per page. This method only:
+          1. DPI-normalises (upscale if too small for YOLO)
+          2. Deskews (still useful if the scan was slightly rotated)
+
+        Use this when the source PDF page was classified as digital by
+        PDFConverter._is_digital_page().
+        """
+        img = self._load(image_input)
+        original_size = (img.shape[1], img.shape[0])
+        logger.debug(f"Minimal pre-process — Loaded image: {original_size[0]}x{original_size[1]}")
+
+        img = self._normalise_dpi(img)
+        img, angle = self._deskew(img)
+        # ← no _denoise, no _adaptive_binarize, no _remove_borders, no _sharpen
+
+        processed_size = (img.shape[1], img.shape[0])
+        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+        logger.info(
+            f"Minimal pre-processing done: {original_size} → {processed_size}, "
+            f"deskew={angle:.2f}°, binarized=False (skipped — digital source)"
+        )
+
+        return PreprocessResult(
+            image=img,
+            pil_image=pil_img,
+            original_size=original_size,
+            processed_size=processed_size,
+            deskew_angle=angle,
+            was_binarized=False,
+        )
+
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -206,3 +247,53 @@ class InvoicePreprocessor:
         """Mild unsharp mask to improve OCR on slightly blurry text."""
         gaussian = cv2.GaussianBlur(img, (0, 0), 3)
         return cv2.addWeighted(img, 1.5, gaussian, -0.5, 0)
+
+    def _auto_orient(self, img: np.ndarray) -> tuple[np.ndarray, int]:
+        """
+        Detects 90, 180, or 270 degree rotation on scanned documents using
+        fast OCR text line orientation scoring on a small thumbnail.
+        """
+        h, w = img.shape[:2]
+        # Use 800px thumbnail for reliable character recognition
+        scale = 800 / max(h, w)
+        thumb = cv2.resize(img, (int(w * scale), int(h * scale)))
+
+        try:
+            import easyocr
+            if not hasattr(self, "_orient_reader"):
+                self._orient_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+
+            best_angle = 0
+            best_score = -1.0
+
+            for angle in [0, 90, 180, 270]:
+                if angle == 0:
+                    rot = thumb
+                elif angle == 90:
+                    rot = cv2.rotate(thumb, cv2.ROTATE_90_CLOCKWISE)
+                elif angle == 180:
+                    rot = cv2.rotate(thumb, cv2.ROTATE_180)
+                elif angle == 270:
+                    rot = cv2.rotate(thumb, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+                res = self._orient_reader.readtext(rot)
+                score = sum(r[2] for r in res if len(r[1].strip()) >= 3 and r[2] > 0.35)
+
+                if score > best_score:
+                    best_score = score
+                    best_angle = angle
+
+            if best_angle != 0 and best_score > 3.0:
+                logger.info(f"Auto-orienting scanned image by {best_angle}° (score={best_score:.2f})")
+                if best_angle == 90:
+                    return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE), 90
+                elif best_angle == 180:
+                    return cv2.rotate(img, cv2.ROTATE_180), 180
+                elif best_angle == 270:
+                    return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE), 270
+        except Exception as e:
+            logger.debug(f"Orientation auto-detection skipped: {e}")
+
+        return img, 0
+
+

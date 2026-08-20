@@ -92,17 +92,63 @@ class DatabaseManager:
             result = await session.execute(stmt)
             return result.scalar_one_or_none()
 
-    async def list_jobs(self, limit: int = 50, offset: int = 0) -> list[InvoiceRecord]:
-        from sqlalchemy import select
+    async def delete_job(self, job_id: str) -> bool:
+        from sqlalchemy import delete
         async with self.session_factory() as session:
-            stmt = (
-                select(InvoiceRecord)
-                .order_by(InvoiceRecord.created_at.desc())
-                .limit(limit)
-                .offset(offset)
-            )
+            stmt = delete(InvoiceRecord).where(InvoiceRecord.job_id == job_id)
             result = await session.execute(stmt)
-            return list(result.scalars().all())
+            await session.commit()
+            return result.rowcount > 0
+
+    async def list_jobs(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        status: Optional[str] = None,
+        search: Optional[str] = None,
+        needs_review: Optional[bool] = None,
+        exclude_pending: bool = False,
+    ) -> tuple[list[InvoiceRecord], int]:
+        from sqlalchemy import select, func, or_
+        async with self.session_factory() as session:
+            query = select(InvoiceRecord)
+            count_query = select(func.count(InvoiceRecord.id))
+
+            conditions = []
+            if exclude_pending:
+                conditions.append(InvoiceRecord.status != "pending")
+            elif status and status != "all":
+                if status == "non_pending":
+                    conditions.append(InvoiceRecord.status != "pending")
+                elif status in ("reviewed", "partially_reviewed", "done", "processing", "failed", "pending"):
+                    conditions.append(InvoiceRecord.status == status)
+
+            if search and search.strip():
+                s = f"%{search.strip()}%"
+                conditions.append(
+                    or_(
+                        InvoiceRecord.filename.ilike(s),
+                        InvoiceRecord.job_id.ilike(s),
+                    )
+                )
+
+            if needs_review is not None:
+                conditions.append(InvoiceRecord.needs_review == needs_review)
+
+            for cond in conditions:
+                query = query.where(cond)
+                count_query = count_query.where(cond)
+
+            # Get total matching count
+            total_count_res = await session.execute(count_query)
+            total_count = total_count_res.scalar() or 0
+
+            # Get paginated slice
+            query = query.order_by(InvoiceRecord.created_at.desc()).limit(limit).offset(offset)
+            result = await session.execute(query)
+            records = list(result.scalars().all())
+
+            return records, total_count
 
 
 # ------------------------------------------------------------------

@@ -8,11 +8,13 @@ Prompt engineering is structured so the model returns only the requested
 field value, nothing else, making parsing trivial and reliable.
 """
 
+import re
 import json
 import httpx
 from loguru import logger
 from typing import Optional
 from understanding.layoutlm import ExtractedField
+
 
 
 FIELD_PROMPTS = {
@@ -245,14 +247,16 @@ class OllamaClient:
                 json={
                     "model": self.model,
                     "prompt": prompt,
+                    "format": "json",
                     "stream": False,
                     "options": {
                         "temperature": 0.0,
-                        "num_predict": 500,
+                        "num_predict": 350,
                     },
                 },
                 timeout=self.timeout,
             )
+
             resp.raise_for_status()
             raw = resp.json().get("response", "").strip()
 
@@ -324,13 +328,19 @@ class OllamaClient:
         results = self._extract_multiple_fields_batch(missing_fields, ocr_texts)
 
         enhanced_count = 0
+        gstin_pattern = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}$")
         for field_name, value in results.items():
             if field_name in missing_fields and value:
+                val_str = str(value).strip()
+                if "gstin" in field_name and not gstin_pattern.match(val_str.upper()):
+                    logger.debug(f"  Discarding LLM non-compliant GSTIN for {field_name}: {val_str}")
+                    continue
                 setattr(invoice, field_name, ExtractedField(
-                    value=value, confidence=0.82, source="llm"
+                    value=val_str, confidence=0.82, source="llm"
                 ))
                 enhanced_count += 1
-                logger.debug(f"  LLM extracted {field_name}: {value[:60]}")
+                logger.debug(f"  LLM extracted {field_name}: {val_str[:60]}")
+
 
         if enhanced_count:
             logger.info(f"LLM enhanced {enhanced_count}/{len(missing_fields)} low-confidence fields")

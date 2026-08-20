@@ -315,6 +315,58 @@ GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$")
 PAN_RE   = re.compile(r"^[A-Z]{5}\d{4}[A-Z]$")
 IFSC_RE  = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
 
+GST_STATE_CODES: dict[str, str] = {
+    "01": "Jammu & Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh",
+    "05": "Uttarakhand", "06": "Haryana", "07": "Delhi", "08": "Rajasthan", "09": "Uttar Pradesh",
+    "10": "Bihar", "11": "Sikkim", "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur",
+    "15": "Mizoram", "16": "Tripura", "17": "Meghalaya", "18": "Assam", "19": "West Bengal",
+    "20": "Jharkhand", "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh",
+    "24": "Gujarat", "27": "Maharashtra", "29": "Karnataka", "30": "Goa", "32": "Kerala",
+    "33": "Tamil Nadu", "36": "Telangana", "37": "Andhra Pradesh"
+}
+
+
+def number_to_words_inr(num: Optional[float]) -> str:
+    """Convert number to Indian currency words format."""
+    if not num or num <= 0:
+        return ""
+    a = ["", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine", "Ten",
+         "Eleven", "Twelve", "Thirteen", "Fourteen", "Fifteen", "Sixteen", "Seventeen", "Eighteen", "Nineteen"]
+    b = ["", "", "Twenty", "Thirty", "Forty", "Fifty", "Sixty", "Seventy", "Eighty", "Ninety"]
+
+    def in_words(n):
+        s = ""
+        if n > 99:
+            s += a[n // 100] + " Hundred "
+            n %= 100
+        if n > 19:
+            s += b[n // 10] + (" " + a[n % 10] if n % 10 else "")
+        elif n > 0:
+            s += a[n]
+        return s.strip()
+
+    whole = int(num)
+    paise = round((num - whole) * 100)
+    res = ""
+    crore = whole // 10000000
+    whole %= 10000000
+    lakh = whole // 100000
+    whole %= 100000
+    thousand = whole // 1000
+    whole %= 1000
+    hundred = whole
+
+    if crore: res += in_words(crore) + " Crore "
+    if lakh: res += in_words(lakh) + " Lakh "
+    if thousand: res += in_words(thousand) + " Thousand "
+    if hundred: res += in_words(hundred) + " "
+
+    res = res.strip()
+    if res: res = "Rupees " + res
+    if paise > 0:
+        res += (" and " if res else "Rupees ") + in_words(paise) + " Paise"
+    return (res + " Only") if res else ""
+
 
 class InvoiceValidator:
     """
@@ -327,6 +379,9 @@ class InvoiceValidator:
     def validate(self, invoice: ExtractedInvoice) -> tuple[InvoiceSchema, ValidationReport]:
         report = ValidationReport()
         schema = self._to_schema(invoice)
+
+        # Cross-field mathematical & consistency auto-repair
+        schema = self._auto_repair(schema)
 
         self._check_required_fields(schema, report)
         self._check_formats(schema, report)
@@ -342,6 +397,67 @@ class InvoiceValidator:
             f"errors={len(report.errors)}, warnings={len(report.warnings)}"
         )
         return schema, report
+
+    def _auto_repair(self, s: InvoiceSchema) -> InvoiceSchema:
+        """
+        Cross-field consistency and auto-repair logic before validation.
+        Fixes common arithmetic and field omissions using known relationships.
+        """
+        # 1. Compute subtotal from line items if subtotal is missing
+        if s.line_items and (s.subtotal is None or s.subtotal == 0):
+            item_sum = sum(item.amount for item in s.line_items if item.amount)
+            if item_sum > 0:
+                s.subtotal = round(item_sum, 2)
+
+        # 2. Total tax calculation from CGST + SGST + IGST if tax_amount is missing
+        taxes = [s.cgst, s.sgst, s.igst]
+        valid_taxes = [t for t in taxes if t is not None]
+        if valid_taxes and (s.tax_amount is None or s.tax_amount == 0):
+            s.tax_amount = round(sum(valid_taxes), 2)
+
+        # 3. Derive grand_total if subtotal + tax_amount are present
+        if s.subtotal is not None and s.tax_amount is not None and (s.grand_total is None or s.grand_total == 0):
+            computed = s.subtotal + s.tax_amount - (s.discount or 0.0) + (s.round_off or 0.0)
+            if computed > 0:
+                s.grand_total = round(computed, 2)
+
+        # 4. Derive subtotal from grand_total if grand_total is present and tax_amount is known
+        if s.grand_total is not None and s.tax_amount is not None and (s.subtotal is None or s.subtotal == 0):
+            derived_subtotal = s.grand_total - s.tax_amount + (s.discount or 0.0) - (s.round_off or 0.0)
+            if derived_subtotal > 0:
+                s.subtotal = round(derived_subtotal, 2)
+
+        # 5. If grand_total exists and no taxes were extracted or mentioned, subtotal == grand_total
+        if s.grand_total is not None and (s.subtotal is None or s.subtotal == 0) and not valid_taxes:
+            s.subtotal = s.grand_total
+
+        # 6. If line items amount is missing but grand_total exists, sync single line item
+        if s.grand_total is not None and s.line_items and len(s.line_items) == 1:
+            if s.line_items[0].amount == 0 or s.line_items[0].taxable_value == 0:
+                target_val = s.subtotal if s.subtotal else s.grand_total
+                s.line_items[0].rate = target_val
+                s.line_items[0].amount = target_val
+                s.line_items[0].taxable_value = target_val
+
+        # 7. Extract state code / place of supply from GSTIN if missing
+        if not s.place_of_supply and s.vendor_gstin and len(s.vendor_gstin) >= 2:
+            st_code = s.vendor_gstin[:2]
+            if st_code in GST_STATE_CODES:
+                s.place_of_supply = f"{st_code} - {GST_STATE_CODES[st_code]}"
+
+        # 8. Amount in words derivation
+        if not s.amount_in_words and s.grand_total and s.grand_total > 0:
+            s.amount_in_words = number_to_words_inr(s.grand_total)
+
+        # 9. Account Name fallback to Beneficiary or Vendor name
+        if not s.account_name:
+            if s.buyer_name:
+                s.account_name = s.buyer_name
+            elif s.vendor_name:
+                s.account_name = s.vendor_name
+
+        return s
+
 
     # ------------------------------------------------------------------
 
@@ -394,15 +510,22 @@ class InvoiceValidator:
             due_date=self._get_val(inv.due_date),
             po_number=self._get_val(inv.po_number),
             place_of_supply=self._get_val(getattr(inv, "place_of_supply", None)),
+            category=self._get_val(getattr(inv, "category", None)),
+            subcategory=self._get_val(getattr(inv, "subcategory", None)),
             vendor_name=self._get_val(inv.vendor_name),
             vendor_address=self._get_val(inv.vendor_address),
+            vendor_address_line1=self._get_val(getattr(inv, "vendor_address_line1", None)),
+            vendor_address_line2=self._get_val(getattr(inv, "vendor_address_line2", None)),
             vendor_gstin=self._get_val(inv.vendor_gstin),
             vendor_pan=self._get_val(inv.vendor_pan),
             vendor_email=self._get_val(inv.vendor_email),
             vendor_phone=self._get_val(inv.vendor_phone),
             buyer_name=self._get_val(inv.buyer_name),
             buyer_address=self._get_val(inv.buyer_address),
+            buyer_address_line1=self._get_val(getattr(inv, "buyer_address_line1", None)),
+            buyer_address_line2=self._get_val(getattr(inv, "buyer_address_line2", None)),
             buyer_gstin=self._get_val(inv.buyer_gstin),
+            buyer_phone=self._get_val(getattr(inv, "buyer_phone", None)),
             sls_code=self._get_val(getattr(inv, "sls_code", None)),
             line_items=line_items,
             subtotal=self._get_float(inv.subtotal),
@@ -424,6 +547,7 @@ class InvoiceValidator:
             remarks=self._get_val(getattr(inv, "remarks", None)),
             overall_confidence=inv.overall_confidence,
         )
+
 
     def _check_required_fields(self, s: InvoiceSchema, r: ValidationReport):
         required = {

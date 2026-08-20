@@ -100,12 +100,14 @@ class InvoiceOCR:
                                 ))
             except Exception as e:
                 logger.debug(f"PaddleOCR extraction fallback triggered: {e}")
+                self._ocr = None
                 if self._easyocr is None:
                     try:
                         import easyocr
                         self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
                     except Exception:
                         pass
+
 
         if not text_blocks and self._easyocr is not None:
             results = self._easyocr.readtext(crop)

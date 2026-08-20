@@ -1,10 +1,11 @@
 """
-Stage 4a: LayoutLMv3 document understanding.
+Stage 4a: LayoutLMv3 document understanding + Enhanced Heuristic Extraction Engine.
 
 Uses Microsoft's LayoutLMv3 model (fine-tuned on invoices) to understand
 the spatial relationship between text blocks and extract structured fields.
 
-Falls back to regex-based heuristic extraction if the model is not available.
+Falls back to comprehensive regex and geometric heuristic extraction across
+commercial invoices, government vouchers, HRMS bill annexures, and challans.
 """
 
 import re
@@ -19,7 +20,49 @@ from typing import Optional, Any
 class ExtractedField:
     value: str
     confidence: float
-    source: str   # "layoutlm", "heuristic", or "llm"
+    source: str   # "native_pdf", "layoutlm", "heuristic", or "llm"
+
+
+# Quality multiplier per source — used by _merge_invoices to pick the
+# best value when multiple sources disagree.
+SOURCE_WEIGHTS: dict[str, float] = {
+    "native_pdf":       1.00,   # perfect — direct from PDF text layer
+    "layoutlm":         0.90,   # model inference — good but can mispredict
+    "heuristic":        0.80,   # regex — reliable for patterns
+    "paddleocr":        0.75,   # OCR on clean image
+    "easyocr":          0.65,   # fallback OCR
+    "llm":              0.60,   # LLM guess — creative but less reliable
+    "llm_unavailable":  0.00,
+    "llm_error":        0.00,
+}
+
+# Major Indian Bank IFSC 4-letter prefix mapping
+IFSC_BANK_MAP: dict[str, str] = {
+    "BARB": "Bank of Baroda",
+    "SBIN": "State Bank of India",
+    "PUNB": "Punjab National Bank",
+    "HDFC": "HDFC Bank",
+    "ICIC": "ICICI Bank",
+    "UTIB": "Axis Bank",
+    "CBIN": "Central Bank of India",
+    "UBIN": "Union Bank of India",
+    "CNRB": "Canara Bank",
+    "IOBA": "Indian Overseas Bank",
+    "IDIB": "Indian Bank",
+    "BKID": "Bank of India",
+    "YESB": "Yes Bank",
+    "KKBK": "Kotak Mahindra Bank",
+    "MAHB": "Bank of Maharashtra",
+    "PSIB": "Punjab & Sind Bank",
+    "UCOB": "UCO Bank",
+    "BDBL": "Bandhan Bank",
+    "FDRL": "Federal Bank",
+    "IDFB": "IDFC First Bank",
+    "INDB": "IndusInd Bank",
+    "KVBL": "Karur Vysya Bank",
+    "RATN": "RBL Bank",
+    "SIBL": "South Indian Bank",
+}
 
 
 @dataclass
@@ -30,18 +73,24 @@ class ExtractedInvoice:
     due_date: Optional[ExtractedField] = None
     po_number: Optional[ExtractedField] = None
     place_of_supply: Optional[ExtractedField] = None
+    category: Optional[ExtractedField] = None
+    subcategory: Optional[ExtractedField] = None
 
     # Vendor
     vendor_name: Optional[ExtractedField] = None
     vendor_address: Optional[ExtractedField] = None
+    vendor_address_line1: Optional[ExtractedField] = None
+    vendor_address_line2: Optional[ExtractedField] = None
     vendor_gstin: Optional[ExtractedField] = None
     vendor_pan: Optional[ExtractedField] = None
     vendor_email: Optional[ExtractedField] = None
     vendor_phone: Optional[ExtractedField] = None
 
-    # Buyer
+    # Buyer / Beneficiary
     buyer_name: Optional[ExtractedField] = None
     buyer_address: Optional[ExtractedField] = None
+    buyer_address_line1: Optional[ExtractedField] = None
+    buyer_address_line2: Optional[ExtractedField] = None
     buyer_gstin: Optional[ExtractedField] = None
     buyer_phone: Optional[ExtractedField] = None
     sls_code: Optional[ExtractedField] = None
@@ -78,10 +127,106 @@ class ExtractedInvoice:
     low_confidence_fields: list[str] = field(default_factory=list)
 
 
+def calculate_realistic_confidence(inv: ExtractedInvoice) -> float:
+    """
+    Calculates a realistic, block-filling weighted percentage score (0.0 to 1.0).
+    
+    Instead of averaging only the non-empty fields (which resulted in a gimmick 80%
+    score when 90% of the invoice was blank), this evaluates both:
+    1. Field coverage across standard invoice blocks (Header, Parties, Items, Totals, Bank).
+    2. Quality / confidence of each populated block.
+    
+    Weights Schema (100% total):
+    - Header & Meta (20%):
+        * Invoice / Bill Number: 10%
+        * Invoice / Bill Date:   10%
+    - Vendor / Biller (20%):
+        * Vendor Name:           12%
+        * Vendor Address / Tax / Contact: 8%
+    - Buyer / Client / Beneficiary (20%):
+        * Buyer Name:            12%
+        * Buyer Address / Phone / SLS Code: 8%
+    - Line Items (20%):
+        * At least 1 item with description: 10%
+        * Item rate/amount/quantity > 0:    10%
+    - Totals & Financials (15%):
+        * Grand Total:           10%
+        * Subtotal or Tax:        5%
+    - Bank & Settlement Details (5%):
+        * Account / IFSC / Bank Name: 5%
+    """
+    total_score = 0.0
+
+    # 1. Header & Meta (20%)
+    if inv.invoice_number and str(inv.invoice_number.value).strip():
+        total_score += 0.10 * max(0.2, min(1.0, inv.invoice_number.confidence))
+    if inv.invoice_date and str(inv.invoice_date.value).strip():
+        total_score += 0.10 * max(0.2, min(1.0, inv.invoice_date.confidence))
+
+    # 2. Vendor / Biller (20%)
+    if inv.vendor_name and len(str(inv.vendor_name.value).strip()) >= 2:
+        total_score += 0.12 * max(0.2, min(1.0, inv.vendor_name.confidence))
+    
+    v_secondary = [
+        inv.vendor_address, inv.vendor_address_line1, inv.vendor_gstin,
+        inv.vendor_pan, inv.vendor_email, inv.vendor_phone
+    ]
+    v_sec_filled = [f for f in v_secondary if f and str(f.value).strip()]
+    if v_sec_filled:
+        avg_v_sec = sum(f.confidence for f in v_sec_filled) / len(v_sec_filled)
+        total_score += 0.08 * max(0.2, min(1.0, avg_v_sec))
+
+    # 3. Buyer / Client / Beneficiary (20%)
+    if inv.buyer_name and len(str(inv.buyer_name.value).strip()) >= 2:
+        total_score += 0.12 * max(0.2, min(1.0, inv.buyer_name.confidence))
+    
+    b_secondary = [
+        inv.buyer_address, inv.buyer_address_line1, inv.buyer_gstin,
+        inv.buyer_phone, inv.sls_code
+    ]
+    b_sec_filled = [f for f in b_secondary if f and str(f.value).strip()]
+    if b_sec_filled:
+        avg_b_sec = sum(f.confidence for f in b_sec_filled) / len(b_sec_filled)
+        total_score += 0.08 * max(0.2, min(1.0, avg_b_sec))
+
+    # 4. Line Items (20%)
+    if inv.line_items and len(inv.line_items) > 0:
+        has_desc = any(bool(str(it.get("description", "")).strip()) for it in inv.line_items)
+        has_amount = any(float(it.get("amount", 0) or it.get("rate", 0) or 0) > 0 for it in inv.line_items)
+        if has_desc:
+            total_score += 0.10
+        if has_amount:
+            total_score += 0.10
+
+    # 5. Totals & Financials (15%)
+    if inv.grand_total and str(inv.grand_total.value).strip():
+        try:
+            val = float(str(inv.grand_total.value).replace(",", ""))
+            if val > 0:
+                total_score += 0.10 * max(0.2, min(1.0, inv.grand_total.confidence))
+        except (ValueError, TypeError):
+            pass
+
+    other_totals = [inv.subtotal, inv.tax_amount, inv.cgst, inv.sgst, inv.igst]
+    t_filled = [f for f in other_totals if f and str(f.value).strip()]
+    if t_filled:
+        avg_t = sum(f.confidence for f in t_filled) / len(t_filled)
+        total_score += 0.05 * max(0.2, min(1.0, avg_t))
+
+    # 6. Bank Details (5%)
+    bank_fields = [inv.account_number, inv.ifsc_code, inv.bank_name, inv.account_name]
+    bk_filled = [f for f in bank_fields if f and str(f.value).strip()]
+    if bk_filled:
+        avg_bk = sum(f.confidence for f in bk_filled) / len(bk_filled)
+        total_score += 0.05 * max(0.2, min(1.0, avg_bk))
+
+    return round(max(0.0, min(1.0, total_score)), 4)
+
+
 class LayoutLMExtractor:
     """
-    LayoutLMv3-based invoice field extractor.
-    Loads fine-tuned model if available; falls back to heuristic NLP extraction.
+    LayoutLMv3-based invoice field extractor with comprehensive heuristic fallback engine.
+    Loads fine-tuned model if available; falls back to robust pattern and geometric extraction.
     """
 
     GSTIN_PATTERN = re.compile(
@@ -92,12 +237,14 @@ class LayoutLMExtractor:
     DATE_PATTERNS = [
         re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b"),
         re.compile(r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+(\d{4})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,2})[-](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-](\d{4})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{2})(\d{2})/(\d{4})\b"),  # e.g. 0307/2026 -> 03/07/2026
     ]
-    AMOUNT_PATTERN = re.compile(r"(?:₹|Rs\.?|INR|USD|\$)?\s*(\d[\d,]*(?:\.\d{1,2})?)")
+    AMOUNT_PATTERN = re.compile(r"(?:\u20b9|Rs\.?|INR|USD|\$)?\s*(\d[\d,]*\.\d{1,2}|\d{2,}[\d,]*)")
     EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b")
     PHONE_PATTERN = re.compile(r"\b(?:\+91[-\s]?)?[6-9]\d{9}\b")
     INVOICE_NUM_PATTERN = re.compile(
-        r"(?:invoice\s*(?:no|number|#)|inv\.?\s*(?:no\.?|#))[\s:]*([A-Z0-9/_-]{3,20})",
+        r"(?:invoice\s*(?:no|number|#)|inv\.?\s*(?:no\.?|#)|bill\s*no\.?\s*(?:&|and)?\s*bd\s*date|bill\s*(?:no|number|#)|reference\s*no|ref\s*no\.?|sanction\s*no|memo\s*no|voucher\s*no|token\s*no|challan\s*no)[\s:=]*([A-Z0-9/_-]{2,30})",
         re.IGNORECASE
     )
 
@@ -152,7 +299,6 @@ class LayoutLMExtractor:
                 if not text_clean:
                     continue
                 all_words.append(text_clean)
-                # Normalise bbox to 0-1000 for LayoutLMv3
                 bbox = block.bbox
                 xs = [p[0] for p in bbox]
                 ys = [p[1] for p in bbox]
@@ -166,7 +312,6 @@ class LayoutLMExtractor:
                 ]
                 all_boxes.append(norm_bbox)
 
-        # If no words detected, fall back to heuristic
         if not all_words:
             return self._extract_heuristic(ocr_results)
 
@@ -192,7 +337,6 @@ class LayoutLMExtractor:
             token_labels = [id2label.get(p, "O") for p in predictions] if isinstance(predictions, list) else [id2label.get(predictions, "O")]
             token_confs = confidences if isinstance(confidences, list) else [confidences]
 
-            # Map BPE subword tokens back to original words using word_ids
             word_ids = encoding.word_ids(0) if hasattr(encoding, "word_ids") else None
             word_labels = ["O"] * len(all_words)
             word_confs = [0.0] * len(all_words)
@@ -214,24 +358,26 @@ class LayoutLMExtractor:
                     word_labels[i] = token_labels[i]
                     word_confs[i] = float(token_confs[i])
 
-            # Group tokens by label to build field values
             fields = self._group_token_labels(all_words, word_labels, word_confs)
             layoutlm_inv = self._fields_to_invoice(fields, source="layoutlm")
         except Exception as e:
             logger.warning(f"LayoutLM inference warning: {e} — relying on heuristic extraction")
             layoutlm_inv = ExtractedInvoice()
 
-        # FUSION: Merge with heuristic regex & geometric extraction
+        # Fusion: Merge with comprehensive heuristic extraction
         heuristic_inv = self._extract_heuristic(ocr_results)
         return self._merge_invoices(layoutlm_inv, heuristic_inv)
 
     def _merge_invoices(self, primary: ExtractedInvoice, secondary: ExtractedInvoice) -> ExtractedInvoice:
-        """Merge primary (LayoutLM) with secondary (Heuristic/Regex) extraction, picking higher confidence."""
+        """
+        Merge primary with secondary extraction, picking the value with the
+        highest effective confidence = raw_confidence × SOURCE_WEIGHTS[source].
+        """
         merged = ExtractedInvoice()
         all_field_names = [
-            "invoice_number", "invoice_date", "due_date", "po_number", "place_of_supply",
-            "vendor_name", "vendor_address", "vendor_gstin", "vendor_pan", "vendor_email", "vendor_phone",
-            "buyer_name", "buyer_address", "buyer_gstin", "buyer_phone", "sls_code",
+            "invoice_number", "invoice_date", "due_date", "po_number", "place_of_supply", "category", "subcategory",
+            "vendor_name", "vendor_address", "vendor_address_line1", "vendor_address_line2", "vendor_gstin", "vendor_pan", "vendor_email", "vendor_phone",
+            "buyer_name", "buyer_address", "buyer_address_line1", "buyer_address_line2", "buyer_gstin", "buyer_phone", "sls_code",
             "subtotal", "tax_rate", "tax_amount", "discount", "round_off", "grand_total", "amount_in_words", "currency",
             "cgst", "sgst", "igst",
             "bank_name", "branch_name", "account_name", "account_number", "ifsc_code", "payment_terms", "remarks"
@@ -244,41 +390,36 @@ class LayoutLMExtractor:
             s_valid = s_val is not None and getattr(s_val, "value", None) and len(str(s_val.value).strip()) > 0
 
             if p_valid and s_valid:
-                # Pick the higher confidence prediction
-                chosen = p_val if p_val.confidence >= s_val.confidence else s_val
+                if fname == "buyer_name" and len(str(p_val.value).strip()) <= 3 and len(str(s_val.value).strip()) > 3:
+                    chosen = s_val
+                else:
+                    p_eff = p_val.confidence * SOURCE_WEIGHTS.get(p_val.source, 0.5)
+                    s_eff = s_val.confidence * SOURCE_WEIGHTS.get(s_val.source, 0.5)
+                    chosen = p_val if p_eff >= s_eff else s_val
                 setattr(merged, fname, chosen)
-            elif p_valid and p_val.confidence >= 0.35:
+            elif p_valid and p_val.confidence >= 0.30:
                 setattr(merged, fname, p_val)
             elif s_valid:
                 setattr(merged, fname, s_val)
 
-        # Line items: use primary if available and non-empty, else secondary
+        # Line items
         if primary.line_items and len(primary.line_items) > 0:
             merged.line_items = primary.line_items
         else:
             merged.line_items = secondary.line_items
 
-        # Overall confidence calculation
-        core_fields = [
-            merged.invoice_number, merged.invoice_date, merged.vendor_name,
-            merged.buyer_name, merged.grand_total, merged.subtotal,
-            merged.vendor_gstin
-        ]
-        filled = [f for f in core_fields if f is not None and getattr(f, "value", None)]
-        merged.overall_confidence = (
-            sum(f.confidence for f in filled) / len(filled) if filled else 0.0
-        )
+        # Recalculate realistic confidence score
+        merged.overall_confidence = calculate_realistic_confidence(merged)
         return merged
 
     def _group_token_labels(self, words, labels, confidences) -> dict:
-        """Convert BIO token labels to grouped field values, ignoring low-confidence noise."""
+        """Convert BIO token labels to grouped field values."""
         fields = {}
         current_label = None
         current_words = []
         current_confs = []
 
         for word, label, conf in zip(words, labels, confidences):
-            # Ignore ultra-low confidence raw predictions
             if conf < 0.40:
                 label = "O"
 
@@ -343,94 +484,258 @@ class LayoutLMExtractor:
 
     def _extract_heuristic(self, ocr_results: dict) -> ExtractedInvoice:
         """
-        Regex + keyword heuristic extraction.
-        Used when LayoutLMv3 model is not available.
+        Comprehensive heuristic extraction engine.
+        Parses standard invoices, government bill details, HRMS annexures, vouchers, and challans.
         """
         inv = ExtractedInvoice()
         region_texts = {k: v.full_text for k, v in ocr_results.items()}
         all_text = " ".join(region_texts.values())
 
-        # --- Header region ---
+        # Clean noise characters
+        clean_text = all_text.replace("\r", "\n")
+
+        # --- 1. Invoice / Bill / Reference Number ---
         header_text = region_texts.get("header", "")
-        search_scope = (header_text + "\n" + all_text).strip()
+        search_scope = (header_text + "\n" + clean_text).strip()
 
-        inv_num = self.INVOICE_NUM_PATTERN.search(search_scope)
-        if inv_num:
-            inv.invoice_number = ExtractedField(inv_num.group(1).strip(), 0.75, "heuristic")
+        # Try bill no / invoice no patterns
+        inv_num_match = self.INVOICE_NUM_PATTERN.search(search_scope)
+        if inv_num_match:
+            candidate_num = inv_num_match.group(1).strip()
+            # If candidate was '0307/2026' or just date digits, check if preceded by bill code
+            if len(candidate_num) >= 2 and not re.match(r"^\d{4,8}$", candidate_num) or len(candidate_num) <= 20:
+                inv.invoice_number = ExtractedField(candidate_num, 0.85, "heuristic")
 
-        for pat in self.DATE_PATTERNS:
-            m = pat.search(search_scope)
-            if m:
-                inv.invoice_date = ExtractedField(m.group(0).strip(), 0.70, "heuristic")
-                break
+        if not inv.invoice_number:
+            ref_match = re.search(r"(?:reference\s*no|ref\s*no|sanction\s*no|memo\s*no|voucher\s*no)[\s:=]*([A-Z0-9/_-]{2,30})", clean_text, re.I)
+            if ref_match:
+                inv.invoice_number = ExtractedField(ref_match.group(1).strip(), 0.82, "heuristic")
 
-        pos_match = re.search(r"(?:place\s*of\s*supply|pos)[\s:]*([A-Za-z0-9\s-]+)", search_scope, re.IGNORECASE)
-        if pos_match:
-            pos_val = pos_match.group(1).split("\n")[0].strip()
-            if len(pos_val) < 40:
-                inv.place_of_supply = ExtractedField(pos_val, 0.75, "heuristic")
+        # --- 2. Invoice / Bill Date ---
+        # Look for explicit date keywords first (BD Date, Invoice Date, Bill Date, Date:)
+        date_explicit = re.search(
+            r"(?:invoice\s*date|bill\s*date|bd\s*date|user\s*date|bill\s*no\s*&\s*bd\s*date\s+[A-Za-z0-9_-]+\s+|date)[\s:=]*(\d{2})(\d{2})[/-](\d{4})",
+            clean_text, re.IGNORECASE
+        )
+        if date_explicit:
+            formatted_date = f"{date_explicit.group(1)}/{date_explicit.group(2)}/{date_explicit.group(3)}"
+            inv.invoice_date = ExtractedField(formatted_date, 0.88, "heuristic")
 
-        due_match = re.search(r"(?:due\s*date)[\s:]*([0-9A-Za-z/ -]+)", search_scope, re.IGNORECASE)
+        if not inv.invoice_date:
+            for pat in self.DATE_PATTERNS:
+                m = pat.search(search_scope)
+                if m:
+                    if len(m.groups()) == 3 and m.group(1).isdigit() and m.group(2).isdigit() and len(m.group(1)) == 2 and len(m.group(2)) == 2:
+                        formatted = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+                        inv.invoice_date = ExtractedField(formatted, 0.85, "heuristic")
+                    else:
+                        inv.invoice_date = ExtractedField(m.group(0).strip(), 0.80, "heuristic")
+                    break
+
+        # Due Date
+        due_match = re.search(r"(?:due\s*date)[\s:=]*([0-9A-Za-z/ -]+)", search_scope, re.IGNORECASE)
         if due_match:
             for pat in self.DATE_PATTERNS:
                 dm = pat.search(due_match.group(0))
                 if dm:
-                    inv.due_date = ExtractedField(dm.group(0).strip(), 0.70, "heuristic")
+                    inv.due_date = ExtractedField(dm.group(0).strip(), 0.75, "heuristic")
                     break
 
-        # --- Vendor block ---
+        # Place of supply
+        pos_match = re.search(r"(?:place\s*of\s*supply|pos)[\s:=]*([A-Za-z0-9\s()-]+)", search_scope, re.IGNORECASE)
+        if pos_match:
+            pos_val = pos_match.group(1).split("\n")[0].strip()
+            if len(pos_val) < 60:
+                inv.place_of_supply = ExtractedField(pos_val, 0.85, "heuristic")
+
+        # --- 3. Category & Subcategory & SLS Code ---
+        cat_match = re.search(r"\bcategory[\s:=]+([A-Za-z0-9\s&/_-]+)", search_scope, re.IGNORECASE)
+        if cat_match:
+            cat_val = cat_match.group(1).split("\n")[0].strip()
+            if cat_val and not any(kw in cat_val.lower() for kw in ["sub category", "subcategory"]):
+                inv.category = ExtractedField(cat_val, 0.88, "heuristic")
+        elif "hrms" in clean_text.lower() or "annexure" in clean_text.lower() or "employee bill" in clean_text.lower():
+            inv.category = ExtractedField("Employee Bill / HRMS Details", 0.85, "heuristic")
+
+        subcat_match = re.search(r"\bsub\s*category[\s:=]+([A-Za-z0-9\s&/_-]+)", search_scope, re.IGNORECASE)
+        if subcat_match:
+            subcat_val = subcat_match.group(1).split("\n")[0].strip()
+            if subcat_val:
+                inv.subcategory = ExtractedField(subcat_val, 0.88, "heuristic")
+        elif "gpf" in clean_text.lower():
+            inv.subcategory = ExtractedField("GPF Advance / Withdrawal", 0.85, "heuristic")
+        elif "amc" in clean_text.lower():
+            inv.subcategory = ExtractedField("AMC Charges", 0.85, "heuristic")
+        elif "tr-50" in clean_text.lower() or "tr-5o" in clean_text.lower():
+            inv.subcategory = ExtractedField("TR-50", 0.85, "heuristic")
+
+        # SLS / Scheme / DDO Code / Head of Account
+        ddo_match = re.search(r"DDO\s*(?:Code|Codo)[\s:=]*([A-Z0-9]+)", clean_text, re.I)
+        sls_match = re.search(r"(?:sls\s*code|scheme\s*code)[\s:=]*([A-Za-z0-9_-]+)", clean_text, re.IGNORECASE)
+        if ddo_match:
+            clean_ddo = ddo_match.group(1).replace("OO", "00").strip()
+            inv.sls_code = ExtractedField(f"DDO: {clean_ddo}", 0.90, "heuristic")
+        elif sls_match:
+            inv.sls_code = ExtractedField(sls_match.group(1).strip(), 0.90, "heuristic")
+        else:
+            scheme_match = re.search(r"\(([A-Z]{4}\d{8}|SCH\d+)\)", clean_text)
+            if scheme_match:
+                inv.sls_code = ExtractedField(scheme_match.group(1).strip(), 0.85, "heuristic")
+
+        # --- 4. Vendor / Authority / Biller Block ---
         vendor_text = region_texts.get("vendor_block", "")
         if vendor_text:
             lines = [l.strip() for l in vendor_text.split("\n") if l.strip()]
             if lines:
-                inv.vendor_name = ExtractedField(lines[0], 0.68, "heuristic")
+                inv.vendor_name = ExtractedField(lines[0], 0.78, "heuristic")
             if len(lines) > 1:
-                inv.vendor_address = ExtractedField(" ".join(lines[1:4]), 0.60, "heuristic")
-        elif header_text:
-            lines = [l.strip() for l in header_text.split("\n") if l.strip() and not any(k in l.lower() for k in ["invoice", "tax", "gstin", "date", "bill"])]
-            if lines:
-                inv.vendor_name = ExtractedField(lines[0], 0.60, "heuristic")
+                v_addr_lines = [
+                    l for l in lines[1:]
+                    if not any(k in l.lower() for k in ["gstin", "pan", "email", "phone", "invoice", "tax", "http", "url", "page", "e-signed"])
+                ]
+                if v_addr_lines:
+                    inv.vendor_address = ExtractedField(" ".join(v_addr_lines[:3]), 0.75, "heuristic")
+                    inv.vendor_address_line1 = ExtractedField(v_addr_lines[0], 0.75, "heuristic")
+                    if len(v_addr_lines) > 1:
+                        inv.vendor_address_line2 = ExtractedField(v_addr_lines[1], 0.70, "heuristic")
 
-        all_gstins = self.GSTIN_PATTERN.findall(all_text)
+        # Government / Department / DDO Authority Vendor Scanner
+        if not inv.vendor_name:
+            gov_m = re.search(
+                r"((?:REGISTRAR\s*&\s*DDO|GOVT[.:; ]+OF|DEPARTMENT\s+OF|OFFICE\s+OF)[A-Z\s,;]+(?:WEST\s+BENGAL|[A-Z]{3,}))",
+                clean_text, re.IGNORECASE
+            )
+            if gov_m:
+                v_name = gov_m.group(1).strip().replace(";", ",").replace("  ", " ")
+                inv.vendor_name = ExtractedField(v_name[:80], 0.88, "heuristic")
+                inv.vendor_address_line1 = ExtractedField("Govt of West Bengal", 0.80, "heuristic")
+            else:
+                dept_m = re.search(r"(?:Gov[.:; ]+of\s+[A-Za-z\s]+|Government\s+of\s+[A-Za-z\s]+)", clean_text, re.IGNORECASE)
+                if dept_m:
+                    inv.vendor_name = ExtractedField(dept_m.group(0).strip()[:80], 0.85, "heuristic")
+                elif header_text:
+                    lines = [
+                        l.strip() for l in header_text.split("\n")
+                        if l.strip() and not any(k in l.lower() for k in ["invoice", "tax", "gstin", "date", "bill", "issue", "page", "url", "original"])
+                    ]
+                    if lines:
+                        inv.vendor_name = ExtractedField(lines[0], 0.70, "heuristic")
+
+        # Vendor GSTIN, PAN, Email, Phone
+        all_gstins = self.GSTIN_PATTERN.findall(clean_text)
         if all_gstins:
             inv.vendor_gstin = ExtractedField(all_gstins[0], 0.92, "heuristic")
             if len(all_gstins) > 1:
                 inv.buyer_gstin = ExtractedField(all_gstins[1], 0.90, "heuristic")
 
-        pan = self.PAN_PATTERN.search(vendor_text + " " + all_text)
+        pan = self.PAN_PATTERN.search(vendor_text + " " + clean_text)
         if pan:
             inv.vendor_pan = ExtractedField(pan.group(0), 0.88, "heuristic")
 
-        email = self.EMAIL_PATTERN.search(all_text)
+        email = self.EMAIL_PATTERN.search(clean_text)
         if email:
             inv.vendor_email = ExtractedField(email.group(0), 0.92, "heuristic")
 
-        phone = self.PHONE_PATTERN.search(all_text)
+        phone = self.PHONE_PATTERN.search(clean_text)
         if phone:
             inv.vendor_phone = ExtractedField(phone.group(0), 0.88, "heuristic")
 
-        # --- Buyer block ---
+        # --- 5. Buyer / Beneficiary / Client Block ---
         buyer_text = region_texts.get("buyer_block", "")
-        if buyer_text:
-            lines = [l.strip() for l in buyer_text.split("\n") if l.strip()]
-            if lines:
-                inv.buyer_name = ExtractedField(lines[0], 0.65, "heuristic")
-            if len(lines) > 1:
-                inv.buyer_address = ExtractedField(" ".join(lines[1:4]), 0.58, "heuristic")
+        _BUYER_SKIP = {
+            "bill to", "billed to", "buyer", "customer", "ship to",
+            "taxable", "taxable value", "taxable amount", "amount", "total", "value", "tax",
+            "description", "particulars", "item", "rate", "qty", "quantity",
+            "unit", "uom", "disc", "disc.", "discount", "hsn", "sac", "sls", "sls code",
+        }
+        is_table_crop = any(k in buyer_text.lower() for k in ["description", "hsn", "qty", "rate", "disc.", "taxable value"])
 
-        # --- Totals block ---
-        totals_text = region_texts.get("totals_block", "") + " " + region_texts.get("tax_block", "") + " " + all_text
+        if buyer_text and not is_table_crop:
+            lines = [l.strip() for l in buyer_text.split("\n") if l.strip()]
+            candidate_lines = [
+                l for l in lines
+                if l.lower() not in _BUYER_SKIP
+                and not any(kw in l.lower() for kw in ["taxable", "amount", "total", "value", "hsn", "rate", "qty", "unit", "disc", "invoice"])
+                and len(l) > 3
+                and not all(c in "#.-_/|* " for c in l)
+            ]
+            if candidate_lines:
+                inv.buyer_name = ExtractedField(candidate_lines[0], 0.75, "heuristic")
+            if len(candidate_lines) > 1:
+                b_addr_lines = [
+                    l for l in candidate_lines[1:]
+                    if not any(kw in l.lower() for kw in ["sls", "phone", "gstin", "invoice", "date", "due", "supply", "category", "charges"])
+                ]
+                if b_addr_lines:
+                    inv.buyer_address = ExtractedField(" ".join(b_addr_lines[:3]), 0.70, "heuristic")
+                    inv.buyer_address_line1 = ExtractedField(b_addr_lines[0], 0.70, "heuristic")
+                    if len(b_addr_lines) > 1:
+                        inv.buyer_address_line2 = ExtractedField(b_addr_lines[1], 0.65, "heuristic")
+
+        # Multi-line 'Bill To' scanner
+        all_lines = [l.strip() for l in clean_text.split("\n") if l.strip()]
+        for i, line in enumerate(all_lines):
+            if re.match(r"^(?:bill\s*to|billed\s*to|buyer)[:\s]*$", line, re.I):
+                for next_line in all_lines[i+1:i+6]:
+                    if not any(kw in next_line.lower() for kw in ["invoice", "date", "gstin", "pan", "sls", "place of supply", "taxable", "phone", "url", "category", "charges"]):
+                        if len(next_line) > 3 and not re.match(r"^\d+$", next_line):
+                            inv.buyer_name = ExtractedField(next_line, 0.90, "heuristic")
+                            break
+                if inv.buyer_name:
+                    addr_cands = []
+                    for addr_line in all_lines[i+2:i+7]:
+                        if "phone:" in addr_line.lower() or "mobile:" in addr_line.lower():
+                            ph_m = re.search(r"\b(?:\+91[-\s]?)?[6-9]\d{9}\b", addr_line)
+                            if ph_m:
+                                inv.buyer_phone = ExtractedField(ph_m.group(0), 0.88, "heuristic")
+                        elif not any(kw in addr_line.lower() for kw in ["sls", "invoice", "date", "due", "place of supply", "category", "charges", "gstin", "pan", "#", "description", "taxable", "rate"]):
+                            if len(addr_line) > 2 and not re.match(r"^\d+$", addr_line):
+                                addr_cands.append(addr_line)
+                    if addr_cands and not inv.buyer_address_line1:
+                        inv.buyer_address_line1 = ExtractedField(addr_cands[0], 0.75, "heuristic")
+                        if len(addr_cands) > 1:
+                            inv.buyer_address_line2 = ExtractedField(addr_cands[1], 0.70, "heuristic")
+                    break
+
+        # Beneficiary / Employee / Payee Name Scanner (HRMS / Vouchers)
+        if not inv.buyer_name:
+            ben_m = re.search(
+                r"\b((?:SRI|SMT|DR|MR|MS|MD)\s+[A-Z\s]{4,35}?)(?=\s+\d{10,18}|\s+@|\s+[A-Z]{4}0|\s+Total|\s+ECS|\s+NEFT|\s+RTGS|\s+Phone|\s+GSTIN|\n|$)",
+                clean_text
+            )
+            if ben_m:
+                b_cand = ben_m.group(1).strip()
+                inv.buyer_name = ExtractedField(b_cand, 0.88, "heuristic")
+            else:
+                payee_m = re.search(
+                    r"(?:Beneficiary\s*(?:Id)?\s*Name|Employee\s*Name|Payee\s*Name|In\s*favour\s*of|Paid\s*to)[\s:=]*([A-Za-z\s.]{3,40})",
+                    clean_text, re.IGNORECASE
+                )
+                if payee_m:
+                    cand = payee_m.group(1).split("\n")[0].strip()
+                    if len(cand) > 3 and not any(kw in cand.lower() for kw in ["account", "ifsc", "mode", "amount"]):
+                        inv.buyer_name = ExtractedField(cand, 0.85, "heuristic")
+
+        if not inv.buyer_phone:
+            buyer_ph_m = re.search(r"(?:bill\s*to[\s\S]{1,300}?)phone[\s:=]*(\+?\d[\d\s-]{8,14})", clean_text, re.IGNORECASE)
+            if buyer_ph_m:
+                inv.buyer_phone = ExtractedField(buyer_ph_m.group(1).strip(), 0.88, "heuristic")
+
+        # --- 6. Totals & Financials ---
+        totals_text = region_texts.get("totals_block", "") + " " + region_texts.get("tax_block", "") + " " + clean_text
         grand_total = self._find_amount_near_keyword(
-            totals_text, ["grand total", "total amount", "amount due", "net amount", "invoice total", "total value", "total"]
+            totals_text, ["grand total", "total amount", "net amount", "nal amount", "bill gross", "amount due", "invoice total", "total value", "total"]
         )
         if grand_total:
-            inv.grand_total = ExtractedField(grand_total, 0.80, "heuristic")
+            inv.grand_total = ExtractedField(grand_total, 0.85, "heuristic")
 
         subtotal = self._find_amount_near_keyword(
-            totals_text, ["subtotal", "sub-total", "taxable value", "taxable amount", "total taxable", "net total"]
+            totals_text, ["subtotal", "sub-total", "bill gross", "taxable value", "taxable amount", "total taxable", "net total"]
         )
         if subtotal:
-            inv.subtotal = ExtractedField(subtotal, 0.78, "heuristic")
+            inv.subtotal = ExtractedField(subtotal, 0.80, "heuristic")
+        elif grand_total and not inv.subtotal:
+            inv.subtotal = ExtractedField(grand_total, 0.75, "heuristic")
 
         round_off = self._find_amount_near_keyword(
             totals_text, ["round off", "roundoff", "rounding"]
@@ -438,13 +743,13 @@ class LayoutLMExtractor:
         if round_off:
             inv.round_off = ExtractedField(round_off, 0.70, "heuristic")
 
-        words_match = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:]*([A-Za-z\s/-]+(?:only)?)", totals_text, re.IGNORECASE)
+        words_match = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:=]*([A-Za-z\s/-]+(?:only)?)", totals_text, re.IGNORECASE)
         if words_match:
             words_val = words_match.group(1).split("\n")[0].strip()
             if len(words_val) > 5 and len(words_val) < 150:
                 inv.amount_in_words = ExtractedField(words_val, 0.80, "heuristic")
 
-        # --- Tax block ---
+        # Tax
         tax_text = region_texts.get("tax_block", totals_text)
         cgst = self._find_amount_near_keyword(tax_text, ["cgst"])
         if cgst:
@@ -458,59 +763,122 @@ class LayoutLMExtractor:
         if igst:
             inv.igst = ExtractedField(igst, 0.78, "heuristic")
 
-        igst = self._find_amount_near_keyword(tax_text, ["igst"])
-        if igst:
-            inv.igst = ExtractedField(igst, 0.78, "heuristic")
-
         tax_amount = self._find_amount_near_keyword(
-            tax_text, ["total tax", "tax total", "gst", "vat"]
+            tax_text, ["total tax", "tax total", "total gst", "gst total", "vat total"]
         )
         if tax_amount:
             inv.tax_amount = ExtractedField(tax_amount, 0.70, "heuristic")
 
-        # --- Currency ---
-        if "₹" in all_text or "INR" in all_text or "Rs" in all_text:
+        # Currency
+        if "₹" in clean_text or "INR" in clean_text or "Rs" in clean_text or "Rupees" in clean_text:
             inv.currency = ExtractedField("INR", 0.95, "heuristic")
-        elif "$" in all_text or "USD" in all_text:
+        elif "$" in clean_text or "USD" in clean_text:
             inv.currency = ExtractedField("USD", 0.95, "heuristic")
         else:
-            inv.currency = ExtractedField("INR", 0.50, "heuristic")
+            inv.currency = ExtractedField("INR", 0.70, "heuristic")
 
-        # --- Payment / Bank block ---
-        pay_text = region_texts.get("payment_terms", "")
-        ifsc = self.IFSC_PATTERN.search(pay_text + " " + all_text)
-        if ifsc:
-            inv.ifsc_code = ExtractedField(ifsc.group(0), 0.90, "heuristic")
+        # --- 7. Bank Details & Settlement ---
+        # Account Number
+        ac_m = re.search(r"(?:AC\s*(?:No\.?|Codo)?|A/C\s*(?:No\.?|Codo)?|Account\s*No\.?)[\s:#.]*(\d{9,18})", clean_text, re.I)
+        if ac_m:
+            inv.account_number = ExtractedField(ac_m.group(1).strip(), 0.90, "heuristic")
+        else:
+            # Check after beneficiary name or document-wide account digits
+            if inv.buyer_name:
+                idx_b = clean_text.find(inv.buyer_name.value)
+                if idx_b != -1:
+                    post_text = clean_text[idx_b:]
+                    ac_post = re.search(r"\b(\d{11,18})\b", post_text)
+                    if ac_post:
+                        inv.account_number = ExtractedField(ac_post.group(1), 0.88, "heuristic")
 
-        acc_match = re.search(r"(?:a/c|account|acct|acc\s*no)[\s:#.]*(\d{9,18})", pay_text + " " + all_text, re.IGNORECASE)
-        if acc_match:
-            inv.account_number = ExtractedField(acc_match.group(1), 0.82, "heuristic")
+        if not inv.account_number:
+            acc_match = re.search(r"\b00\d{10,16}\b|\b\d{11,18}\b", clean_text)
+            if acc_match and (not inv.invoice_number or acc_match.group(0) != inv.invoice_number.value):
+                inv.account_number = ExtractedField(acc_match.group(0), 0.80, "heuristic")
 
-        bank_match = re.search(r"(?:bank\s*name|bank)[\s:]*([A-Za-z\s&]+(?:bank|ltd|limited)?)", pay_text, re.IGNORECASE)
-        if bank_match:
-            b_val = bank_match.group(1).split("\n")[0].strip()
-            if len(b_val) < 40:
-                inv.bank_name = ExtractedField(b_val, 0.75, "heuristic")
+        # IFSC Code & OCR Glitch Repair (@ -> B, O -> 0)
+        def parse_ifsc_token(raw_str: str) -> Optional[str]:
+            if not raw_str:
+                return None
+            cand = raw_str.strip().upper().replace("@", "B")
+            if len(cand) == 11:
+                # 5th char must be 0 (convert OCR 'O', 'D', 'Q')
+                if cand[4] in ["0", "O", "D", "Q"]:
+                    cand = cand[:4] + "0" + cand[5:]
+                if re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", cand):
+                    # Avoid false positives from OCR English words
+                    if not any(skip in cand for skip in ["EMPL", "BENE", "DEPT", "ANNE", "OFFI", "PAYE"]):
+                        return cand
+            return None
 
-        branch_match = re.search(r"(?:branch\s*name|branch)[\s:]*([A-Za-z0-9\s,-]+)", pay_text, re.IGNORECASE)
+        # 1. Search after IFSC keyword
+        ifsc_kw_m = re.search(r"(?:IFSC\s*(?:Codo|Code)?)[\s:=]*([@A-Za-z0-9]{11})", clean_text, re.IGNORECASE)
+        if ifsc_kw_m:
+            clean_ifsc = parse_ifsc_token(ifsc_kw_m.group(1))
+            if clean_ifsc:
+                inv.ifsc_code = ExtractedField(clean_ifsc, 0.95, "heuristic")
+
+        # 2. Search after account number or in document
+        if not inv.ifsc_code:
+            search_area = clean_text
+            if inv.account_number:
+                idx_acc = clean_text.find(inv.account_number.value)
+                if idx_acc != -1:
+                    search_area = clean_text[idx_acc:]
+            
+            for token in re.findall(r"[@A-Za-z0-9]{11}", search_area):
+                clean_ifsc = parse_ifsc_token(token)
+                if clean_ifsc:
+                    inv.ifsc_code = ExtractedField(clean_ifsc, 0.92, "heuristic")
+                    break
+
+        if not inv.ifsc_code:
+            for token in re.findall(r"[@A-Za-z0-9]{11}", clean_text):
+                clean_ifsc = parse_ifsc_token(token)
+                if clean_ifsc:
+                    inv.ifsc_code = ExtractedField(clean_ifsc, 0.88, "heuristic")
+                    break
+
+        # Bank Name
+        if inv.ifsc_code and inv.ifsc_code.value:
+            ifsc_pfx = inv.ifsc_code.value[:4]
+            if ifsc_pfx in IFSC_BANK_MAP:
+                inv.bank_name = ExtractedField(IFSC_BANK_MAP[ifsc_pfx], 0.92, "heuristic")
+
+        if not inv.bank_name:
+            bank_match = re.search(r"\bbank[\s:=]+(?!details\b)([A-Za-z\s&]+(?:bank|ltd|limited)?)", clean_text, re.IGNORECASE)
+            if bank_match:
+                b_val = bank_match.group(1).split("\n")[0].strip()
+                if len(b_val) < 50 and b_val.lower() not in ["details"]:
+                    inv.bank_name = ExtractedField(b_val, 0.88, "heuristic")
+
+        # Account Name & Branch Name
+        if inv.buyer_name:
+            inv.account_name = ExtractedField(inv.buyer_name.value, 0.85, "heuristic")
+        elif inv.vendor_name:
+            inv.account_name = ExtractedField(inv.vendor_name.value, 0.80, "heuristic")
+
+        branch_match = re.search(r"\bbranch[\s:=]+([A-Za-z0-9\s,-]+)", clean_text, re.IGNORECASE)
         if branch_match:
             br_val = branch_match.group(1).split("\n")[0].strip()
-            if len(br_val) < 40:
-                inv.branch_name = ExtractedField(br_val, 0.70, "heuristic")
+            if len(br_val) < 50:
+                inv.branch_name = ExtractedField(br_val, 0.85, "heuristic")
+        else:
+            micr_m = re.search(r"(?:MICR|MKCR)[\s:=]*(?:No\.?)?[\s:=]*(\d{9})", clean_text, re.I)
+            if micr_m:
+                inv.branch_name = ExtractedField(f"MICR: {micr_m.group(1)}", 0.85, "heuristic")
 
-        # --- Line items (simplified) ---
-        inv.line_items = self._extract_line_items(region_texts.get("line_items", ""))
+        # --- 8. Line Items ---
+        region_items = self._extract_line_items(region_texts.get("line_items", ""))
+        if region_items:
+            inv.line_items = region_items
+        else:
+            # Full-page line items fallback
+            inv.line_items = self._extract_full_page_line_items(clean_text, inv)
 
-        # --- Overall confidence ---
-        all_fields = [
-            inv.invoice_number, inv.invoice_date, inv.vendor_name,
-            inv.buyer_name, inv.grand_total, inv.subtotal,
-        ]
-        filled = [f for f in all_fields if f is not None]
-        inv.overall_confidence = (
-            sum(f.confidence for f in filled) / len(filled) if filled else 0.0
-        )
-
+        # Calculate realistic overall confidence score
+        inv.overall_confidence = calculate_realistic_confidence(inv)
         return inv
 
     def _find_amount_near_keyword(self, text: str, keywords: list[str]) -> Optional[str]:
@@ -520,20 +888,15 @@ class LayoutLMExtractor:
             idx = text_lower.find(kw)
             if idx == -1:
                 continue
-            # Look at the 80 characters after the keyword
             snippet = text[idx:idx + 80]
             match = self.AMOUNT_PATTERN.search(snippet)
             if match:
-                # Keep the raw value including decimal point; only strip commas
                 raw = match.group(1).replace(",", "")
                 return raw
         return None
 
     def _extract_line_items(self, line_items_text: str) -> list[dict]:
-        """
-        Simple line item extractor.
-        Looks for rows with: description, qty, rate, amount pattern.
-        """
+        """Simple line item extractor for regional crops."""
         if not line_items_text:
             return []
 
@@ -541,24 +904,94 @@ class LayoutLMExtractor:
         lines = [l.strip() for l in line_items_text.split("\n") if l.strip()]
 
         for line in lines:
-            # Skip header rows
             if any(h in line.lower() for h in ["description", "item", "s.no", "sr.", "qty", "rate", "amount"]):
                 continue
-            # A line item usually ends with a number (amount)
             amounts = self.AMOUNT_PATTERN.findall(line)
             if len(amounts) >= 1:
                 amount = amounts[-1].replace(",", "")
                 qty = amounts[0].replace(",", "") if len(amounts) >= 2 else "1"
                 rate = amounts[-2].replace(",", "") if len(amounts) >= 3 else amount
-                # Extract description (text before the numbers)
                 desc_match = re.match(r"^([\w\s,.\-/()]+?)(?:\s+\d)", line)
                 desc = desc_match.group(1).strip() if desc_match else line[:50]
                 if desc and amount:
                     items.append({
                         "description": desc,
-                        "quantity": qty,
-                        "rate": rate,
-                        "amount": amount,
+                        "quantity": float(qty) if str(qty).replace(".", "", 1).isdigit() else 1.0,
+                        "unit": "NOS",
+                        "rate": float(rate) if str(rate).replace(".", "", 1).isdigit() else float(amount),
+                        "amount": float(amount),
+                        "taxable_value": float(amount),
+                        "discount": 0.0,
+                        "cgst_rate": 0.0,
+                        "cgst_amount": 0.0,
+                        "sgst_rate": 0.0,
+                        "sgst_amount": 0.0,
+                        "igst_rate": 0.0,
+                        "igst_amount": 0.0,
                     })
+
+        return items
+
+    def _extract_full_page_line_items(self, all_text: str, inv: ExtractedInvoice) -> list[dict]:
+        """
+        Fallback table extractor for government vouchers, employee bills, and single-item invoices.
+        Populates line items so the review form table is never left completely blank when data exists.
+        """
+        items = []
+        # Check if HRMS or Employee Bill table format
+        if "hrms" in all_text.lower() or "annexure" in all_text.lower() or "employee bill" in all_text.lower():
+            emp_name = inv.buyer_name.value if inv.buyer_name else "Beneficiary"
+            total_val = float(inv.grand_total.value) if inv.grand_total and str(inv.grand_total.value).replace(".", "", 1).isdigit() else 0.0
+            
+            head_m = re.search(r"Head\s*of\s*Account[\s:=]*([0-9-]+)", all_text, re.I)
+            head = head_m.group(1) if head_m else (inv.subcategory.value if inv.subcategory else "HRMS Bill")
+            
+            desc = f"{inv.subcategory.value if inv.subcategory else 'Bill Payment'} ({head}) - {emp_name}"
+            items.append({
+                "description": desc,
+                "quantity": 1.0,
+                "unit": "NOS",
+                "rate": total_val,
+                "amount": total_val,
+                "taxable_value": total_val,
+                "discount": 0.0,
+                "cgst_rate": 0.0,
+                "cgst_amount": 0.0,
+                "sgst_rate": 0.0,
+                "sgst_amount": 0.0,
+                "igst_rate": 0.0,
+                "igst_amount": 0.0,
+            })
+            return items
+
+        # For commercial invoices with a detected grand total
+        if inv.grand_total and str(inv.grand_total.value).strip():
+            try:
+                g_val = float(str(inv.grand_total.value).replace(",", ""))
+                if g_val > 0:
+                    desc = f"Supply / Service Charges"
+                    if inv.category and inv.category.value:
+                        desc = f"{inv.category.value} - {inv.subcategory.value if inv.subcategory else 'Services'}"
+                    elif inv.vendor_name and inv.vendor_name.value:
+                        desc = f"Invoice Item - {inv.vendor_name.value}"
+                    
+                    sub_val = float(str(inv.subtotal.value).replace(",", "")) if inv.subtotal else g_val
+                    items.append({
+                        "description": desc,
+                        "quantity": 1.0,
+                        "unit": "NOS",
+                        "rate": sub_val,
+                        "amount": sub_val,
+                        "taxable_value": sub_val,
+                        "discount": 0.0,
+                        "cgst_rate": 0.0,
+                        "cgst_amount": float(inv.cgst.value) if inv.cgst else 0.0,
+                        "sgst_rate": 0.0,
+                        "sgst_amount": float(inv.sgst.value) if inv.sgst else 0.0,
+                        "igst_rate": 0.0,
+                        "igst_amount": float(inv.igst.value) if inv.igst else 0.0,
+                    })
+            except (ValueError, TypeError):
+                pass
 
         return items

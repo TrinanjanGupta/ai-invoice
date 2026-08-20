@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import axios from 'axios'
 import toast from 'react-hot-toast'
@@ -7,7 +7,7 @@ import {
   CheckCircle, RefreshCw, Trash2, Plus,
   FileText, Building, Landmark, ShoppingBag, MessageSquare,
   ChevronRight, ChevronLeft, Copy, Check, Sparkles, LayoutGrid,
-  Columns, Maximize2, ZoomIn, ZoomOut, RotateCcw, ExternalLink,
+  Columns, Maximize2, ZoomIn, ZoomOut, RotateCcw, RotateCw, ExternalLink,
   Play, Cpu, X
 } from 'lucide-react'
 
@@ -163,11 +163,45 @@ export default function ReviewPage() {
   const [docPage, setDocPage] = useState(0)
   const [docTotalPages, setDocTotalPages] = useState(1)
   const [zoomLevel, setZoomLevel] = useState(100)
+  const [rotation, setRotation] = useState(0)
 
   // Training state
   const [showTrainModal, setShowTrainModal] = useState(false)
   const [trainingStatus, setTrainingStatus] = useState(null)
-  const [trainingInProgress, setTrainingInProgress] = useState(false)
+  const [isRescanning, setIsRescanning] = useState(false)
+  const [rescanProgress, setRescanProgress] = useState({
+    stage: 'preprocessing',
+    stageIndex: 1,
+    stageLabel: 'Pre-processing: Initializing document...',
+    progressPct: 15,
+  })
+  const rescanTargetRef = useRef(15)
+  const rescanEsRef = useRef(null)
+
+  // Smooth rescan progress ticker (250ms, independent of SSE cadence)
+  useEffect(() => {
+    if (!isRescanning) return
+    const ticker = setInterval(() => {
+      setRescanProgress(prev => {
+        const target = rescanTargetRef.current
+        if (prev.progressPct < target) {
+          return { ...prev, progressPct: Math.min(target, prev.progressPct + 1) }
+        }
+        // Creep forward up to 12% beyond last known target (covers slow OCR/LLM steps)
+        if (prev.progressPct < 98 && prev.progressPct < (target + 12)) {
+          return { ...prev, progressPct: prev.progressPct + 1 }
+        }
+        return prev
+      })
+    }, 300)
+    return () => clearInterval(ticker)
+  }, [isRescanning])
+
+  // Cleanup rescan EventSource on unmount
+  useEffect(() => {
+    return () => { if (rescanEsRef.current) rescanEsRef.current.close() }
+  }, [])
+
 
   // ── Auto-Calculate Totals ──────────────────────────────────────────────────
 
@@ -438,11 +472,21 @@ export default function ReviewPage() {
 
   // ── Save & Export Actions ──────────────────────────────────────────────────
 
-  const save = async () => {
+  const save = async (asVerified = false) => {
+    // Explicit boolean check prevents SyntheticEvent objects from being truthy
+    const isTrulyVerified = asVerified === true
     setSaving(true)
     try {
-      await axios.patch(`/api/invoices/${jobId}`, { corrections: formData })
-      toast.success('Invoice successfully saved and validated!')
+      const { data } = await axios.patch(`/api/invoices/${jobId}`, {
+        corrections: formData,
+        is_verified: isTrulyVerified,
+        status: isTrulyVerified ? 'reviewed' : 'partially_reviewed',
+      })
+      if (isTrulyVerified) {
+        toast.success('Invoice verified & marked as ground truth! ✓')
+      } else {
+        toast.success('Draft progress saved as Partially Reviewed (unverified).')
+      }
       setDirty(false)
       fetchJob()
     } catch (e) {
@@ -486,6 +530,70 @@ export default function ReviewPage() {
     }
   }
 
+  const reprocessCurrentInvoice = async () => {
+    // Close any previous rescan SSE connection
+    if (rescanEsRef.current) rescanEsRef.current.close()
+
+    rescanTargetRef.current = 15
+    setIsRescanning(true)
+    setRescanProgress({
+      stage: 'preprocessing',
+      stageIndex: 1,
+      stageLabel: 'Pre-processing: Initializing document...',
+      progressPct: 15,
+    })
+    try {
+      await axios.post(`/api/invoices/${jobId}/reprocess`)
+      toast.success('AI Pipeline re-scan started!')
+      setJob(prev => prev ? { ...prev, status: 'processing' } : prev)
+
+      // Open SSE stream — backend pushes events; no polling requests needed
+      const es = new EventSource(`/api/invoices/${jobId}/stream`)
+      rescanEsRef.current = es
+
+      es.onmessage = (e) => {
+        const data = JSON.parse(e.data)
+
+        if (data.stage_index != null && data.stage_index > 0) {
+          if ((data.progress_pct || 15) > rescanTargetRef.current) {
+            rescanTargetRef.current = data.progress_pct || 15
+          }
+          setRescanProgress(prev => ({
+            ...prev,
+            stage: data.stage || 'processing',
+            stageIndex: data.stage_index,
+            stageLabel: data.stage_label || 'Processing document...',
+          }))
+        }
+
+        if (data.status === 'done' || data.status === 'reviewed' || data.status === 'partially_reviewed') {
+          es.close()
+          rescanTargetRef.current = 100
+          setRescanProgress(prev => ({ ...prev, stageLabel: 'Digitization Complete', progressPct: 100, stageIndex: 6 }))
+          setTimeout(() => {
+            setIsRescanning(false)
+            fetchJob()
+            toast.success('Invoice data refreshed with latest AI pipeline results!')
+          }, 400)
+        } else if (data.status === 'failed') {
+          es.close()
+          setIsRescanning(false)
+          fetchJob()
+          toast.error('Re-scan encountered an error.')
+        }
+      }
+
+      es.onerror = () => {
+        // EventSource auto-reconnects on transient network errors
+      }
+    } catch (e) {
+      setIsRescanning(false)
+      toast.error('Re-scan failed: ' + (e.response?.data?.detail || e.message))
+    }
+  }
+
+
+
   // ── Step Validation Checks ─────────────────────────────────────────────────
 
   const isStepValid = (stepId) => {
@@ -505,7 +613,8 @@ export default function ReviewPage() {
     )
   }
 
-  if (!job || (job.status !== 'done' && job.status !== 'reviewed' && job.status !== 'failed')) {
+  const isReady = job && ['done', 'reviewed', 'partially_reviewed', 'failed'].includes(job.status)
+  if (!isReady) {
     return (
       <div className="p-12 text-center text-slate-400">
         <RefreshCw size={28} className="spinner mx-auto mb-3 text-blue-600" />
@@ -530,8 +639,20 @@ export default function ReviewPage() {
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <h1 className="text-sm font-bold text-slate-900 truncate max-w-xs md:max-w-md">{job.filename}</h1>
-              <span className={`badge ${job.status === 'reviewed' ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-blue-50 text-blue-700 border border-blue-200'}`}>
-                {job.status === 'reviewed' ? 'Verified' : 'AI Extracted'}
+              <span
+                className={`badge ${
+                  job.status === 'reviewed'
+                    ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                    : job.status === 'partially_reviewed'
+                    ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                    : 'bg-blue-50 text-blue-700 border border-blue-200'
+                }`}
+              >
+                {job.status === 'reviewed'
+                  ? '✓ Verified'
+                  : job.status === 'partially_reviewed'
+                  ? '⏳ Partially Reviewed'
+                  : '🤖 AI Extracted'}
               </span>
             </div>
             <p className="text-[11px] text-slate-400 font-mono">Job ID: {jobId.slice(0, 12)}</p>
@@ -599,12 +720,37 @@ export default function ReviewPage() {
           </div>
 
           <button
+            disabled={isRescanning || job?.status === 'processing'}
+            onClick={reprocessCurrentInvoice}
+            className={`btn-secondary py-1.5 px-3 border transition-all ${
+              isRescanning || job?.status === 'processing'
+                ? 'bg-amber-100 text-amber-900 border-amber-300 cursor-not-allowed opacity-85'
+                : 'text-amber-800 border-amber-200 bg-amber-50 hover:bg-amber-100'
+            }`}
+            title="Re-scan this invoice with the latest AI pipeline"
+          >
+            {isRescanning || job?.status === 'processing' ? (
+              <>
+                <RefreshCw size={13} className="spinner text-amber-700" />
+                <span className="hidden lg:inline font-semibold">Re-scanning...</span>
+              </>
+            ) : (
+              <>
+                <Sparkles size={13} className="text-amber-600" />
+                <span className="hidden lg:inline">Re-scan with AI</span>
+              </>
+            )}
+          </button>
+
+          <button
             onClick={() => setShowTrainModal(true)}
             className="btn-secondary py-1.5 px-3 text-purple-700 border-purple-200 bg-purple-50/50 hover:bg-purple-100/50"
             title="Train AI Models on Reviewed Invoices"
           >
             <Cpu size={13} /> <span className="hidden xl:inline">Train Models</span>
           </button>
+
+
 
           <button onClick={downloadPdf} title="Download rendered PDF invoice" className="btn-secondary py-1.5 px-3">
             <Download size={13} /> <span className="hidden md:inline">PDF</span>
@@ -613,12 +759,65 @@ export default function ReviewPage() {
             {copied ? <Check size={13} className="text-emerald-600" /> : <Copy size={13} />}
             <span className="hidden md:inline">{copied ? 'Copied!' : 'Copy JSON'}</span>
           </button>
-          <button onClick={save} disabled={saving} className="btn-primary py-1.5 px-4">
-            {saving ? <RefreshCw size={13} className="spinner" /> : <Save size={13} />}
-            <span>Save</span>
+
+          {/* Save Draft (Partial Review) */}
+          <button
+            onClick={() => save(false)}
+            disabled={saving}
+            className="btn-secondary py-1.5 px-3 text-xs border-amber-200 bg-amber-50 hover:bg-amber-100 text-amber-900 shadow-xs"
+            title="Save changes as a draft without marking as verified ground truth"
+          >
+            {saving ? <RefreshCw size={13} className="spinner" /> : <Save size={13} className="text-amber-700" />}
+            <span>Save Partial</span>
+          </button>
+
+          {/* Full Verify & Confirm */}
+          <button
+            onClick={() => save(true)}
+            disabled={saving}
+            className="btn-success py-1.5 px-3.5 text-xs shadow-xs"
+            title="Confirm all fields are correct and mark as verified ground truth for AI retraining"
+          >
+            {saving ? <RefreshCw size={13} className="spinner" /> : <CheckCircle size={13} />}
+            <span>Verify & Complete</span>
           </button>
         </div>
       </header>
+
+
+      {/* ── Active Scanning Banner ───────────────────────────────────────────── */}
+      {(isRescanning || job?.status === 'processing') && (
+        <div className="bg-slate-900 text-white px-6 py-2.5 flex flex-col md:flex-row md:items-center justify-between text-xs shadow-lg sticky top-[57px] z-20 border-b border-amber-500/40 gap-2.5 animate-fade-in">
+          <div className="flex items-center gap-3 font-medium min-w-0">
+            <div className="w-6 h-6 rounded-full bg-amber-500/20 border border-amber-500/50 flex items-center justify-center flex-shrink-0">
+              <RefreshCw size={12} className="spinner text-amber-400" />
+            </div>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="font-bold text-amber-300">
+                  {rescanProgress.stageIndex > 0 ? `Stage ${rescanProgress.stageIndex}/6:` : 'AI Pipeline Active:'}
+                </span>
+                <span className="text-white font-semibold truncate">
+                  {rescanProgress.stageLabel || 'Processing document...'}
+                </span>
+              </div>
+            </div>
+          </div>
+          
+          <div className="flex items-center gap-3 flex-shrink-0 self-end md:self-auto">
+            <div className="w-36 bg-slate-800 rounded-full h-2 overflow-hidden border border-slate-700">
+              <div
+                className="bg-amber-400 h-full rounded-full transition-all duration-500 ease-out"
+                style={{ width: `${rescanProgress.progressPct}%` }}
+              />
+            </div>
+            <span className="text-[11px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-2.5 py-0.5 rounded-full font-mono font-bold tracking-wide">
+              {rescanProgress.progressPct}%
+            </span>
+          </div>
+        </div>
+      )}
+
 
       {/* ── Retrain Modal ────────────────────────────────────────────────────── */}
       {showTrainModal && (
@@ -681,8 +880,8 @@ export default function ReviewPage() {
       )}
 
       {/* ── Main Content Area ────────────────────────────────────────────────── */}
-      <div className="flex-1 overflow-auto p-4 md:p-6">
-        <div className="max-w-7xl mx-auto">
+      <div className="flex-1 overflow-auto p-3 md:p-5 lg:p-6">
+        <div className="w-full max-w-[1920px] mx-auto">
           
           {/* Fullscreen Document Tab */}
           {activeTab === 'preview' ? (
@@ -735,7 +934,7 @@ export default function ReviewPage() {
                     <div className="flex items-center gap-1 bg-slate-100 p-0.5 rounded-lg border border-slate-200">
                       <button
                         onClick={() => setZoomLevel(z => Math.max(40, z - 25))}
-                        className="p-1 text-slate-600 hover:text-blue-600"
+                        className="p-1 text-slate-600 hover:text-blue-600 rounded hover:bg-white"
                         title="Zoom Out"
                       >
                         <ZoomOut size={14} />
@@ -743,17 +942,28 @@ export default function ReviewPage() {
                       <span className="text-xs font-mono font-semibold px-1 text-slate-700 min-w-[42px] text-center">{zoomLevel}%</span>
                       <button
                         onClick={() => setZoomLevel(z => Math.min(350, z + 25))}
-                        className="p-1 text-slate-600 hover:text-blue-600"
+                        className="p-1 text-slate-600 hover:text-blue-600 rounded hover:bg-white"
                         title="Zoom In"
                       >
                         <ZoomIn size={14} />
                       </button>
                       <button
-                        onClick={() => setZoomLevel(100)}
-                        className="p-1 text-slate-600 hover:text-blue-600"
-                        title="Reset Zoom (100%)"
+                        onClick={() => { setZoomLevel(100); setRotation(0) }}
+                        className="p-1 text-slate-600 hover:text-blue-600 rounded hover:bg-white"
+                        title="Reset Zoom (100%) & Rotation (0°)"
                       >
                         <RotateCcw size={12} />
+                      </button>
+                      <div className="w-[1px] h-3.5 bg-slate-300 mx-0.5" />
+                      <button
+                        onClick={() => setRotation(r => (r + 90) % 360)}
+                        className={`p-1 rounded text-slate-600 hover:text-blue-600 hover:bg-white flex items-center gap-1 transition-all ${
+                          rotation !== 0 ? 'text-blue-600 bg-blue-50 font-bold' : ''
+                        }`}
+                        title={`Rotate Image 90° clockwise (current: ${rotation}°)`}
+                      >
+                        <RotateCw size={13} />
+                        {rotation !== 0 && <span className="text-[10px] font-mono">{rotation}°</span>}
                       </button>
                     </div>
 
@@ -776,12 +986,19 @@ export default function ReviewPage() {
 
               <div className="flex-1 w-full rounded-lg overflow-auto border border-slate-200 bg-slate-200/80 p-0 relative shadow-inner">
                 {docSource === 'original' ? (
-                  <div className="min-w-full min-h-full w-max h-max p-4 flex items-start justify-center">
+                  <div className="min-w-full min-h-full w-max h-max p-4 flex items-center justify-center">
                     <img
                       src={previewImageUrl}
                       alt="Original Scanned Invoice"
-                      style={{ width: `${zoomLevel}%`, minWidth: `${zoomLevel}%`, maxWidth: 'none' }}
-                      className="rounded-lg shadow-xl bg-white border border-slate-300 transition-all duration-100 select-none block"
+                      style={{
+                        width: `${zoomLevel}%`,
+                        minWidth: `${zoomLevel}%`,
+                        maxWidth: 'none',
+                        transform: `rotate(${rotation}deg)`,
+                        transformOrigin: 'center center',
+                        transition: 'transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), width 0.1s ease-out',
+                      }}
+                      className="rounded-lg shadow-xl bg-white border border-slate-300 select-none block"
                     />
                   </div>
                 ) : (
@@ -794,10 +1011,10 @@ export default function ReviewPage() {
               </div>
             </div>
           ) : (
-            <div className={`grid ${activeTab === 'split' ? 'grid-cols-1 xl:grid-cols-12 gap-6' : 'grid-cols-1'}`}>
+            <div className={`grid ${activeTab === 'split' ? 'grid-cols-1 xl:grid-cols-12 2xl:grid-cols-12 gap-5' : 'grid-cols-1'}`}>
               
               {/* Form Column */}
-              <div className={`${activeTab === 'split' ? 'xl:col-span-7' : 'w-full'} space-y-5`}>
+              <div className={`${activeTab === 'split' ? 'xl:col-span-7 2xl:col-span-7' : 'w-full'} space-y-5`}>
 
                 {/* Guided Stepper Header (When in Wizard Mode) */}
                 {isWizardMode && (
@@ -868,21 +1085,28 @@ export default function ReviewPage() {
                 <div className="card p-4 bg-gradient-to-r from-white via-white to-blue-50/40 border-blue-100 flex flex-wrap items-center justify-between gap-4 shadow-sm">
                   <div className="flex items-center gap-3">
                     <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${
-                      confidenceScore >= 80 ? 'bg-emerald-100 text-emerald-700' : confidenceScore >= 60 ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'
+                      confidenceScore >= 80 ? 'bg-emerald-100 text-emerald-700' : confidenceScore >= 50 ? 'bg-blue-100 text-blue-700' : 'bg-amber-100 text-amber-700'
                     }`}>
                       <Sparkles size={20} />
                     </div>
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="text-xs font-bold uppercase tracking-wider text-slate-500">AI Detection Score</span>
+                        <span className="text-xs font-bold uppercase tracking-wider text-slate-500">Field Detection & Fill Rate</span>
                         <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                          confidenceScore >= 80 ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-700'
+                          confidenceScore >= 80 ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : confidenceScore >= 50 ? 'bg-blue-50 text-blue-700 border border-blue-200' : 'bg-amber-50 text-amber-700 border border-amber-200'
                         }`}>
                           {confidenceScore}%
                         </span>
+                        <span className="text-[11px] font-semibold text-slate-400">
+                          {confidenceScore >= 80 ? '(High Coverage)' : confidenceScore >= 50 ? '(Moderate Coverage)' : '(Partial Extraction)'}
+                        </span>
                       </div>
                       <p className="text-xs text-slate-600 mt-0.5">
-                        {job.needs_review ? 'Human verification recommended. Check highlighted fields.' : 'All automated layout & financial checks passed.'}
+                        {confidenceScore >= 80
+                          ? 'High extraction coverage — most invoice blocks and fields identified.'
+                          : confidenceScore >= 50
+                            ? 'Moderate extraction coverage — verify highlighted fields and line items.'
+                            : 'Low extraction coverage — document format may require manual verification.'}
                       </p>
                     </div>
                   </div>
@@ -1520,10 +1744,28 @@ export default function ReviewPage() {
                             <Copy size={13} /> {copied ? 'Copied JSON!' : 'Copy to Invoice Builder'}
                           </button>
                         </div>
-                        <button onClick={save} disabled={saving} className="btn-success text-xs px-6 py-2">
-                          {saving ? <RefreshCw size={14} className="spinner" /> : <Save size={14} />}
-                          Save & Verify Ground Truth
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => save(false)}
+                            disabled={saving}
+                            className="btn-secondary text-xs px-4 py-2 text-amber-900 bg-amber-50 border-amber-200 hover:bg-amber-100"
+                            title="Save your progress without marking as verified ground truth"
+                          >
+                            {saving ? <RefreshCw size={13} className="spinner" /> : <Save size={13} className="text-amber-700" />}
+                            <span>Save Partial</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => save(true)}
+                            disabled={saving}
+                            className="btn-success text-xs px-5 py-2 flex items-center gap-1.5"
+                            title="Confirm all fields are correct and mark as verified ground truth"
+                          >
+                            {saving ? <RefreshCw size={14} className="spinner" /> : <CheckCircle size={14} />}
+                            <span>Verify Ground Truth</span>
+                          </button>
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1550,15 +1792,29 @@ export default function ReviewPage() {
                         Next Step <ChevronRight size={14} />
                       </button>
                     ) : (
-                      <button
-                        type="button"
-                        onClick={save}
-                        disabled={saving}
-                        className="btn-success px-6 py-2 text-xs"
-                      >
-                        {saving ? <RefreshCw size={14} className="spinner" /> : <Save size={14} />}
-                        Save Invoice
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => save(false)}
+                          disabled={saving}
+                          className="btn-secondary px-4 py-2 text-xs text-amber-900 bg-amber-50 border-amber-200 hover:bg-amber-100"
+                          title="Save your changes so far without marking as verified ground truth"
+                        >
+                          {saving ? <RefreshCw size={13} className="spinner" /> : <Save size={13} className="text-amber-700" />}
+                          <span>Save as Partial</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => save(true)}
+                          disabled={saving}
+                          className="btn-success px-5 py-2 text-xs flex items-center gap-1.5"
+                          title="Confirm all fields are correct and mark as verified ground truth"
+                        >
+                          {saving ? <RefreshCw size={14} className="spinner" /> : <CheckCircle size={14} />}
+                          <span>Verify & Mark Done</span>
+                        </button>
+                      </div>
                     )}
                   </div>
                 )}
@@ -1567,7 +1823,7 @@ export default function ReviewPage() {
 
               {/* ── Split-Screen Document Preview Column ───────────────────── */}
               {activeTab === 'split' && (
-                <div className="xl:col-span-5 sticky top-20 h-[calc(100vh-120px)] card p-3 bg-white shadow-sm flex flex-col">
+                <div className="xl:col-span-5 2xl:col-span-5 sticky top-20 h-[calc(100vh-120px)] card p-3 bg-white shadow-sm flex flex-col">
                   
                   {/* Top Bar inside Document Pane */}
                   <div className="flex items-center justify-between pb-2 mb-2 border-b border-slate-100 flex-shrink-0">
@@ -1618,7 +1874,7 @@ export default function ReviewPage() {
                         <div className="flex items-center gap-0.5 bg-slate-100 p-0.5 rounded border border-slate-200">
                           <button
                             onClick={() => setZoomLevel(z => Math.max(40, z - 25))}
-                            className="p-0.5 text-slate-600 hover:text-blue-600"
+                            className="p-0.5 text-slate-600 hover:text-blue-600 rounded hover:bg-white"
                             title="Zoom Out"
                           >
                             <ZoomOut size={12} />
@@ -1626,17 +1882,28 @@ export default function ReviewPage() {
                           <span className="text-[10px] font-mono px-0.5 text-slate-700 min-w-[34px] text-center">{zoomLevel}%</span>
                           <button
                             onClick={() => setZoomLevel(z => Math.min(350, z + 25))}
-                            className="p-0.5 text-slate-600 hover:text-blue-600"
+                            className="p-0.5 text-slate-600 hover:text-blue-600 rounded hover:bg-white"
                             title="Zoom In"
                           >
                             <ZoomIn size={12} />
                           </button>
                           <button
-                            onClick={() => setZoomLevel(100)}
-                            className="p-0.5 text-slate-600 hover:text-blue-600"
-                            title="Reset Zoom (100%)"
+                            onClick={() => { setZoomLevel(100); setRotation(0) }}
+                            className="p-0.5 text-slate-600 hover:text-blue-600 rounded hover:bg-white"
+                            title="Reset Zoom (100%) & Rotation (0°)"
                           >
                             <RotateCcw size={10} />
+                          </button>
+                          <div className="w-[1px] h-3 bg-slate-300 mx-0.5" />
+                          <button
+                            onClick={() => setRotation(r => (r + 90) % 360)}
+                            className={`p-0.5 rounded text-slate-600 hover:text-blue-600 hover:bg-white flex items-center gap-0.5 transition-all ${
+                              rotation !== 0 ? 'text-blue-600 bg-blue-50 font-bold' : ''
+                            }`}
+                            title={`Rotate Image 90° clockwise (current: ${rotation}°)`}
+                          >
+                            <RotateCw size={11} />
+                            {rotation !== 0 && <span className="text-[9px] font-mono">{rotation}°</span>}
                           </button>
                         </div>
 
@@ -1662,12 +1929,19 @@ export default function ReviewPage() {
                   {/* Document Frame */}
                   <div className="flex-1 w-full rounded-lg overflow-auto border border-slate-200 bg-slate-200/80 p-0 relative shadow-inner">
                     {docSource === 'original' ? (
-                      <div className="min-w-full min-h-full w-max h-max p-3 flex items-start justify-center">
+                      <div className="min-w-full min-h-full w-max h-max p-3 flex items-center justify-center">
                         <img
                           src={previewImageUrl}
                           alt="Original Scanned Document"
-                          style={{ width: `${zoomLevel}%`, minWidth: `${zoomLevel}%`, maxWidth: 'none' }}
-                          className="rounded shadow-lg bg-white border border-slate-300 transition-all duration-100 select-none block"
+                          style={{
+                            width: `${zoomLevel}%`,
+                            minWidth: `${zoomLevel}%`,
+                            maxWidth: 'none',
+                            transform: `rotate(${rotation}deg)`,
+                            transformOrigin: 'center center',
+                            transition: 'transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), width 0.1s ease-out',
+                          }}
+                          className="rounded shadow-lg bg-white border border-slate-300 select-none block"
                         />
                       </div>
                     ) : (
