@@ -446,24 +446,24 @@ export default function InvoiceListPage() {
       </div>
 
       {/* ── Search & Filter Controls Bar ───────────────────────────────────── */}
-      <div className="card p-4 space-y-3.5 bg-white shadow-sm border-slate-200">
+      <div className="card p-4 space-y-3.5 bg-white dark:bg-slate-900 shadow-sm border-slate-200 dark:border-slate-800">
         
         {/* Search Bar */}
         <form onSubmit={handleSearch} className="flex flex-wrap items-center gap-2">
           <div className="relative flex-1 min-w-[260px]">
-            <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+            <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 dark:text-slate-500" />
             <input
               type="text"
               placeholder="Search by invoice file name or Job ID..."
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
-              className="w-full pl-9 pr-8 py-2 bg-slate-50 hover:bg-slate-100/70 focus:bg-white border border-slate-200 rounded-lg text-xs md:text-sm text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
+              className="w-full pl-9 pr-8 py-2 bg-slate-50 dark:bg-slate-800/80 hover:bg-slate-100/70 dark:hover:bg-slate-800 focus:bg-white dark:focus:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg text-xs md:text-sm text-slate-800 dark:text-white placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 transition-all"
             />
             {searchInput && (
               <button
                 type="button"
                 onClick={handleClearSearch}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 rounded-full"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 p-0.5 rounded-full"
                 title="Clear search input"
               >
                 <X size={14} />
@@ -483,7 +483,7 @@ export default function InvoiceListPage() {
             <button
               type="button"
               onClick={handleClearSearch}
-              className="btn-secondary text-xs px-3 py-2 flex items-center gap-1 text-slate-600 hover:text-red-600 shrink-0"
+              className="btn-secondary text-xs px-3 py-2 flex items-center gap-1 text-slate-600 dark:text-slate-400 hover:text-red-600 dark:hover:text-red-400 shrink-0"
               title="Reset search filter"
             >
               <X size={13} />
@@ -493,9 +493,9 @@ export default function InvoiceListPage() {
         </form>
 
         {/* Status Filter Tabs */}
-        <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 flex-wrap">
+        <div className="pt-2 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between gap-2 flex-wrap">
           <div className="flex items-center gap-1.5 overflow-x-auto pb-1 max-w-full no-scrollbar">
-            <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mr-1 flex items-center gap-1">
+            <span className="text-[11px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-wider mr-1 flex items-center gap-1">
               <Filter size={11} /> Filter:
             </span>
             {FILTER_TABS.map((tab) => {
@@ -508,10 +508,10 @@ export default function InvoiceListPage() {
                   className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap transition-all ${
                     isActive
                       ? 'bg-blue-600 text-white shadow-sm ring-2 ring-blue-500/30'
-                      : 'bg-slate-100 hover:bg-slate-200/70 text-slate-600 hover:text-slate-900 border border-transparent'
+                      : 'bg-slate-100 dark:bg-slate-800 hover:bg-slate-200/70 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white border border-transparent'
                   }`}
                 >
-                  <TabIcon size={12} className={isActive ? 'text-white' : tab.color || 'text-slate-500'} />
+                  <TabIcon size={12} className={isActive ? 'text-white' : tab.color || 'text-slate-500 dark:text-slate-400'} />
                   <span>{tab.label}</span>
                 </button>
               )
@@ -519,12 +519,12 @@ export default function InvoiceListPage() {
           </div>
 
           {/* Page size dropdown */}
-          <div className="flex items-center gap-2 shrink-0 text-xs text-slate-500">
+          <div className="flex items-center gap-2 shrink-0 text-xs text-slate-500 dark:text-slate-400">
             <span>Per page:</span>
             <select
               value={pageSize}
               onChange={(e) => handlePageSizeChange(e.target.value)}
-              className="bg-slate-50 border border-slate-200 text-slate-700 text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 font-medium cursor-pointer"
+              className="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 text-xs rounded-md px-2 py-1 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 font-medium cursor-pointer"
             >
               <option value="10">10</option>
               <option value="20">20</option>
@@ -538,15 +538,15 @@ export default function InvoiceListPage() {
 
       {/* ── Table Content ──────────────────────────────────────────────────── */}
       {initialLoading && jobs.length === 0 ? (
-        <div className="card p-16 flex flex-col items-center justify-center text-slate-400 space-y-2">
+        <div className="card p-16 flex flex-col items-center justify-center text-slate-400 space-y-2 bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800">
           <RefreshCw size={24} className="spinner text-blue-600" />
-          <span className="text-xs font-medium text-slate-600">Loading invoice database...</span>
+          <span className="text-xs font-medium text-slate-600 dark:text-slate-400">Loading invoice database...</span>
         </div>
       ) : jobs.length === 0 ? (
-        <div className="card p-16 text-center text-slate-400 border-dashed">
+        <div className="card p-16 text-center text-slate-400 border-dashed bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800">
           <FileText size={44} className="mx-auto mb-3 opacity-25 text-slate-500" />
-          <p className="font-semibold text-slate-700 text-base">No Matching Invoices Found</p>
-          <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
+          <p className="font-semibold text-slate-700 dark:text-slate-200 text-base">No Matching Invoices Found</p>
+          <p className="text-xs text-slate-400 dark:text-slate-500 mt-1 max-w-sm mx-auto">
             {activeSearch || statusFilter !== 'all'
               ? 'No invoices match the current filter or search criteria. Try clearing search or selecting "All Invoices".'
               : 'Upload your first invoice PDF or image to extract fields, inspect layout boxes, and verify data.'}
@@ -569,21 +569,21 @@ export default function InvoiceListPage() {
           </div>
         </div>
       ) : (
-        <div className="card overflow-hidden border-slate-200 shadow-sm">
+        <div className="card overflow-hidden border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm">
           <div className="overflow-x-auto">
             <table className="w-full text-xs">
               <thead>
-                <tr className="border-b border-slate-200 bg-slate-50/90 text-slate-500 font-semibold uppercase tracking-wider text-[11px]">
-                  <th className="text-center px-3.5 py-3.5 w-12 text-slate-400">#</th>
+                <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50/90 dark:bg-slate-800/80 text-slate-500 dark:text-slate-400 font-semibold uppercase tracking-wider text-[11px]">
+                  <th className="text-center px-3.5 py-3.5 w-12 text-slate-400 dark:text-slate-500">#</th>
                   <th className="text-left px-5 py-3.5">Invoice File</th>
                   <th className="text-left px-5 py-3.5">Status</th>
-                  <th className="text-left px-5 py-3.5">Confidence</th>
+                  <th className="text-left px-5 py-3.5">AI Fetched / Conf</th>
                   <th className="text-left px-5 py-3.5">Review Level</th>
                   <th className="text-left px-5 py-3.5">Created Date</th>
                   <th className="px-5 py-3.5 text-right">Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-100">
+              <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {jobs.map((job, i) => {
                   const cfg = STATUS_CONFIG[job.status] || STATUS_CONFIG.pending
                   const Icon = cfg.icon
@@ -601,17 +601,19 @@ export default function InvoiceListPage() {
                       key={job.job_id}
                       className={`cursor-pointer transition-all ${
                         isDeleting
-                          ? 'opacity-40 pointer-events-none bg-red-50'
+                          ? 'opacity-40 pointer-events-none bg-red-50 dark:bg-red-950/40'
                           : isScanning
-                          ? 'bg-amber-50/80 border-l-4 border-l-amber-500 animate-pulse'
+                          ? 'bg-amber-50/80 dark:bg-amber-950/40 border-l-4 border-l-amber-500 animate-pulse'
                           : isFailed
-                          ? 'bg-red-50/20 hover:bg-red-50/40'
-                          : i % 2 === 0 ? 'bg-white hover:bg-blue-50/40' : 'bg-slate-50/30 hover:bg-blue-50/40'
+                          ? 'bg-red-50/20 dark:bg-red-950/20 hover:bg-red-50/40 dark:hover:bg-red-950/40'
+                          : i % 2 === 0
+                          ? 'bg-white dark:bg-slate-900 hover:bg-blue-50/40 dark:hover:bg-slate-800/60'
+                          : 'bg-slate-50/30 dark:bg-slate-900/50 hover:bg-blue-50/40 dark:hover:bg-slate-800/60'
                       }`}
                       onClick={() => navigate(`/invoices/${job.job_id}`)}
                     >
                       {/* S.No. Serial Number */}
-                      <td className="px-3.5 py-3.5 text-center text-slate-400 font-mono text-[11px] select-none font-medium">
+                      <td className="px-3.5 py-3.5 text-center text-slate-400 dark:text-slate-500 font-mono text-[11px] select-none font-medium">
                         {serialNo}
                       </td>
 
@@ -619,24 +621,24 @@ export default function InvoiceListPage() {
                         <div className="flex items-center gap-3">
                           <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
                             isFailed
-                              ? 'bg-red-50 text-red-600 border-red-200'
+                              ? 'bg-red-50 dark:bg-red-950 text-red-600 dark:text-red-400 border-red-200 dark:border-red-800'
                               : isScanning
-                              ? 'bg-amber-100 text-amber-700 border-amber-300'
-                              : 'bg-blue-50 text-blue-600 border-blue-100'
+                              ? 'bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-400 border-amber-300 dark:border-amber-700'
+                              : 'bg-blue-50 dark:bg-blue-950/80 text-blue-600 dark:text-blue-400 border-blue-100 dark:border-blue-900'
                           }`}>
                             {isScanning ? (
-                              <RefreshCw size={15} className="spinner text-amber-700" />
+                              <RefreshCw size={15} className="spinner text-amber-700 dark:text-amber-400" />
                             ) : isFailed ? (
-                              <XCircle size={15} className="text-red-600" />
+                              <XCircle size={15} className="text-red-600 dark:text-red-400" />
                             ) : (
                               <FileText size={15} />
                             )}
                           </div>
                           <div className="min-w-0">
-                            <span className="font-bold text-slate-900 truncate block max-w-[280px]">
+                            <span className="font-bold text-slate-900 dark:text-white truncate block max-w-[280px]">
                               {job.filename}
                             </span>
-                            <span className="text-[10px] text-slate-400 font-mono">
+                            <span className="text-[10px] text-slate-400 dark:text-slate-500 font-mono">
                               {job.job_id.slice(0, 8)}…
                             </span>
                           </div>
@@ -646,16 +648,16 @@ export default function InvoiceListPage() {
                       <td className="px-5 py-3.5">
                         {isScanning ? (
                           <div className="flex flex-col gap-1">
-                            <span className="badge border bg-amber-100/90 border-amber-300 text-amber-900 flex items-center gap-1 font-bold w-fit">
-                              <RefreshCw size={10} className="spinner text-amber-700" />
+                            <span className="badge border bg-amber-100/90 dark:bg-amber-950 border-amber-300 dark:border-amber-700 text-amber-900 dark:text-amber-300 flex items-center gap-1 font-bold w-fit">
+                              <RefreshCw size={10} className="spinner text-amber-700 dark:text-amber-400" />
                               {job.stage_index > 0 ? `Stage ${job.stage_index}/6` : 'In Queue...'}
                             </span>
-                            <span className="text-[11px] text-amber-800 truncate max-w-[180px] font-medium">
+                            <span className="text-[11px] text-amber-800 dark:text-amber-300 truncate max-w-[180px] font-medium">
                               {job.stage_label || 'Processing document...'}
                             </span>
                           </div>
                         ) : (
-                          <span className={`badge border ${cfg.bg} ${cfg.color}`}>
+                          <span className={`badge border ${cfg.bg} ${cfg.color} dark:bg-slate-800 dark:border-slate-700`}>
                             <Icon size={11} className="mr-1" />
                             {cfg.label}
                           </span>
@@ -665,19 +667,19 @@ export default function InvoiceListPage() {
                       <td className="px-5 py-3.5">
                         {isScanning ? (
                           <div className="flex items-center gap-2">
-                            <div className="w-16 bg-amber-200/60 rounded-full h-1.5 overflow-hidden">
+                            <div className="w-16 bg-amber-200/60 dark:bg-amber-950 rounded-full h-1.5 overflow-hidden">
                               <div
-                                className="bg-amber-600 h-full rounded-full transition-all duration-500 ease-out"
+                                className="bg-amber-600 dark:bg-amber-400 h-full rounded-full transition-all duration-500 ease-out"
                                 style={{ width: `${job.progress_pct || 15}%` }}
                               />
                             </div>
-                            <span className="font-mono font-bold text-amber-800 text-xs">
+                            <span className="font-mono font-bold text-amber-800 dark:text-amber-300 text-xs">
                               {job.progress_pct || 15}%
                             </span>
                           </div>
                         ) : conf != null ? (
                           <div className="flex items-center gap-2">
-                            <div className="w-16 bg-slate-100 rounded-full h-1.5 overflow-hidden">
+                            <div className="w-16 bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
                               <div
                                 className={`h-full rounded-full ${
                                   conf >= 80 ? 'bg-emerald-500' : conf >= 65 ? 'bg-amber-400' : 'bg-red-400'
@@ -685,38 +687,38 @@ export default function InvoiceListPage() {
                                 style={{ width: `${conf}%` }}
                               />
                             </div>
-                            <span className="font-mono font-bold text-slate-700">{conf}%</span>
+                            <span className="font-mono font-bold text-slate-700 dark:text-slate-300">{conf}%</span>
                           </div>
                         ) : (
-                          <span className="text-slate-400">—</span>
+                          <span className="text-slate-400 dark:text-slate-500">—</span>
                         )}
                       </td>
 
                       <td className="px-5 py-3.5">
                         {job.status === 'reviewed' ? (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full">
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-950/60 border border-emerald-200 dark:border-emerald-800 px-2.5 py-0.5 rounded-full">
                             <CheckCircle size={11} /> Ground Truth (Verified)
                           </span>
                         ) : job.status === 'partially_reviewed' ? (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-full">
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-800 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 px-2.5 py-0.5 rounded-full">
                             <Clock size={11} /> Partially Reviewed
                           </span>
                         ) : job.status === 'failed' ? (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-red-700 bg-red-50 border border-red-200 px-2.5 py-0.5 rounded-full">
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-red-700 dark:text-red-300 bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-800 px-2.5 py-0.5 rounded-full">
                             <XCircle size={11} /> Digitization Failed
                           </span>
                         ) : job.needs_review ? (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-full">
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800 px-2.5 py-0.5 rounded-full">
                             <AlertTriangle size={11} /> Needs Review (Low Conf)
                           </span>
                         ) : (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 bg-blue-50 border border-blue-200 px-2.5 py-0.5 rounded-full">
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/60 border border-blue-200 dark:border-blue-800 px-2.5 py-0.5 rounded-full">
                             <FileText size={11} /> Unreviewed (AI Extracted)
                           </span>
                         )}
                       </td>
 
-                      <td className="px-5 py-3.5 text-slate-500 font-mono text-[11px]">
+                      <td className="px-5 py-3.5 text-slate-500 dark:text-slate-400 font-mono text-[11px]">
                         {job.created_at ? new Date(job.created_at).toLocaleString() : '—'}
                       </td>
 
@@ -743,14 +745,14 @@ export default function InvoiceListPage() {
                               onClick={(e) => reprocessSingle(e, job.job_id)}
                               className={`px-2.5 py-1 text-[11px] font-medium rounded transition-all flex items-center gap-1 ${
                                 isScanning
-                                  ? 'bg-amber-100 text-amber-800 border border-amber-300 cursor-not-allowed opacity-80'
-                                  : 'bg-slate-100 hover:bg-amber-50 text-slate-600 hover:text-amber-800 border border-slate-200 hover:border-amber-200'
+                                  ? 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 border border-amber-300 dark:border-amber-700 cursor-not-allowed opacity-80'
+                                  : 'bg-slate-100 dark:bg-slate-800 hover:bg-amber-50 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 hover:text-amber-800 dark:hover:text-amber-400 border border-slate-200 dark:border-slate-700'
                               }`}
                               title={isScanning ? "Document is currently in processing queue" : "Re-scan this invoice with the latest AI pipeline"}
                             >
                               {isScanning ? (
                                 <>
-                                  <RefreshCw size={10} className="spinner text-amber-700" />
+                                  <RefreshCw size={10} className="spinner text-amber-700 dark:text-amber-400" />
                                   <span>In Queue...</span>
                                 </>
                               ) : (
@@ -762,13 +764,13 @@ export default function InvoiceListPage() {
                           {/* Delete / Cancel Button (Works for queued, failed, done) */}
                           <button
                             onClick={(e) => deleteSingle(e, job.job_id, job.filename)}
-                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded border border-transparent hover:border-red-200 transition-all ml-1"
+                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/60 rounded border border-transparent hover:border-red-200 dark:hover:border-red-800 transition-all ml-1"
                             title="Delete / Cancel invoice from queue"
                           >
                             <Trash2 size={13} />
                           </button>
 
-                          <span className="text-xs font-semibold text-blue-600 hover:text-blue-800 pl-1">
+                          <span className="text-xs font-semibold text-blue-600 dark:text-blue-400 hover:text-blue-800 dark:hover:text-blue-300 pl-1">
                             Review &rarr;
                           </span>
                         </div>
@@ -781,18 +783,18 @@ export default function InvoiceListPage() {
           </div>
 
           {/* ── Pagination Footer ────────────────────────────────────────────── */}
-          <div className="px-5 py-3.5 border-t border-slate-200 bg-slate-50/80 flex flex-wrap items-center justify-between gap-4">
-            <div className="text-xs text-slate-500">
-              Showing <span className="font-semibold text-slate-800">{(page - 1) * pageSize + 1}</span> to{' '}
-              <span className="font-semibold text-slate-800">{Math.min(page * pageSize, totalCount)}</span> of{' '}
-              <span className="font-semibold text-slate-800">{totalCount}</span> invoices
+          <div className="px-5 py-3.5 border-t border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-900/90 flex flex-wrap items-center justify-between gap-4">
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              Showing <span className="font-semibold text-slate-800 dark:text-slate-200">{(page - 1) * pageSize + 1}</span> to{' '}
+              <span className="font-semibold text-slate-800 dark:text-slate-200">{Math.min(page * pageSize, totalCount)}</span> of{' '}
+              <span className="font-semibold text-slate-800 dark:text-slate-200">{totalCount}</span> invoices
             </div>
 
             <div className="flex items-center gap-1.5">
               <button
                 onClick={() => setPage(1)}
                 disabled={page <= 1}
-                className="p-1.5 rounded border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                className="p-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                 title="First Page"
               >
                 <ChevronsLeft size={14} />
@@ -801,7 +803,7 @@ export default function InvoiceListPage() {
               <button
                 onClick={() => setPage(p => Math.max(1, p - 1))}
                 disabled={page <= 1}
-                className="p-1.5 rounded border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                className="p-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                 title="Previous Page"
               >
                 <ChevronLeft size={14} />
@@ -816,13 +818,13 @@ export default function InvoiceListPage() {
                     const showEllipsis = prevP && p - prevP > 1
                     return (
                       <span key={p} className="flex items-center">
-                        {showEllipsis && <span className="px-1 text-slate-400 text-xs font-mono">…</span>}
+                        {showEllipsis && <span className="px-1 text-slate-400 dark:text-slate-600 text-xs font-mono">…</span>}
                         <button
                           onClick={() => setPage(p)}
                           className={`min-w-[28px] h-7 px-2 text-xs font-semibold rounded transition-all ${
                             p === page
                               ? 'bg-blue-600 text-white shadow-sm'
-                              : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-200'
+                              : 'bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 border border-slate-200 dark:border-slate-700'
                           }`}
                         >
                           {p}
@@ -835,7 +837,7 @@ export default function InvoiceListPage() {
               <button
                 onClick={() => setPage(p => Math.min(totalPages, p + 1))}
                 disabled={page >= totalPages}
-                className="p-1.5 rounded border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                className="p-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                 title="Next Page"
               >
                 <ChevronRight size={14} />
@@ -844,7 +846,7 @@ export default function InvoiceListPage() {
               <button
                 onClick={() => setPage(totalPages)}
                 disabled={page >= totalPages}
-                className="p-1.5 rounded border border-slate-200 bg-white hover:bg-slate-100 text-slate-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+                className="p-1.5 rounded border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
                 title="Last Page"
               >
                 <ChevronsRight size={14} />

@@ -379,22 +379,22 @@ export default function UploadPage() {
       {mode === 'idle' && (
         <div
           {...getRootProps()}
-          className={`card p-12 flex flex-col items-center justify-center text-center cursor-pointer
-                      border-2 border-dashed transition-all duration-200
-                      ${isDragActive ? 'border-blue-500 bg-blue-50/50 scale-[1.01]' : 'border-slate-300 hover:border-blue-400 hover:bg-slate-50/60'}`}
+          className={`card p-10 md:p-12 flex flex-col items-center justify-center text-center cursor-pointer
+                      border-2 border-dashed transition-all duration-200 bg-white dark:bg-slate-900
+                      ${isDragActive ? 'border-blue-500 bg-blue-50/50 dark:bg-blue-950/30 scale-[1.01]' : 'border-slate-300 dark:border-slate-700 hover:border-blue-400 dark:hover:border-blue-500 hover:bg-slate-50/60 dark:hover:bg-slate-800/40'}`}
         >
           <input {...getInputProps()} />
-          <div className="w-16 h-16 rounded-2xl bg-blue-50 border border-blue-100 flex items-center justify-center mb-4 text-blue-600 shadow-xs">
+          <div className="w-16 h-16 rounded-2xl bg-blue-50 dark:bg-blue-950/50 border border-blue-100 dark:border-blue-900/60 flex items-center justify-center mb-4 text-blue-600 dark:text-blue-400 shadow-xs">
             <Upload size={28} />
           </div>
 
-          <p className="font-bold text-slate-800 text-lg">
+          <p className="font-bold text-slate-800 dark:text-slate-100 text-lg">
             {isDragActive ? 'Drop your invoices here' : 'Drag & drop invoice files here'}
           </p>
-          <p className="text-xs text-slate-500 mt-1.5">
-            or <span className="text-blue-600 font-semibold underline">browse from your computer</span> &bull; Multiple files supported
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1.5">
+            or <span className="text-blue-600 dark:text-blue-400 font-semibold underline">browse from your computer</span> &bull; Multiple files supported
           </p>
-          <div className="mt-4 flex items-center gap-2 text-[11px] text-slate-400 font-medium bg-slate-100/80 px-3 py-1 rounded-full border border-slate-200">
+          <div className="mt-4 flex items-center gap-2 text-[11px] text-slate-400 dark:text-slate-400 font-medium bg-slate-100/80 dark:bg-slate-800/80 px-3 py-1 rounded-full border border-slate-200 dark:border-slate-700">
             <span>PDF</span> &bull; <span>JPG / PNG</span> &bull; <span>TIFF</span> &bull; <span>WEBP</span> &bull; <span>Up to 50 files (max 50 MB each)</span>
           </div>
         </div>
@@ -402,38 +402,38 @@ export default function UploadPage() {
 
       {/* ── Batch Upload Dashboard ───────────────────────────────────────────── */}
       {mode === 'batch' && (
-        <div className="space-y-6">
+        <div className="space-y-5">
           
           {/* Overall Batch Progress Card */}
-          <div className="card p-6 border-slate-200 shadow-sm space-y-4">
+          <div className="card p-5 md:p-6 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
                   <span>Batch Digitization Queue</span>
-                  <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200">
+                  <span className="text-xs font-mono font-semibold px-2 py-0.5 rounded-full bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
                     {batchCompleted} / {batchTotal} Decoded
                   </span>
                 </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                   Invoices are processed by the AI pipeline and added to your database automatically.
                 </p>
               </div>
 
-              <div className="flex items-center gap-3 text-xs">
+              <div className="flex items-center gap-2.5 text-xs">
                 {batchProcessing > 0 && (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 text-amber-800 border border-amber-200 font-medium">
-                    <RefreshCw size={11} className="spinner text-amber-600" />
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800 font-medium">
+                    <RefreshCw size={11} className="spinner text-amber-600 dark:text-amber-400" />
                     {batchProcessing} In Progress
                   </span>
                 )}
                 {batchCompleted > 0 && (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-medium">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 font-medium">
                     <CheckCircle size={11} />
                     {batchCompleted} Ready
                   </span>
                 )}
                 {batchFailed > 0 && (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-50 text-red-700 border border-red-200 font-medium">
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800 font-medium">
                     <AlertCircle size={11} />
                     {batchFailed} Failed
                   </span>
@@ -444,18 +444,18 @@ export default function UploadPage() {
             {/* Overall Progress Bar */}
             <div className="space-y-1.5">
               <div className="flex justify-between text-xs font-semibold">
-                <span className="text-slate-600">Overall Batch Progress</span>
-                <span className="font-mono text-blue-700">{batchOverallPct}%</span>
+                <span className="text-slate-600 dark:text-slate-400">Overall Batch Progress</span>
+                <span className="font-mono text-blue-700 dark:text-blue-400 font-bold">{batchOverallPct}%</span>
               </div>
-              <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
+              <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-2.5 overflow-hidden">
                 <div
-                  className="bg-blue-600 h-full rounded-full transition-all duration-500 ease-out"
+                  className="bg-blue-600 dark:bg-blue-500 h-full rounded-full transition-all duration-500 ease-out"
                   style={{ width: `${batchOverallPct}%` }}
                 />
               </div>
             </div>
 
-            <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+            <div className="flex items-center justify-between pt-2 border-t border-slate-100 dark:border-slate-800">
               <button
                 onClick={() => navigate('/invoices')}
                 className="btn-primary text-xs flex items-center gap-1.5"
@@ -466,7 +466,7 @@ export default function UploadPage() {
 
               <button
                 onClick={resetUpload}
-                className="btn-secondary text-xs flex items-center gap-1"
+                className="btn-secondary text-xs flex items-center gap-1 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
               >
                 <Plus size={13} /> Upload More Files
               </button>
@@ -474,8 +474,8 @@ export default function UploadPage() {
           </div>
 
           {/* File Queue List */}
-          <div className="card overflow-hidden border-slate-200">
-            <div className="px-5 py-3.5 bg-slate-50/80 border-b border-slate-200 font-semibold text-xs text-slate-600 flex items-center justify-between">
+          <div className="card overflow-hidden border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-sm">
+            <div className="px-5 py-3.5 bg-slate-50/90 dark:bg-slate-800/80 border-b border-slate-200 dark:border-slate-800 font-semibold text-xs text-slate-600 dark:text-slate-300 flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <span className="w-6 text-center text-slate-400">#</span>
                 <span>Invoice Documents ({batchTotal})</span>
@@ -483,7 +483,7 @@ export default function UploadPage() {
               <span>Status & Stage</span>
             </div>
 
-            <div className="divide-y divide-slate-100 max-h-[520px] overflow-y-auto">
+            <div className="divide-y divide-slate-100 dark:divide-slate-800 max-h-[520px] overflow-y-auto">
               {batchJobs.map((job, idx) => {
                 const isDone = ['done', 'reviewed', 'partially_reviewed'].includes(job.status)
                 const isFailed = job.status === 'failed'
@@ -493,30 +493,38 @@ export default function UploadPage() {
                   <div
                     key={job.job_id || idx}
                     className={`p-4 flex flex-wrap items-center justify-between gap-4 transition-colors ${
-                      isDone ? 'bg-white hover:bg-emerald-50/30' : isFailed ? 'bg-red-50/40' : 'bg-slate-50/40'
+                      isDone
+                        ? 'bg-white dark:bg-slate-900 hover:bg-emerald-50/20 dark:hover:bg-slate-800/40'
+                        : isFailed
+                        ? 'bg-red-50/30 dark:bg-red-950/20'
+                        : 'bg-slate-50/40 dark:bg-slate-900/60 hover:bg-slate-50/80 dark:hover:bg-slate-800/30'
                     }`}
                   >
                     {/* File info with S.No. */}
                     <div className="flex items-center gap-3 min-w-[240px] max-w-sm">
-                      <span className="font-mono text-slate-400 text-xs font-semibold w-6 text-center select-none shrink-0">
+                      <span className="font-mono text-slate-400 dark:text-slate-500 text-xs font-semibold w-6 text-center select-none shrink-0">
                         {idx + 1}
                       </span>
                       <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border ${
-                        isDone ? 'bg-emerald-50 text-emerald-600 border-emerald-200' : isFailed ? 'bg-red-50 text-red-600 border-red-200' : 'bg-blue-50 text-blue-600 border-blue-200'
+                        isDone
+                          ? 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-600 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800'
+                          : isFailed
+                          ? 'bg-red-50 dark:bg-red-950/50 text-red-600 dark:text-red-400 border-red-200 dark:border-red-800'
+                          : 'bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-400 border-blue-200 dark:border-blue-800'
                       }`}>
                         {isDone ? (
                           <CheckCircle size={16} />
                         ) : isFailed ? (
                           <AlertCircle size={16} />
                         ) : (
-                          <RefreshCw size={16} className="spinner text-blue-600" />
+                          <RefreshCw size={16} className="spinner text-blue-600 dark:text-blue-400" />
                         )}
                       </div>
                       <div className="min-w-0">
-                        <p className="font-semibold text-slate-800 text-xs truncate" title={job.filename}>
+                        <p className="font-semibold text-slate-800 dark:text-slate-200 text-xs truncate" title={job.filename}>
                           {job.filename}
                         </p>
-                        <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                        <p className="text-[10px] text-slate-400 dark:text-slate-500 font-mono mt-0.5">
                           {formatFileSize(job.fileSize)} {job.job_id && !job.job_id.startsWith('temp_') && `• ${job.job_id.slice(0, 8)}…`}
                         </p>
                       </div>
@@ -525,18 +533,24 @@ export default function UploadPage() {
                     {/* Stage & Progress Bar */}
                     <div className="flex-1 min-w-[200px] max-w-md">
                       <div className="flex items-center justify-between text-[11px] mb-1">
-                        <span className={`font-medium truncate ${isDone ? 'text-emerald-700' : isFailed ? 'text-red-600' : 'text-slate-700'}`}>
+                        <span className={`font-medium truncate ${
+                          isDone
+                            ? 'text-emerald-700 dark:text-emerald-400'
+                            : isFailed
+                            ? 'text-red-600 dark:text-red-400'
+                            : 'text-slate-700 dark:text-slate-300'
+                        }`}>
                           {isDone ? 'AI Digitization Complete' : isFailed ? (job.error_message || 'Processing Error') : (job.stage_label || 'Processing...')}
                         </span>
-                        <span className="font-mono font-bold text-slate-500 shrink-0 ml-2">
+                        <span className="font-mono font-bold text-slate-500 dark:text-slate-400 shrink-0 ml-2">
                           {job.progress_pct || 15}%
                         </span>
                       </div>
 
-                      <div className="w-full bg-slate-200/70 rounded-full h-1.5 overflow-hidden">
+                      <div className="w-full bg-slate-200/70 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
                         <div
                           className={`h-full rounded-full transition-all duration-500 ease-out ${
-                            isDone ? 'bg-emerald-500' : isFailed ? 'bg-red-500' : 'bg-blue-600'
+                            isDone ? 'bg-emerald-500' : isFailed ? 'bg-red-500' : 'bg-blue-600 dark:bg-blue-500'
                           }`}
                           style={{ width: `${job.progress_pct || 15}%` }}
                         />
@@ -565,7 +579,7 @@ export default function UploadPage() {
                           </button>
                           <button
                             onClick={() => deleteBatchJob(job.job_id, job.filename)}
-                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded"
+                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded"
                             title="Delete from queue"
                           >
                             <Trash2 size={13} />
@@ -573,13 +587,13 @@ export default function UploadPage() {
                         </div>
                       ) : (
                         <div className="flex items-center gap-1.5">
-                          <span className="text-xs font-medium text-slate-500 bg-slate-100 px-2.5 py-1 rounded-md flex items-center gap-1.5">
-                            <RefreshCw size={11} className="spinner text-blue-600" />
+                          <span className="text-xs font-medium text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-2.5 py-1 rounded-md flex items-center gap-1.5">
+                            <RefreshCw size={11} className="spinner text-blue-600 dark:text-blue-400" />
                             <span>In Queue</span>
                           </span>
                           <button
                             onClick={() => deleteBatchJob(job.job_id, job.filename)}
-                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded"
+                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 rounded"
                             title="Cancel / Delete from queue"
                           >
                             <Trash2 size={13} />
@@ -597,21 +611,21 @@ export default function UploadPage() {
 
       {/* ── Single File Pipeline Progress ────────────────────────────────────── */}
       {mode === 'single' && (singleStatus === 'uploading' || singleStatus === 'polling' || singleStatus === 'done') && (
-        <div className="card p-6 fade-in shadow-sm border border-slate-200">
+        <div className="card p-6 fade-in shadow-sm border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
           <div className="flex items-center justify-between mb-2">
             <div>
-              <h2 className="text-sm font-bold text-slate-900">AI Digitization Pipeline</h2>
-              <p className="text-xs text-slate-400 mt-0.5">{singleFile?.name} ({formatFileSize(singleFile?.size)})</p>
+              <h2 className="text-sm font-bold text-slate-900 dark:text-white">AI Digitization Pipeline</h2>
+              <p className="text-xs text-slate-400 dark:text-slate-500 mt-0.5">{singleFile?.name} ({formatFileSize(singleFile?.size)})</p>
             </div>
-            <span className="text-xs font-mono font-bold text-blue-700 bg-blue-50 px-2.5 py-0.5 rounded-full border border-blue-100">
+            <span className="text-xs font-mono font-bold text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/60 px-2.5 py-0.5 rounded-full border border-blue-100 dark:border-blue-800">
               {singleProgressPct}%
             </span>
           </div>
 
           {/* Progress bar */}
-          <div className="w-full bg-slate-100 rounded-full h-1.5 mb-5 overflow-hidden">
+          <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 mb-5 overflow-hidden">
             <div
-              className="bg-blue-600 h-full rounded-full transition-all duration-500 ease-out"
+              className="bg-blue-600 dark:bg-blue-500 h-full rounded-full transition-all duration-500 ease-out"
               style={{ width: `${singleProgressPct}%` }}
             />
           </div>
@@ -624,28 +638,28 @@ export default function UploadPage() {
                 <div key={step.id} className="flex items-start gap-3">
                   <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5
                                    transition-all duration-300
-                                   ${isDone ? 'bg-emerald-500 shadow-xs' : isActive ? 'bg-blue-600 ring-4 ring-blue-100' : 'bg-slate-100'}`}>
+                                   ${isDone ? 'bg-emerald-500 shadow-xs' : isActive ? 'bg-blue-600 ring-4 ring-blue-100 dark:ring-blue-950' : 'bg-slate-100 dark:bg-slate-800'}`}>
                     {isDone ? (
                       <CheckCircle size={14} className="text-white" />
                     ) : isActive ? (
                       <Loader size={12} className="text-white spinner" />
                     ) : (
-                      <span className="text-xs text-slate-400 font-medium">{step.id}</span>
+                      <span className="text-xs text-slate-400 dark:text-slate-500 font-medium">{step.id}</span>
                     )}
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center justify-between">
                       <p className={`text-sm font-medium transition-colors
-                                     ${isDone ? 'text-emerald-800' : isActive ? 'text-blue-700 font-semibold' : 'text-slate-400'}`}>
+                                     ${isDone ? 'text-emerald-800 dark:text-emerald-400' : isActive ? 'text-blue-700 dark:text-blue-300 font-semibold' : 'text-slate-400 dark:text-slate-500'}`}>
                         {step.label}
                       </p>
                       {isActive && (
-                        <span className="text-[11px] font-medium text-blue-600 animate-pulse hidden sm:inline">
+                        <span className="text-[11px] font-medium text-blue-600 dark:text-blue-400 animate-pulse hidden sm:inline">
                           Running...
                         </span>
                       )}
                     </div>
-                    <p className="text-xs text-slate-500 mt-0.5">
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                       {isActive && singleStageLabel ? singleStageLabel : step.desc}
                     </p>
                   </div>
@@ -655,7 +669,7 @@ export default function UploadPage() {
           </div>
 
           {singleStatus === 'done' && (
-            <p className="text-center text-sm text-emerald-600 font-medium mt-5 animate-fade-in">
+            <p className="text-center text-sm text-emerald-600 dark:text-emerald-400 font-medium mt-5 animate-fade-in">
               ✓ Redirecting to review workspace...
             </p>
           )}
@@ -664,14 +678,14 @@ export default function UploadPage() {
 
       {/* Single Mode Error */}
       {mode === 'single' && singleStatus === 'error' && (
-        <div className="card p-5 border-red-200 bg-red-50 fade-in flex items-start gap-3">
+        <div className="card p-5 border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/30 fade-in flex items-start gap-3">
           <AlertCircle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
           <div>
-            <p className="text-sm font-semibold text-red-800">Processing failed</p>
-            <p className="text-sm text-red-600 mt-1">{singleError}</p>
+            <p className="text-sm font-semibold text-red-800 dark:text-red-300">Processing failed</p>
+            <p className="text-sm text-red-600 dark:text-red-400 mt-1">{singleError}</p>
             <button
               onClick={resetUpload}
-              className="text-xs text-red-700 underline mt-2"
+              className="text-xs text-red-700 dark:text-red-400 underline mt-2"
             >
               Try again
             </button>
@@ -681,15 +695,15 @@ export default function UploadPage() {
 
       {/* ── Recent Invoices & Database Queue Banner (Shown when idle) ─────────── */}
       {mode === 'idle' && dbTotalCount > 0 && (
-        <div className="card p-5 border-slate-200 bg-white shadow-xs space-y-3.5">
+        <div className="card p-5 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs space-y-3.5">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
               <div>
-                <span className="text-xs font-bold text-slate-800 uppercase tracking-wider block">
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-100 uppercase tracking-wider block">
                   Invoice Database & Live Queue ({dbTotalCount} Invoices)
                 </span>
-                <p className="text-[11px] text-slate-400 mt-0.5">
+                <p className="text-[11px] text-slate-400 dark:text-slate-400 mt-0.5">
                   All previously uploaded and currently processing invoices are stored securely in your database.
                 </p>
               </div>
@@ -703,36 +717,36 @@ export default function UploadPage() {
             </button>
           </div>
 
-          <div className="divide-y divide-slate-100 border border-slate-100 rounded-lg overflow-hidden bg-slate-50/30">
+          <div className="divide-y divide-slate-100 dark:divide-slate-800 border border-slate-100 dark:border-slate-800 rounded-lg overflow-hidden bg-slate-50/30 dark:bg-slate-800/30">
             {recentJobs.slice(0, 5).map((j, i) => (
               <div
                 key={j.job_id}
                 onClick={() => navigate(`/invoices/${j.job_id}`)}
-                className="p-3 flex items-center justify-between text-xs hover:bg-blue-50/50 cursor-pointer transition-colors"
+                className="p-3 flex items-center justify-between text-xs hover:bg-blue-50/50 dark:hover:bg-slate-800/60 cursor-pointer transition-colors"
               >
                 <div className="flex items-center gap-2.5 min-w-0">
-                  <span className="font-mono text-slate-400 text-[11px] font-semibold w-5 text-center shrink-0">
+                  <span className="font-mono text-slate-400 dark:text-slate-500 text-[11px] font-semibold w-5 text-center shrink-0">
                     {i + 1}
                   </span>
-                  <FileText size={14} className="text-slate-400 shrink-0" />
-                  <span className="font-semibold text-slate-800 truncate max-w-[280px]">
+                  <FileText size={14} className="text-slate-400 dark:text-slate-400 shrink-0" />
+                  <span className="font-semibold text-slate-800 dark:text-slate-200 truncate max-w-[280px]">
                     {j.filename}
                   </span>
-                  <span className="text-[10px] text-slate-400 font-mono hidden sm:inline">
+                  <span className="text-[10px] text-slate-400 dark:text-slate-500 font-mono hidden sm:inline">
                     ({j.job_id.slice(0, 8)}…)
                   </span>
                 </div>
 
                 <div className="flex items-center gap-3 shrink-0">
                   <span className={`badge text-[10px] px-2 py-0.5 border ${
-                    j.status === 'reviewed' ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
-                    j.status === 'processing' ? 'bg-amber-50 text-amber-800 border-amber-200' :
-                    j.status === 'failed' ? 'bg-red-50 text-red-700 border-red-200' :
-                    'bg-blue-50 text-blue-700 border-blue-200'
+                    j.status === 'reviewed' ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800' :
+                    j.status === 'processing' ? 'bg-amber-50 dark:bg-amber-950/60 text-amber-800 dark:text-amber-300 border-amber-200 dark:border-amber-800' :
+                    j.status === 'failed' ? 'bg-red-50 dark:bg-red-950/60 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800' :
+                    'bg-blue-50 dark:bg-blue-950/60 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800'
                   }`}>
                     {j.status === 'reviewed' ? 'Verified' : j.status === 'processing' ? 'Processing' : j.status === 'failed' ? 'Failed' : 'AI Extracted'}
                   </span>
-                  <span className="text-blue-600 font-semibold text-[11px] hover:underline">
+                  <span className="text-blue-600 dark:text-blue-400 font-semibold text-[11px] hover:underline">
                     Review &rarr;
                   </span>
                 </div>
@@ -750,10 +764,10 @@ export default function UploadPage() {
             { icon: '🧠', title: 'LayoutLMv3 AI', desc: 'Spatial intelligence maps key-value fields with high accuracy' },
             { icon: '⚡', title: 'Batch Processing', desc: 'Drop multiple invoices and review them as they complete decoding' },
           ].map((c) => (
-            <div key={c.title} className="card p-4 border-slate-200">
+            <div key={c.title} className="card p-4 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
               <div className="text-2xl mb-2">{c.icon}</div>
-              <p className="text-xs font-bold text-slate-800">{c.title}</p>
-              <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">{c.desc}</p>
+              <p className="text-xs font-bold text-slate-800 dark:text-slate-100">{c.title}</p>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">{c.desc}</p>
             </div>
           ))}
         </div>
