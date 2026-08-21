@@ -118,9 +118,8 @@ def _native_page_to_ocr_results(
             )
         }
 
-    # ── Assign each line to a YOLO region by its centre point ─────────────
+    # ── Assign each line to a detected region (or proportional zone fallback) ──
     region_line_groups: dict[str, list[list]] = {r.label: [] for r in det_regions}
-    overflow_label = det_regions[0].label  # fallback
 
     for line_words in sorted_lines:
         # Centre of this line in pixel coords
@@ -135,7 +134,22 @@ def _native_page_to_ocr_results(
                 placed = True
                 break
         if not placed:
-            region_line_groups[overflow_label].append(line_words)
+            # Proportional placement fallback based on vertical position
+            cy_pct = cy / max(1.0, img_h)
+            if cy_pct < 0.20 and "header" in region_line_groups:
+                region_line_groups["header"].append(line_words)
+            elif cy_pct < 0.35 and "vendor_block" in region_line_groups:
+                region_line_groups["vendor_block"].append(line_words)
+            elif cy_pct < 0.45 and "buyer_block" in region_line_groups:
+                region_line_groups["buyer_block"].append(line_words)
+            elif cy_pct < 0.75 and "line_items" in region_line_groups:
+                region_line_groups["line_items"].append(line_words)
+            elif cy_pct < 0.90 and "totals_block" in region_line_groups:
+                region_line_groups["totals_block"].append(line_words)
+            elif "payment_terms" in region_line_groups:
+                region_line_groups["payment_terms"].append(line_words)
+            elif det_regions:
+                region_line_groups[det_regions[0].label].append(line_words)
 
     results = {}
     for region in det_regions:
@@ -148,6 +162,15 @@ def _native_page_to_ocr_results(
             full_text=full_text,
             avg_confidence=0.99 if blocks else 0.0,
         )
+
+    # Always provide unified full_page OCR result
+    all_blocks = [line_to_textblock(lw, "full_page") for lw in sorted_lines]
+    results["full_page"] = OCRResult(
+        region_label="full_page",
+        text_blocks=all_blocks,
+        full_text="\n".join(b.text for b in all_blocks),
+        avg_confidence=0.99,
+    )
     return results
 
 

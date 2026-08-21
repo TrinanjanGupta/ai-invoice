@@ -207,6 +207,63 @@ class OllamaClient:
             logger.error(f"Ollama error for field {field_name}: {e}")
             return ExtractedField(value="", confidence=0.0, source="llm_error")
 
+    def _get_dynamic_few_shot_context(self) -> str:
+        """Fetches 1-2 verified invoices from the database as few-shot in-context learning demonstrations."""
+        try:
+            import asyncio
+            import concurrent.futures
+            from storage.db import DatabaseManager, InvoiceRecord
+            from config.settings import get_settings
+            from sqlalchemy import select
+
+            async def _fetch():
+                settings = get_settings()
+                db = DatabaseManager(settings.database_url)
+                async with db.session_factory() as session:
+                    res = await session.execute(
+                        select(InvoiceRecord)
+                        .filter(
+                            InvoiceRecord.status.in_(["reviewed", "partially_reviewed", "done"]),
+                            InvoiceRecord.needs_review == False,
+                            InvoiceRecord.output_json.isnot(None)
+                        )
+                        .limit(2)
+                    )
+                    return res.scalars().all()
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        records = pool.submit(asyncio.run, _fetch()).result()
+                else:
+                    records = loop.run_until_complete(_fetch())
+            except Exception:
+                records = asyncio.run(_fetch())
+
+            if not records:
+                return ""
+
+            examples = []
+            for i, rec in enumerate(records):
+                clean_out = {
+                    k: v for k, v in rec.output_json.items()
+                    if k in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "buyer_name", "buyer_gstin", "subtotal", "tax_amount", "grand_total"]
+                    and v is not None
+                }
+
+                if clean_out:
+                    examples.append(
+                        f"### Example {i+1} (Verified Ground Truth from your database):\n"
+                        f"Extracted JSON:\n{json.dumps(clean_out, indent=2)}"
+                    )
+
+            if examples:
+                return "\n\n" + "\n\n".join(examples) + "\n\n"
+        except Exception as e:
+            logger.debug(f"Dynamic few-shot loading skipped: {e}")
+        return ""
+
     def _extract_multiple_fields_batch(
         self,
         field_names: list,
@@ -215,7 +272,7 @@ class OllamaClient:
         """
         Ask the LLM to extract ALL missing fields in a single prompt.
         Returns a dict of {field_name: value_string}.
-        Much faster than one call per field on CPU-only Ollama.
+        Uses dynamic few-shot learning and strict normalization rules.
         """
         context = "\n".join(
             f"[{region}]\n{text}"
@@ -227,17 +284,20 @@ class OllamaClient:
             f"- {name}" for name in field_names
         )
 
+        few_shot_sec = self._get_dynamic_few_shot_context()
+
         prompt = (
-            "You are an invoice data extraction assistant.\n"
-            "From the OCR text below, extract the following fields.\n"
-            "Return your answer as a JSON object with field names as keys "
-            "and extracted values as strings. If a field is not found, set its value to null.\n\n"
+            "You are an expert AI Invoice Digitization Engine specialized in Indian GST, multi-state commercial invoices, and handwriting normalization.\n"
+            "From the OCR text below, extract the requested fields.\n"
+            "Return your answer as a JSON object with field names as keys and extracted values as strings. If a field is not found, set its value to null.\n\n"
             f"Fields to extract:\n{fields_desc}\n\n"
-            "Formatting rules:\n"
-            "- Dates should be DD/MM/YYYY\n"
-            "- Numbers should be plain numeric (no currency symbols)\n"
-            "- GSTIN format: 2 digits + 5 letters + 4 digits + 1 letter + 1 letter + Z + 1 alphanumeric\n\n"
-            f"---\nINVOICE TEXT:\n{context[:4000]}\n---\n\n"
+            "Strict Normalization Rules:\n"
+            "- Dates MUST be formatted as DD/MM/YYYY (convert 2-digit years like '22-Dec-25' -> '22/12/2025')\n"
+            "- Numbers MUST be plain numeric (no currency symbols)\n"
+            "- GSTIN MUST be strictly 15 alphanumeric characters. Auto-correct OCR typos: 'O' -> '0' in numeric positions, 'I'/'l' -> '1', 'S' -> '5' (e.g. '19AFKPGO717KIZD' -> '19AFKPG0717K1ZD')\n"
+            "- Reconcile Math: Subtotal + CGST + SGST = Grand Total\n"
+            f"{few_shot_sec}"
+            f"---\nINVOICE TEXT TO EXTRACT:\n{context[:4000]}\n---\n\n"
             "Return ONLY the JSON object, no other text."
         )
 
@@ -250,8 +310,8 @@ class OllamaClient:
                     "format": "json",
                     "stream": False,
                     "options": {
-                        "temperature": 0.0,
-                        "num_predict": 350,
+                        "temperature": 0.1,
+                        "num_predict": 500,
                     },
                 },
                 timeout=self.timeout,

@@ -45,9 +45,9 @@ class InvoiceOCR:
         try:
             from paddleocr import PaddleOCR
             try:
-                self._ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, use_gpu=self.use_gpu)
+                self._ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, use_gpu=self.use_gpu, enable_mkldnn=False)
             except Exception:
-                self._ocr = PaddleOCR(lang=self.lang)
+                self._ocr = PaddleOCR(lang=self.lang, enable_mkldnn=False)
             logger.info(f"PaddleOCR initialised (lang={self.lang}, gpu={self.use_gpu})")
         except (ImportError, Exception) as e:
             logger.warning(f"PaddleOCR initialisation failed/not installed ({e}). Trying EasyOCR fallback...")
@@ -101,28 +101,32 @@ class InvoiceOCR:
             except Exception as e:
                 logger.debug(f"PaddleOCR extraction fallback triggered: {e}")
                 self._ocr = None
-                if self._easyocr is None:
-                    try:
-                        import easyocr
-                        self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
-                    except Exception:
-                        pass
 
+        if not text_blocks:
+            if self._easyocr is None:
+                try:
+                    import easyocr
+                    self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
+                except Exception as ex:
+                    logger.debug(f"EasyOCR init error: {ex}")
 
-        if not text_blocks and self._easyocr is not None:
-            results = self._easyocr.readtext(crop)
-            for line in results:
-                if line is None:
-                    continue
-                bbox, text, conf = line
-                text = str(text).strip()
-                if text:
-                    text_blocks.append(TextBlock(
-                        text=text,
-                        confidence=float(conf),
-                        bbox=bbox,
-                        region_label=region_label,
-                    ))
+            if self._easyocr is not None:
+                try:
+                    results = self._easyocr.readtext(crop)
+                    for line in results:
+                        if line is None:
+                            continue
+                        bbox, text, conf = line
+                        text = str(text).strip()
+                        if text:
+                            text_blocks.append(TextBlock(
+                                text=text,
+                                confidence=float(conf),
+                                bbox=bbox,
+                                region_label=region_label,
+                            ))
+                except Exception as e:
+                    logger.debug(f"EasyOCR extraction error: {e}")
 
         full_text = " ".join(b.text for b in text_blocks)
         avg_conf = (

@@ -55,9 +55,20 @@ async def lifespan(app: FastAPI):
         logger.warning(f"MinIO not available: {e} — file storage disabled")
         app.state.minio = None
 
-    # Warm up pipeline
-    from api.pipeline_runner import InvoicePipeline
-    app.state.pipeline = InvoicePipeline(settings)
+    # Warm up pipeline asynchronously in background thread so lifespan finishes immediately and API is ready instantly
+    app.state.pipeline = None
+
+    async def _warmup():
+        try:
+            from api.pipeline_runner import InvoicePipeline
+            loop = asyncio.get_running_loop()
+            pipeline = await loop.run_in_executor(None, lambda: InvoicePipeline(settings))
+            app.state.pipeline = pipeline
+            logger.info("Pipeline warmed up in background")
+        except Exception as ex:
+            logger.warning(f"Background pipeline warmup: {ex}")
+
+    asyncio.create_task(_warmup())
 
     yield
 
@@ -474,6 +485,51 @@ async def stream_job_progress(job_id: str, request: Request):
 
 
 
+@app.get("/api/invoices/{job_id}", response_model=JobStatusResponse, tags=["Invoices"])
+async def get_invoice(job_id: str):
+    """
+    Get detailed invoice data for human review.
+    Returns:
+    - job_id, status, filename, overall_confidence, needs_review, review_reasons
+    - invoice: InvoiceSchema dictionary
+    - invoice_builder_data: Nested JSON object ready for the frontend review UI
+    """
+    db: DatabaseManager = app.state.db
+    record = await db.get_job(job_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    from validation.validator import InvoiceSchema
+    invoice_dict = record.output_json
+    builder_data = None
+
+    if invoice_dict:
+        try:
+            if any(k in invoice_dict for k in ["company", "client", "meta", "items", "totals", "bankDetails"]):
+                schema_obj = InvoiceSchema.from_invoice_builder_json(invoice_dict)
+                builder_data = invoice_dict
+                invoice_dict = schema_obj.model_dump()
+            else:
+                schema_obj = InvoiceSchema(**invoice_dict)
+                builder_data = schema_obj.to_invoice_builder_json()
+                invoice_dict = schema_obj.model_dump()
+        except Exception as e:
+            logger.warning(f"Failed to normalize invoice data for {job_id}: {e}")
+
+    return JobStatusResponse(
+        job_id=record.job_id,
+        status=record.status,
+        filename=record.filename,
+        overall_confidence=record.overall_confidence,
+        needs_review=record.needs_review,
+        review_reasons=record.review_reasons or [],
+        invoice=invoice_dict,
+        invoice_builder_data=builder_data,
+        error_message=record.error_message,
+        created_at=str(record.created_at),
+    )
+
+
 @app.get("/api/invoices/{job_id}/html", response_class=HTMLResponse, tags=["Invoices"])
 async def get_invoice_html(job_id: str):
     """Get the rendered HTML invoice."""
@@ -656,201 +712,7 @@ async def get_invoice_doc_info(job_id: str):
         Path(f"data/raw/{job_id}_{record.filename}"),
         Path(f"data/raw/{record.filename}"),
         Path(f"data/uploads/{job_id}_{record.filename}"),
-    ]
-    for c in raw_candidates:
-        if c.exists() and c.is_file():
-            doc_path = c
-            break
-
-    pages = 1
-    is_pdf = False
-    if doc_path and doc_path.suffix.lower() == ".pdf":
-        try:
-            doc = pymupdf.open(str(doc_path))
-            pages = len(doc)
-            is_pdf = True
-            doc.close()
-        except Exception:
-            pass
-
-    return {
-        "job_id": job_id,
-        "filename": record.filename,
-        "is_pdf": is_pdf,
-        "pages": pages,
-    }
-
-
-# ── Training Endpoints ─────────────────────────────────────────────
-
-TRAINING_STATE = {
-    "is_training": False,
-    "current_model": None,
-    "progress": "",
-    "last_trained": None,
-}
-
-
-def _run_yolo_training_task():
-    global TRAINING_STATE
-    import subprocess
-    import sys
-    from datetime import datetime
-
-    TRAINING_STATE["is_training"] = True
-    TRAINING_STATE["current_model"] = "yolo"
-    TRAINING_STATE["progress"] = "Fine-tuning YOLOv8 model on annotations..."
-
-    try:
-        cmd = [sys.executable, "scripts/train_yolo.py", "--data", "data/annotations/dataset.yaml", "--epochs", "60"]
-        logger.info(f"Starting background YOLO training: {' '.join(cmd)}")
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if res.returncode == 0:
-            TRAINING_STATE["last_trained"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            TRAINING_STATE["progress"] = "YOLO training completed successfully! Model active."
-            logger.info("YOLO background training complete ✓")
-            pipeline = getattr(app.state, "pipeline", None)
-            if pipeline and hasattr(pipeline, "detector"):
-                pipeline.detector._try_load_model()
-        else:
-            TRAINING_STATE["progress"] = f"YOLO training error: {res.stderr[:200]}"
-            logger.error(f"YOLO training failed: {res.stderr}")
-    except Exception as e:
-        TRAINING_STATE["progress"] = f"Training failed: {e}"
-        logger.exception("Training error")
-    finally:
-        TRAINING_STATE["is_training"] = False
-
-
-def _run_layoutlm_training_task():
-    global TRAINING_STATE
-    import subprocess
-    import sys
-    from datetime import datetime
-
-    TRAINING_STATE["is_training"] = True
-    TRAINING_STATE["current_model"] = "layoutlmv3"
-    TRAINING_STATE["progress"] = "Exporting reviewed invoices and fine-tuning LayoutLMv3..."
-
-    try:
-        # 1. Export dataset
-        logger.info("Exporting reviewed invoices to LayoutLMv3 dataset...")
-        subprocess.run(
-            [sys.executable, "scripts/export_reviewed_to_layoutlm.py"],
-            check=True,
-            encoding="utf-8",
-            errors="replace"
-        )
-
-        # 2. Train LayoutLMv3
-        logger.info("Training LayoutLMv3...")
-        cmd = [sys.executable, "scripts/train_layoutlm.py", "--epochs", "10"]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if res.returncode == 0:
-            TRAINING_STATE["last_trained"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            TRAINING_STATE["progress"] = "LayoutLMv3 fine-tuning complete! Model active."
-            logger.info("LayoutLMv3 training complete ✓")
-            pipeline = getattr(app.state, "pipeline", None)
-            if pipeline and hasattr(pipeline, "extractor"):
-                pipeline.extractor._try_load_model()
-        else:
-            TRAINING_STATE["progress"] = f"LayoutLMv3 training error: {res.stderr[:200]}"
-            logger.error(f"LayoutLMv3 training failed: {res.stderr}")
-    except Exception as e:
-        TRAINING_STATE["progress"] = f"LayoutLMv3 training failed: {e}"
-        logger.exception("LayoutLMv3 training error")
-    finally:
-        TRAINING_STATE["is_training"] = False
-
-
-@app.post("/api/train/yolo", tags=["Training"])
-async def trigger_yolo_training(background_tasks: BackgroundTasks):
-    """Trigger YOLOv8 retraining on reviewed invoices in background."""
-    if TRAINING_STATE["is_training"]:
-        raise HTTPException(status_code=409, detail=f"Training already in progress: {TRAINING_STATE['progress']}")
-    background_tasks.add_task(_run_yolo_training_task)
-# Check MinIO
-    minio: MinIOManager = getattr(app.state, "minio", None)
-    if minio and record.storage_key:
-        url = minio.get_presigned_url(record.storage_key)
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse(url=url)
-
-    raise HTTPException(status_code=404, detail="Original document file not found on disk")
-
-
-@app.get("/api/invoices/{job_id}/preview-image", tags=["Invoices"])
-async def get_invoice_preview_image(job_id: str, page: int = 0):
-    """
-    Render a crisp PNG image of the requested page of the invoice.
-    Works for both PDF files and image files. Never triggers browser downloads.
-    """
-    from fastapi.responses import Response
-    import pymupdf
-
-    db: DatabaseManager = app.state.db
-    record = await db.get_job(job_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    doc_path = _find_invoice_file(job_id, record.filename)
-    if not doc_path or not doc_path.exists():
-        # Fallback to graceful SVG placeholder so no broken image is displayed
-        clean_name = record.filename
-        svg_placeholder = f"""<svg xmlns="http://www.w3.org/2000/svg" width="600" height="800" viewBox="0 0 600 800">
-            <rect width="600" height="800" fill="#f8fafc" rx="12" stroke="#e2e8f0" stroke-width="2"/>
-            <rect x="40" y="40" width="520" height="720" fill="#ffffff" rx="8" stroke="#cbd5e1" stroke-dasharray="6,6"/>
-            <circle cx="300" cy="340" r="40" fill="#eff6ff"/>
-            <text x="300" y="348" font-family="system-ui, sans-serif" font-size="28" text-anchor="middle">📄</text>
-            <text x="300" y="420" font-family="system-ui, sans-serif" font-size="16" font-weight="bold" fill="#1e293b" text-anchor="middle">Original Document: {clean_name}</text>
-            <text x="300" y="450" font-family="system-ui, sans-serif" font-size="12" fill="#64748b" text-anchor="middle">Processed prior to local disk storage. Please switch to Standard HTML</text>
-            <text x="300" y="475" font-family="system-ui, sans-serif" font-size="12" fill="#64748b" text-anchor="middle">or upload new invoices to view live document side-by-side.</text>
-        </svg>"""
-        return Response(content=svg_placeholder.encode("utf-8"), media_type="image/svg+xml")
-
-    ext = doc_path.suffix.lower().lstrip(".")
-    if ext in ["png", "jpg", "jpeg", "webp"]:
-        with open(doc_path, "rb") as f:
-            content = f.read()
-        mime = "image/png" if ext == "png" else f"image/{ext}"
-        if mime == "image/jpg":
-            mime = "image/jpeg"
-        return Response(content=content, media_type=mime, headers={"Cache-Control": "public, max-age=3600"})
-
-    # Render PDF page to PNG with PyMuPDF
-    try:
-        import pymupdf
-        doc = pymupdf.open(str(doc_path))
-        if page < 0 or page >= len(doc):
-            page = 0
-        pix = doc[page].get_pixmap(dpi=150)
-        img_bytes = pix.tobytes("png")
-        doc.close()
-        return Response(
-            content=img_bytes,
-            media_type="image/png",
-            headers={"Cache-Control": "public, max-age=3600"}
-        )
-    except Exception as e:
-        logger.exception(f"Failed to render preview image: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to render image: {e}")
-
-
-@app.get("/api/invoices/{job_id}/doc-info", tags=["Invoices"])
-async def get_invoice_doc_info(job_id: str):
-    """Get metadata about the original document (page count, filename, format)."""
-    import pymupdf
-
-    db: DatabaseManager = app.state.db
-    record = await db.get_job(job_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    doc_path = None
-    raw_candidates = [
-        Path(f"data/raw/{job_id}_{record.filename}"),
-        Path(f"data/raw/{record.filename}"),
-        Path(f"data/uploads/{job_id}_{record.filename}"),
+        Path(f"data/uploads/{record.filename}"),
     ]
     for c in raw_candidates:
         if c.exists() and c.is_file():
@@ -1194,7 +1056,48 @@ async def delete_invoice(job_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Job not found")
     await db.update_job(job_id, status="deleted")
+    if job_id in _active_job_progress:
+        del _active_job_progress[job_id]
     return {"status": "deleted", "job_id": job_id}
+
+
+@app.post("/api/invoices/bulk-delete", tags=["Invoices"])
+async def bulk_delete_invoices(
+    clear_pending: bool = True,
+    clear_unreviewed: bool = True,
+    clear_failed: bool = True,
+):
+    """
+    Bulk clear/delete invoices matching specified statuses.
+    Sets status to 'deleted' so they are removed from all views and queues.
+    Keeps verified 'reviewed' and 'partially_reviewed' invoices intact.
+    """
+    db: DatabaseManager = app.state.db
+    target_statuses = []
+    if clear_pending:
+        target_statuses.append("pending")
+    if clear_unreviewed:
+        target_statuses.append("done")
+    if clear_failed:
+        target_statuses.append("failed")
+
+    if not target_statuses:
+        return {"deleted_count": 0, "message": "No statuses selected"}
+
+    count = await db.bulk_delete_jobs(target_statuses)
+
+    # Clear memory cache for deleted items
+    for j_id in list(_active_job_progress.keys()):
+        prog = _active_job_progress.get(j_id, {})
+        if prog.get("status") in target_statuses:
+            del _active_job_progress[j_id]
+
+    logger.info(f"Bulk cleared {count} invoices with status in {target_statuses}")
+    return {
+        "deleted_count": count,
+        "statuses": target_statuses,
+        "message": f"Successfully cleared {count} invoice(s) from queue",
+    }
 
 
 def _get_raw_file_bytes(job_id: str, filename: str, storage_key: Optional[str] = None, minio: Optional[MinIOManager] = None) -> Optional[bytes]:
@@ -1300,6 +1203,44 @@ async def reprocess_all_invoices(
         "total_queued": len(queued),
         "total_skipped": len(skipped),
         "queued": queued,
+    }
+
+
+@app.post("/api/invoices/cancel-processing", tags=["Invoices"])
+async def cancel_all_processing():
+    """
+    Instantly cancel/stop all currently running and queued invoice re-scans.
+    Resets processing jobs back to 'done' and clears memory queues.
+    """
+    db: DatabaseManager = app.state.db
+    from sqlalchemy import update
+    async with db.session_factory() as session:
+        stmt = (
+            update(InvoiceRecord)
+            .where(InvoiceRecord.status == "processing")
+            .values(status="done")
+        )
+        res = await session.execute(stmt)
+        await session.commit()
+        count = res.rowcount or 0
+
+    # Clear active progress trackers and notify listeners
+    for j_id in list(_active_job_progress.keys()):
+        _push_progress(j_id, {
+            "job_id": j_id,
+            "status": "done",
+            "stage": "done",
+            "stage_label": "Cancelled by user",
+            "progress_pct": 100,
+        })
+        if j_id in _active_job_progress:
+            del _active_job_progress[j_id]
+
+    logger.info(f"Cancelled all processing: reset {count} jobs back to done")
+    return {
+        "status": "cancelled",
+        "stopped_count": count,
+        "message": f"Successfully stopped {count} running/queued invoice scan(s)",
     }
 
 

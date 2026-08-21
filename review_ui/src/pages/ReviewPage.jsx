@@ -71,6 +71,7 @@ function getEmptyForm() {
   return {
     meta: {
       invoiceNo: '',
+      poNumber: '',
       category: '',
       subcategory: '',
       date: '',
@@ -101,6 +102,7 @@ function getEmptyForm() {
       accountName: '',
       accountNumber: '',
       confirmAccountNumber: '',
+      paymentTerms: '',
     },
     items: [
       {
@@ -124,20 +126,33 @@ function getEmptyForm() {
       totalDiscount: 0,
       netTaxable: 0,
       globalDiscount: 0,
+      finalNetTaxable: 0,
       totalCgst: 0,
       totalSgst: 0,
       totalIgst: 0,
+      globalCgstRate: 0,
+      globalSgstRate: 0,
+      globalIgstRate: 0,
       roundOff: 0,
       grandTotal: 0,
       amountInWords: '',
     },
     remarks: '',
-    certifiedRemarks: [
-      'Certified that the particulars given above are true and correct.',
-      'The applicable GST and other charges are accurately calculated.',
-    ],
+    certifiedRemarks: [],
   }
 }
+
+// ── Standard Certificate Templates (Optional library for quick insertion) ───
+
+const STANDARD_CERTIFICATE_TEMPLATES = [
+  "Certified that the materials/articles as detailed in the invoice have been received in good condition and taken into stock vide Stock Entry No. ________ Dated ________.",
+  "Certified that the services as detailed in the invoice have been satisfactorily rendered as per work order/agreement terms.",
+  "Necessary budget provision exists under the appropriate Head of Account ________",
+  "Special Remarks if any ________",
+  "The claim has not been paid earlier.",
+  "The quantity and specifications have been verified.",
+  "The rates charged are as per approved order/work order/contract.",
+]
 
 // ── Default Columns Definition (Parity with Angular Invoice Builder) ─────────
 
@@ -248,8 +263,9 @@ export default function ReviewPage() {
   // Tax rate popup
   const [activeTaxRowIndex, setActiveTaxRowIndex] = useState(null)
 
-  // Remarks selection
-  const [areAllRemarksSelected, setAreAllRemarksSelected] = useState(true)
+  // Remarks & Certificates state
+  const [newRemarkText, setNewRemarkText] = useState('')
+  const [selectedTemplate, setSelectedTemplate] = useState('')
 
   // Training state
   const [showTrainModal, setShowTrainModal] = useState(false)
@@ -430,16 +446,37 @@ export default function ReviewPage() {
         if (bData.columns && Array.isArray(bData.columns) && bData.columns.length > 0) {
           setColumns(bData.columns)
         }
-        const calc = recalculate(bData.items || [], bData.totals?.roundOff || 0)
+        const globalDisc = parseFloat(bData.totals?.globalDiscount) || 0
+        const globalRates = {
+          cgst: parseFloat(bData.totals?.globalCgstRate) || 0,
+          sgst: parseFloat(bData.totals?.globalSgstRate) || 0,
+          igst: parseFloat(bData.totals?.globalIgstRate) || 0,
+        }
+        const calc = recalculate(bData.items || [], bData.totals?.roundOff != null ? bData.totals.roundOff : 0, globalDisc, globalRates)
         setFormData({
-          meta: { ...getEmptyForm().meta, ...(bData.meta || {}) },
+          meta: {
+            ...getEmptyForm().meta,
+            ...(bData.meta || {}),
+            poNumber: bData.meta?.poNumber || bData.meta?.po_number || '',
+          },
           client: { ...getEmptyForm().client, ...(bData.client || {}) },
           company: { ...getEmptyForm().company, ...(bData.company || {}) },
-          bankDetails: { ...getEmptyForm().bankDetails, ...(bData.bankDetails || {}) },
+          bankDetails: {
+            ...getEmptyForm().bankDetails,
+            ...(bData.bankDetails || {}),
+            paymentTerms: bData.bankDetails?.paymentTerms || bData.paymentTerms || '',
+          },
           items: calc.items.length > 0 ? calc.items : getEmptyForm().items,
-          totals: { ...(bData.totals || {}), ...calc.totals },
+          totals: {
+            ...(bData.totals || {}),
+            ...calc.totals,
+            globalDiscount: globalDisc,
+            globalCgstRate: globalRates.cgst,
+            globalSgstRate: globalRates.sgst,
+            globalIgstRate: globalRates.igst,
+          },
           remarks: bData.remarks || '',
-          certifiedRemarks: bData.certifiedRemarks?.length > 0 ? bData.certifiedRemarks : getEmptyForm().certifiedRemarks,
+          certifiedRemarks: Array.isArray(bData.certifiedRemarks) ? bData.certifiedRemarks : [],
         })
       } else if (data.invoice) {
         const inv = data.invoice
@@ -453,7 +490,7 @@ export default function ReviewPage() {
           unit: it.unit || 'NOS',
           rate: it.rate || 0,
           discount: it.discount || 0,
-          taxableValue: it.amount || 0,
+          taxableValue: it.taxable_value != null ? it.taxable_value : (it.amount || 0),
           cgstRate: it.cgst_rate || 0,
           cgstAmount: it.cgst_amount || 0,
           sgstRate: it.sgst_rate || 0,
@@ -462,11 +499,18 @@ export default function ReviewPage() {
           igstAmount: it.igst_amount || 0,
         }))
 
-        const calc = recalculate(rawItems.length > 0 ? rawItems : getEmptyForm().items, inv.round_off || 0)
+        const globalDisc = parseFloat(inv.global_discount) || 0
+        const globalRates = {
+          cgst: parseFloat(inv.global_cgst_rate) || 0,
+          sgst: parseFloat(inv.global_sgst_rate) || 0,
+          igst: parseFloat(inv.global_igst_rate) || 0,
+        }
+        const calc = recalculate(rawItems.length > 0 ? rawItems : getEmptyForm().items, inv.round_off != null ? inv.round_off : 0, globalDisc, globalRates)
 
         setFormData({
           meta: {
             invoiceNo: inv.invoice_number || '',
+            poNumber: inv.po_number || '',
             category: inv.category || '',
             subcategory: inv.subcategory || '',
             date: inv.invoice_date || '',
@@ -476,15 +520,15 @@ export default function ReviewPage() {
           client: {
             slsCode: inv.sls_code || '',
             name: inv.buyer_name || '',
-            addressLine1: bLines[0] || '',
-            addressLine2: bLines.slice(1).join('\n') || '',
+            addressLine1: inv.buyer_address_line1 || (bLines[0] || ''),
+            addressLine2: inv.buyer_address_line2 || (bLines.slice(1).join('\n') || ''),
             phone: inv.buyer_phone || '',
             gstin: inv.buyer_gstin || '',
           },
           company: {
             name: inv.vendor_name || '',
-            addressLine1: vLines[0] || '',
-            addressLine2: vLines.slice(1).join('\n') || '',
+            addressLine1: inv.vendor_address_line1 || (vLines[0] || ''),
+            addressLine2: inv.vendor_address_line2 || (vLines.slice(1).join('\n') || ''),
             email: inv.vendor_email || '',
             phone: inv.vendor_phone || '',
             gstin: inv.vendor_gstin || '',
@@ -497,22 +541,27 @@ export default function ReviewPage() {
             accountName: inv.account_name || inv.vendor_name || '',
             accountNumber: inv.account_number || '',
             confirmAccountNumber: inv.account_number || '',
+            paymentTerms: inv.payment_terms || '',
           },
           items: calc.items,
           totals: {
-            taxableAmount: inv.subtotal || calc.totals.taxableAmount,
-            totalDiscount: inv.discount || calc.totals.totalDiscount,
-            netTaxable: (inv.subtotal || calc.totals.taxableAmount) - (inv.discount || 0),
-            globalDiscount: 0,
-            totalCgst: inv.cgst || calc.totals.totalCgst,
-            totalSgst: inv.sgst || calc.totals.totalSgst,
-            totalIgst: inv.igst || calc.totals.totalIgst,
-            roundOff: inv.round_off || 0,
-            grandTotal: inv.grand_total || calc.totals.grandTotal,
-            amountInWords: inv.amount_in_words || calc.totals.amountInWords,
+            taxableAmount: calc.totals.taxableAmount,
+            totalDiscount: calc.totals.totalDiscount,
+            netTaxable: calc.totals.netTaxable,
+            globalDiscount: globalDisc,
+            finalNetTaxable: calc.totals.finalNetTaxable,
+            totalCgst: calc.totals.totalCgst,
+            totalSgst: calc.totals.totalSgst,
+            totalIgst: calc.totals.totalIgst,
+            globalCgstRate: globalRates.cgst,
+            globalSgstRate: globalRates.sgst,
+            globalIgstRate: globalRates.igst,
+            roundOff: calc.totals.roundOff,
+            grandTotal: calc.totals.grandTotal,
+            amountInWords: calc.totals.amountInWords,
           },
           remarks: inv.remarks || '',
-          certifiedRemarks: getEmptyForm().certifiedRemarks,
+          certifiedRemarks: Array.isArray(inv.certified_remarks) ? inv.certified_remarks : [],
         })
       }
     } catch (err) {
@@ -562,11 +611,17 @@ export default function ReviewPage() {
       if (idx !== index) return it
       return { ...it, [field]: val }
     })
-    const calc = recalculate(updated, formData.totals.roundOff)
+    const curDisc = parseFloat(formData.totals?.globalDiscount) || 0
+    const curRates = {
+      cgst: parseFloat(formData.totals?.globalCgstRate) || 0,
+      sgst: parseFloat(formData.totals?.globalSgstRate) || 0,
+      igst: parseFloat(formData.totals?.globalIgstRate) || 0,
+    }
+    const calc = recalculate(updated, formData.totals?.roundOff, curDisc, curRates)
     setFormData(prev => ({
       ...prev,
       items: calc.items,
-      totals: { ...prev.totals, ...calc.totals },
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: curDisc, globalCgstRate: curRates.cgst, globalSgstRate: curRates.sgst, globalIgstRate: curRates.igst },
     }))
     setDirty(true)
   }
@@ -598,11 +653,17 @@ export default function ReviewPage() {
         ...customDefaults,
       }
     ]
-    const calc = recalculate(next, formData.totals.roundOff)
+    const curDisc = parseFloat(formData.totals?.globalDiscount) || 0
+    const curRates = {
+      cgst: parseFloat(formData.totals?.globalCgstRate) || 0,
+      sgst: parseFloat(formData.totals?.globalSgstRate) || 0,
+      igst: parseFloat(formData.totals?.globalIgstRate) || 0,
+    }
+    const calc = recalculate(next, formData.totals?.roundOff, curDisc, curRates)
     setFormData(prev => ({
       ...prev,
       items: calc.items,
-      totals: { ...prev.totals, ...calc.totals },
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: curDisc, globalCgstRate: curRates.cgst, globalSgstRate: curRates.sgst, globalIgstRate: curRates.igst },
     }))
     setDirty(true)
   }
@@ -613,20 +674,32 @@ export default function ReviewPage() {
       return
     }
     const next = formData.items.filter((_, i) => i !== idx)
-    const calc = recalculate(next, formData.totals.roundOff)
+    const curDisc = parseFloat(formData.totals?.globalDiscount) || 0
+    const curRates = {
+      cgst: parseFloat(formData.totals?.globalCgstRate) || 0,
+      sgst: parseFloat(formData.totals?.globalSgstRate) || 0,
+      igst: parseFloat(formData.totals?.globalIgstRate) || 0,
+    }
+    const calc = recalculate(next, formData.totals?.roundOff, curDisc, curRates)
     setFormData(prev => ({
       ...prev,
       items: calc.items,
-      totals: { ...prev.totals, ...calc.totals },
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: curDisc, globalCgstRate: curRates.cgst, globalSgstRate: curRates.sgst, globalIgstRate: curRates.igst },
     }))
     setDirty(true)
   }
 
   const updateRoundOff = (val) => {
-    const calc = recalculate(formData.items, val)
+    const curDisc = parseFloat(formData.totals?.globalDiscount) || 0
+    const curRates = {
+      cgst: parseFloat(formData.totals?.globalCgstRate) || 0,
+      sgst: parseFloat(formData.totals?.globalSgstRate) || 0,
+      igst: parseFloat(formData.totals?.globalIgstRate) || 0,
+    }
+    const calc = recalculate(formData.items, val, curDisc, curRates)
     setFormData(prev => ({
       ...prev,
-      totals: { ...prev.totals, ...calc.totals },
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: curDisc, globalCgstRate: curRates.cgst, globalSgstRate: curRates.sgst, globalIgstRate: curRates.igst },
     }))
     setDirty(true)
   }
@@ -708,28 +781,23 @@ export default function ReviewPage() {
     setDirty(true)
   }
 
-  const verifyAccountNumber = async () => {
-    setIsVerifying(true)
-    try {
-      await new Promise(r => setTimeout(r, 600))
-      setAccountVerificationStatus('verified')
-      toast.success('Bank details verified against IFSC registry! ✓')
-    } finally {
-      setIsVerifying(false)
-    }
-  }
-
   const updateItemTaxRate = (idx, rateField, val) => {
     const rateVal = parseFloat(val) || 0
     const updated = (formData.items || []).map((it, i) => {
       if (i !== idx) return it
       return { ...it, [rateField]: rateVal }
     })
-    const calc = recalculate(updated, formData.totals?.roundOff)
+    const curDisc = parseFloat(formData.totals?.globalDiscount) || 0
+    const curRates = {
+      cgst: parseFloat(formData.totals?.globalCgstRate) || 0,
+      sgst: parseFloat(formData.totals?.globalSgstRate) || 0,
+      igst: parseFloat(formData.totals?.globalIgstRate) || 0,
+    }
+    const calc = recalculate(updated, formData.totals?.roundOff, curDisc, curRates)
     setFormData(prev => ({
       ...prev,
       items: calc.items,
-      totals: { ...prev.totals, ...calc.totals },
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: curDisc, globalCgstRate: curRates.cgst, globalSgstRate: curRates.sgst, globalIgstRate: curRates.igst },
     }))
     setDirty(true)
   }
@@ -747,11 +815,17 @@ export default function ReviewPage() {
         igstAmount: 0,
       }
     })
-    const calc = recalculate(updated, formData.totals?.roundOff)
+    const curDisc = parseFloat(formData.totals?.globalDiscount) || 0
+    const curRates = {
+      cgst: parseFloat(formData.totals?.globalCgstRate) || 0,
+      sgst: parseFloat(formData.totals?.globalSgstRate) || 0,
+      igst: parseFloat(formData.totals?.globalIgstRate) || 0,
+    }
+    const calc = recalculate(updated, formData.totals?.roundOff, curDisc, curRates)
     setFormData(prev => ({
       ...prev,
       items: calc.items,
-      totals: { ...prev.totals, ...calc.totals },
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: curDisc, globalCgstRate: curRates.cgst, globalSgstRate: curRates.sgst, globalIgstRate: curRates.igst },
     }))
     setDirty(true)
     setActiveTaxRowIndex(null)
@@ -760,31 +834,68 @@ export default function ReviewPage() {
   const updateGlobalRate = (type, val) => {
     const rateVal = parseFloat(val) || 0
     const newRates = {
-      cgst: type === 'cgst' ? rateVal : (formData.totals?.globalCgstRate || 0),
-      sgst: type === 'sgst' ? rateVal : (formData.totals?.globalSgstRate || 0),
-      igst: type === 'igst' ? rateVal : (formData.totals?.globalIgstRate || 0),
+      cgst: type === 'cgst' ? rateVal : (parseFloat(formData.totals?.globalCgstRate) || 0),
+      sgst: type === 'sgst' ? rateVal : (parseFloat(formData.totals?.globalSgstRate) || 0),
+      igst: type === 'igst' ? rateVal : (parseFloat(formData.totals?.globalIgstRate) || 0),
     }
-    const calc = recalculate(formData.items, formData.totals?.roundOff, formData.totals?.globalDiscount, newRates)
+    const curDisc = parseFloat(formData.totals?.globalDiscount) || 0
+    const calc = recalculate(formData.items, formData.totals?.roundOff, curDisc, newRates)
     setFormData(prev => ({
       ...prev,
-      totals: { ...prev.totals, ...calc.totals, globalCgstRate: newRates.cgst, globalSgstRate: newRates.sgst, globalIgstRate: newRates.igst },
+      items: calc.items,
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: curDisc, globalCgstRate: newRates.cgst, globalSgstRate: newRates.sgst, globalIgstRate: newRates.igst },
     }))
     setDirty(true)
   }
 
   const updateGlobalDiscount = (val) => {
     const disc = parseFloat(val) || 0
-    const calc = recalculate(formData.items, formData.totals?.roundOff, disc)
+    const curRates = {
+      cgst: parseFloat(formData.totals?.globalCgstRate) || 0,
+      sgst: parseFloat(formData.totals?.globalSgstRate) || 0,
+      igst: parseFloat(formData.totals?.globalIgstRate) || 0,
+    }
+    const calc = recalculate(formData.items, formData.totals?.roundOff, disc, curRates)
     setFormData(prev => ({
       ...prev,
       items: calc.items,
-      totals: { ...prev.totals, ...calc.totals, globalDiscount: disc },
+      totals: { ...prev.totals, ...calc.totals, globalDiscount: disc, globalCgstRate: curRates.cgst, globalSgstRate: curRates.sgst, globalIgstRate: curRates.igst },
     }))
     setDirty(true)
   }
 
-  const toggleSelectAllRemarks = () => {
-    setAreAllRemarksSelected(prev => !prev)
+  const addCertifiedRemark = (text) => {
+    const clean = (text || '').trim()
+    if (!clean) return
+    setFormData(prev => {
+      const current = prev.certifiedRemarks || []
+      if (current.includes(clean)) return prev
+      return { ...prev, certifiedRemarks: [...current, clean] }
+    })
+    setNewRemarkText('')
+    setDirty(true)
+  }
+
+  const removeCertifiedRemark = (idx) => {
+    setFormData(prev => ({
+      ...prev,
+      certifiedRemarks: (prev.certifiedRemarks || []).filter((_, i) => i !== idx)
+    }))
+    setDirty(true)
+  }
+
+  const updateCertifiedRemark = (idx, newText) => {
+    setFormData(prev => {
+      const next = [...(prev.certifiedRemarks || [])]
+      next[idx] = newText
+      return { ...prev, certifiedRemarks: next }
+    })
+    setDirty(true)
+  }
+
+  const clearAllCertifiedRemarks = () => {
+    setFormData(prev => ({ ...prev, certifiedRemarks: [] }))
+    setDirty(true)
   }
 
   // ── Save & Export Actions ──────────────────────────────────────────────────
@@ -1057,6 +1168,28 @@ export default function ReviewPage() {
           </button>
           <button onClick={() => navigate('/')} className="btn-secondary py-2 px-4 text-xs flex items-center gap-1.5">
             <Upload size={14} /> Upload New
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  if (job?.status === 'deleted' && !job.invoice && !job.invoice_builder_data) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] p-8 text-center max-w-md mx-auto">
+        <div className="w-14 h-14 rounded-2xl bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 flex items-center justify-center mb-4 border border-amber-200 dark:border-amber-800 shadow-sm">
+          <Trash2 size={28} />
+        </div>
+        <h2 className="text-base font-bold text-slate-900 dark:text-white mb-1.5">Invoice Cleared from Queue</h2>
+        <p className="text-xs text-slate-500 dark:text-slate-400 mb-6 leading-relaxed">
+          This invoice ({job.filename || jobId}) was cleared from the queue and has no saved extraction data.
+        </p>
+        <div className="flex items-center gap-3">
+          <button onClick={() => navigate('/invoices')} className="btn-primary py-2 px-4 text-xs flex items-center gap-1.5 shadow-sm">
+            <ArrowLeft size={14} /> Back to Invoices
+          </button>
+          <button onClick={() => navigate('/')} className="btn-secondary py-2 px-4 text-xs flex items-center gap-1.5">
+            <Upload size={14} /> Upload Invoice
           </button>
         </div>
       </div>
@@ -1716,15 +1849,27 @@ export default function ReviewPage() {
                           </div>
                         </div>
 
-                        <div>
-                          <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Invoice Number <span className="text-red-500">*</span></label>
-                          <input
-                            type="text"
-                            className="field-input text-xs font-bold font-mono text-blue-700 dark:text-blue-400 py-1.5"
-                            placeholder="INV-2024-001"
-                            value={formData.meta.invoiceNo}
-                            onChange={e => updateSection('meta', 'invoiceNo', e.target.value)}
-                          />
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Invoice Number <span className="text-red-500">*</span></label>
+                            <input
+                              type="text"
+                              className="field-input text-xs font-bold font-mono text-blue-700 dark:text-blue-400 py-1.5"
+                              placeholder="INV-2024-001"
+                              value={formData.meta.invoiceNo}
+                              onChange={e => updateSection('meta', 'invoiceNo', e.target.value)}
+                            />
+                          </div>
+                          <div>
+                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">PO / Work Order No.</label>
+                            <input
+                              type="text"
+                              className="field-input text-xs font-mono py-1.5"
+                              placeholder="PO-2024-001"
+                              value={formData.meta.poNumber || ''}
+                              onChange={e => updateSection('meta', 'poNumber', e.target.value)}
+                            />
+                          </div>
                         </div>
 
                         <div className="grid grid-cols-2 gap-2">
@@ -1856,18 +2001,9 @@ export default function ReviewPage() {
 
                     {/* Bank Details */}
                     <div className="card p-4 border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 shadow-xs">
-                      <div className="flex items-center justify-between pb-2 mb-2.5 border-b border-slate-100 dark:border-slate-800">
-                        <div className="flex items-center gap-2">
-                          <Landmark size={15} className="text-blue-600 dark:text-blue-400" />
-                          <h3 className="text-[11px] font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">Bank Details</h3>
-                        </div>
-                        <span className={`badge text-[10px] ${
-                          accountVerificationStatus === 'verified'
-                            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800'
-                            : 'bg-amber-50 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300 border border-amber-200 dark:border-amber-800'
-                        }`}>
-                          {accountVerificationStatus === 'verified' ? '✓ Verified' : 'Pending Verification'}
-                        </span>
+                      <div className="flex items-center gap-2 pb-2 mb-2.5 border-b border-slate-100 dark:border-slate-800">
+                        <Landmark size={15} className="text-blue-600 dark:text-blue-400" />
+                        <h3 className="text-[11px] font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider">Bank Details</h3>
                       </div>
                       <div className="space-y-2.5 text-xs">
                         <div className="grid grid-cols-2 gap-2">
@@ -1918,54 +2054,35 @@ export default function ReviewPage() {
                         <div className="grid grid-cols-2 gap-2">
                           <div>
                             <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Account Number <span className="text-red-500">*</span></label>
-                            <div className="relative">
-                              <input
-                                type={showAccountNumber ? 'text' : 'password'}
-                                className="field-input text-xs font-mono font-semibold pr-8 py-1.5"
-                                placeholder="123456789012"
-                                value={formData.bankDetails.accountNumber}
-                                onChange={e => updateSection('bankDetails', 'accountNumber', e.target.value)}
-                              />
-                              <button
-                                type="button"
-                                onClick={() => setShowAccountNumber(p => !p)}
-                                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                              >
-                                {showAccountNumber ? <Eye size={13} /> : <Eye size={13} className="opacity-60" />}
-                              </button>
-                            </div>
+                            <input
+                              type="text"
+                              className="field-input text-xs font-mono font-semibold py-1.5"
+                              placeholder="123456789012"
+                              value={formData.bankDetails.accountNumber}
+                              onChange={e => updateSection('bankDetails', 'accountNumber', e.target.value)}
+                            />
                           </div>
                           <div>
                             <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Confirm Account No <span className="text-red-500">*</span></label>
-                            <div className="relative">
-                              <input
-                                type={showConfirmAccountNumber ? 'text' : 'password'}
-                                className="field-input text-xs font-mono font-semibold pr-8 py-1.5"
-                                placeholder="123456789012"
-                                value={formData.bankDetails.confirmAccountNumber || formData.bankDetails.accountNumber}
-                                onChange={e => updateSection('bankDetails', 'confirmAccountNumber', e.target.value)}
-                              />
-                              <button
-                                type="button"
-                                onClick={() => setShowConfirmAccountNumber(p => !p)}
-                                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
-                              >
-                                {showConfirmAccountNumber ? <Eye size={13} /> : <Eye size={13} className="opacity-60" />}
-                              </button>
-                            </div>
+                            <input
+                              type="text"
+                              className="field-input text-xs font-mono font-semibold py-1.5"
+                              placeholder="123456789012"
+                              value={formData.bankDetails.confirmAccountNumber || formData.bankDetails.accountNumber}
+                              onChange={e => updateSection('bankDetails', 'confirmAccountNumber', e.target.value)}
+                            />
                           </div>
                         </div>
 
-                        <div className="pt-1">
-                          <button
-                            type="button"
-                            onClick={verifyAccountNumber}
-                            disabled={isVerifying || !formData.bankDetails.accountNumber || !formData.bankDetails.ifsc}
-                            className="btn-primary py-1.5 px-3 text-xs flex items-center gap-1.5"
-                          >
-                            {isVerifying ? <RefreshCw size={12} className="spinner" /> : <CheckCircle size={12} />}
-                            <span>Verify Bank Account</span>
-                          </button>
+                        <div>
+                          <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Payment Terms</label>
+                          <input
+                            type="text"
+                            className="field-input text-xs py-1.5"
+                            placeholder="e.g. Net 30 / Due on receipt / Immediate"
+                            value={formData.bankDetails.paymentTerms || ''}
+                            onChange={e => updateSection('bankDetails', 'paymentTerms', e.target.value)}
+                          />
                         </div>
                       </div>
                     </div>
@@ -2042,8 +2159,8 @@ export default function ReviewPage() {
                                     />
                                   </div>
 
-                                  {/* Column Action Controls (Hover Toolbar) */}
-                                  <div className="absolute -top-3 right-0 hidden group-hover:flex items-center gap-0.5 bg-white dark:bg-slate-800 rounded shadow-md border border-slate-200 dark:border-slate-700 p-0.5 z-20">
+                                  {/* Column Action Controls (Hover Toolbar inside TH) */}
+                                  <div className="absolute top-1 right-1 hidden group-hover:flex items-center gap-0.5 bg-white dark:bg-slate-800 rounded shadow-md border border-slate-200 dark:border-slate-700 p-0.5 z-20">
                                     <button
                                       type="button"
                                       onClick={() => openAddColumnModal(colIdx)}
@@ -2070,7 +2187,9 @@ export default function ReviewPage() {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                            {formData.items.map((item, idx) => (
+                            {formData.items.map((item, idx) => {
+                              const itemTaxTotalRate = (item.sgstRate || 0) + (item.cgstRate || 0) + (item.igstRate || 0)
+                              return (
                               <tr key={idx} className="hover:bg-slate-50/50 dark:hover:bg-slate-800/40 transition-colors group">
                                 <td className="py-2 px-1 text-center font-mono text-slate-400 select-none">{idx + 1}</td>
 
@@ -2167,23 +2286,27 @@ export default function ReviewPage() {
                                       <td key={col.key} className="py-1.5 px-2 text-right relative">
                                         <div className="flex items-center justify-end gap-1.5">
                                           <span className="font-mono font-bold text-slate-800 dark:text-slate-200">
-                                            ₹{item.taxableValue?.toFixed(2)}
+                                            ₹{formatAmount(item.taxableValue)}
                                           </span>
                                           <button
                                             type="button"
                                             onClick={() => setActiveTaxRowIndex(activeTaxRowIndex === idx ? null : idx)}
-                                            className="opacity-0 group-hover:opacity-100 bg-blue-50 dark:bg-blue-950 text-blue-600 dark:text-blue-400 text-[10px] font-bold px-1.5 py-0.5 rounded border border-blue-200 dark:border-blue-800 hover:bg-blue-100 transition-opacity"
+                                            className={`text-[10px] font-bold px-1.5 py-0.5 rounded border transition-colors ${
+                                              itemTaxTotalRate > 0
+                                                ? 'bg-blue-600 text-white border-blue-700 dark:bg-blue-600 dark:border-blue-500 shadow-xs'
+                                                : 'bg-blue-50 text-blue-700 dark:bg-blue-950/80 dark:text-blue-300 border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900'
+                                            }`}
                                             title="Edit item tax rates"
                                           >
-                                            + Tax
+                                            {itemTaxTotalRate > 0 ? `${itemTaxTotalRate}% Tax` : '+ Tax'}
                                           </button>
                                         </div>
 
                                         {/* Tax Popup */}
                                         {activeTaxRowIndex === idx && (
-                                          <div className="absolute top-full right-0 mt-1 bg-white dark:bg-slate-800 rounded-lg shadow-xl border border-slate-200 dark:border-slate-700 p-3 z-50 w-56 text-left animate-pop-in">
+                                          <div className="absolute top-full right-0 mt-1 bg-white dark:bg-slate-800 rounded-lg shadow-2xl border border-slate-200 dark:border-slate-700 p-3.5 z-50 w-56 text-left animate-pop-in">
                                             <div className="flex justify-between items-center mb-2 pb-1 border-b border-slate-100 dark:border-slate-700">
-                                              <span className="font-bold text-xs text-slate-700 dark:text-slate-200">Tax Rates</span>
+                                              <span className="font-bold text-xs text-slate-700 dark:text-slate-200">Tax Rates (%)</span>
                                               <button onClick={() => setActiveTaxRowIndex(null)} className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200">
                                                 <X size={12} />
                                               </button>
@@ -2283,7 +2406,7 @@ export default function ReviewPage() {
                                   </button>
                                 </td>
                               </tr>
-                            ))}
+                            )})}
                           </tbody>
                         </table>
                       </div>
@@ -2535,29 +2658,109 @@ export default function ReviewPage() {
 
                       <div>
                         <div className="flex items-center justify-between mb-2">
-                          <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
-                            Certified Remarks
-                          </label>
-                          <button
-                            type="button"
-                            onClick={toggleSelectAllRemarks}
-                            className="text-xs text-blue-600 dark:text-blue-400 font-semibold hover:underline"
-                          >
-                            {areAllRemarksSelected ? 'Deselect All' : 'Select All'}
-                          </button>
+                          <div className="flex items-center gap-2">
+                            <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+                              Certified Remarks & Declarations
+                            </label>
+                            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 dark:bg-blue-950/60 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+                              {(formData.certifiedRemarks || []).length} {formData.certifiedRemarks?.length === 1 ? 'entry' : 'entries'}
+                            </span>
+                          </div>
+                          {(formData.certifiedRemarks || []).length > 0 && (
+                            <button
+                              type="button"
+                              onClick={clearAllCertifiedRemarks}
+                              className="text-xs text-rose-600 dark:text-rose-400 font-semibold hover:underline"
+                            >
+                              Clear All
+                            </button>
+                          )}
                         </div>
-                        <div className="space-y-2">
-                          {(formData?.certifiedRemarks?.length > 0 ? formData.certifiedRemarks : getEmptyForm().certifiedRemarks).map((remark, idx) => (
-                            <div key={idx} className="flex items-start gap-2.5 p-2.5 bg-slate-50 dark:bg-slate-800/60 rounded-lg border border-slate-200 dark:border-slate-700 text-xs text-slate-700 dark:text-slate-300">
-                              <input
-                                type="checkbox"
-                                checked={areAllRemarksSelected}
-                                onChange={() => {}}
-                                className="mt-0.5 rounded text-blue-600"
-                              />
-                              <span className="flex-1">{remark}</span>
+
+                        {/* List of dynamic certified remarks */}
+                        <div className="space-y-2 mb-3">
+                          {(formData.certifiedRemarks || []).length === 0 ? (
+                            <div className="p-3 rounded-lg border border-dashed border-slate-300 dark:border-slate-700 bg-slate-50/50 dark:bg-slate-800/30 text-center text-xs text-slate-500 dark:text-slate-400">
+                              No declarations or certificates detected on this invoice. You can add custom remarks or pick from standard templates below.
                             </div>
-                          ))}
+                          ) : (
+                            formData.certifiedRemarks.map((remark, idx) => (
+                              <div
+                                key={idx}
+                                className="flex items-start gap-2.5 p-2.5 rounded-lg border bg-blue-50/50 dark:bg-blue-950/30 border-blue-200/80 dark:border-blue-800/70 text-xs text-slate-800 dark:text-slate-200"
+                              >
+                                <span className="text-[11px] font-mono font-bold text-blue-600 dark:text-blue-400 shrink-0 mt-1">
+                                  #{idx + 1}
+                                </span>
+                                <textarea
+                                  rows={2}
+                                  value={remark}
+                                  onChange={e => updateCertifiedRemark(idx, e.target.value)}
+                                  className="flex-1 bg-transparent text-xs text-slate-800 dark:text-slate-200 border-none focus:outline-none resize-y"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeCertifiedRemark(idx)}
+                                  className="text-slate-400 hover:text-rose-600 dark:hover:text-rose-400 p-1 shrink-0 transition-colors"
+                                  title="Remove this certificate entry"
+                                >
+                                  <X size={14} />
+                                </button>
+                              </div>
+                            ))
+                          )}
+                        </div>
+
+                        {/* Add Certificate / Template Controls */}
+                        <div className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-800/50 space-y-2.5">
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              className="field-input text-xs flex-1"
+                              placeholder="Type a certificate, declaration or stock note to add..."
+                              value={newRemarkText}
+                              onChange={e => setNewRemarkText(e.target.value)}
+                              onKeyDown={e => {
+                                if (e.key === 'Enter') {
+                                  e.preventDefault()
+                                  addCertifiedRemark(newRemarkText)
+                                }
+                              }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => addCertifiedRemark(newRemarkText)}
+                              disabled={!newRemarkText.trim()}
+                              className="btn-primary text-xs px-3 py-1.5 shrink-0 disabled:opacity-40"
+                            >
+                              + Add
+                            </button>
+                          </div>
+
+                          {/* Optional Template selector */}
+                          <div className="flex items-center gap-2 pt-1 border-t border-slate-200/60 dark:border-slate-700/60">
+                            <span className="text-[11px] text-slate-500 dark:text-slate-400 shrink-0 font-medium">
+                              Insert Template:
+                            </span>
+                            <select
+                              value={selectedTemplate}
+                              onChange={e => {
+                                const val = e.target.value
+                                if (val) {
+                                  addCertifiedRemark(val)
+                                  setSelectedTemplate('')
+                                }
+                              }}
+                              className="field-input text-xs py-1 flex-1 text-slate-600 dark:text-slate-300"
+                            >
+                              <option value="">-- Select a standard statutory / voucher template --</option>
+                              {STANDARD_CERTIFICATE_TEMPLATES.map((tmpl, tIdx) => (
+                                <option key={tIdx} value={tmpl}>
+                                  {tmpl.length > 75 ? `${tmpl.slice(0, 75)}...` : tmpl}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
                         </div>
                       </div>
 

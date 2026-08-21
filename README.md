@@ -123,7 +123,7 @@ cp .env.example .env
 
 #### Terminal 1: FastAPI Server
 ```bash
-uvicorn api.main:app --reload --port 8000
+uvicorn api.main:app --reload --reload-dir api --host 0.0.0.0
 ```
 
 #### Terminal 2: Celery Worker
@@ -157,27 +157,42 @@ npm run dev
 | Model | What it Learns | Recommended Frequency |
 |---|---|---|
 | **LayoutLMv3** *(Entity Classifier)* | Learns specific field names, numbers, GSTINs, totals, and line item tokens from your reviewed field corrections. | **Regularly** (Every 5–15 reviewed invoices) |
-| **YOLOv8** *(Region Detector)* | Learns visual boundary rectangles for Header, Vendor block, Items table, Totals, and Bank details. | **Occasionally** (Every 30–50 invoices) |
+| **DocLayout-YOLO** *(Region Detector)* | Pretrained zero-shot on 80,000+ documents for high-precision table and block segmentation. Fine-tuning is optional. | **Optional** (Only when you have 100+ annotated samples) |
 
 ### 1. In-App Retraining (Recommended)
 1. Open the Review UI at [http://localhost:5173](http://localhost:5173).
 2. Click **Train Models** in the top navigation bar.
-3. Click **Fine-tune LayoutLMv3** or **Retrain YOLOv8**.
+3. Click **Fine-tune LayoutLMv3** or **Fine-tune DocLayout-YOLO**.
 
 ### 2. Command-Line Training
 
 #### Fine-Tune LayoutLMv3:
 ```bash
-# 1. Export reviewed invoices from database to LayoutLM BIO format
-python scripts/export_reviewed_to_layoutlm.py --output-dir data/processed/layoutlm_dataset
+# 1. Export reviewed ground-truth invoices from database to LayoutLM BIO format
+python scripts/export_reviewed_to_layoutlm.py --output-dir data/layoutlm_dataset
 
-# 2. Run fine-tuning
-python scripts/train_layoutlm.py --data-dir data/processed/layoutlm_dataset --epochs 10 --output-dir data/models/layoutlmv3-finetuned
+# 2. Run fine-tuning on verified ground truth
+python scripts/train_layoutlm.py --data-dir data/layoutlm_dataset --epochs 10 --output-dir data/models/layoutlmv3-finetuned
 ```
 
-#### Retrain YOLOv8:
+#### Fine-Tune DocLayout-YOLO (Optional):
 ```bash
 python scripts/train_yolo.py --data data/annotations/dataset.yaml --epochs 60 --output data/models/invoice_yolo.pt
+```
+
+#### Build Custom Ollama Model (`invoice-expert`):
+```bash
+# Registers specialized low-temperature Indian GST & handwriting expert in Ollama
+python scripts/build_ollama_model.py
+```
+
+#### LoRA Fine-Tuning on Verified Invoices (Method 4):
+```bash
+# 1. Export reviewed ground-truth to Alpaca instruction format
+python scripts/export_reviewed_to_llm.py --output-dir data/llm_dataset
+
+# 2. Run LoRA fine-tuning on base LLM
+python scripts/train_llm_lora.py --data-dir data/llm_dataset --epochs 3 --output-dir data/models/invoice_llm_lora
 ```
 
 ---
@@ -192,16 +207,16 @@ ai-invoice/
 │   ├── models.py                 # Pydantic schemas & response models
 │   └── dependencies.py           # Shared dependency injectors
 ├── preprocessing/                # OpenCV image processing & deskewing
-│   ├── pipeline.py               # Grayscale, binarization, noise reduction, deskew
+│   ├── pipeline.py               # CLAHE ink enhancement, binarization, noise reduction, deskew
 │   └── pdf_converter.py          # PyMuPDF rasterization & image conversion
-├── detection/                    # YOLOv8 macro region detector
-│   └── detector.py               # Header, vendor, buyer, items, totals bounding boxes
+├── detection/                    # Pretrained DocLayout-YOLO macro region detector
+│   └── detector.py               # Table, Header, Footer, Text layout bounding boxes
 ├── ocr/                          # Optical character recognition
 │   └── extractor.py              # PaddleOCR wrapper with EasyOCR fallback
 ├── understanding/                # Spatial entity extraction
 │   └── layoutlm.py               # LayoutLMv3 token classifier + Ensemble Merger
 ├── llm_fallback/                 # Local LLM batch entity extractor
-│   └── ollama_client.py          # Ollama JSON fallback for low-confidence fields
+│   └── ollama_client.py          # Dynamic Few-Shot In-Context learning & invoice-expert client
 ├── validation/                   # Pydantic rules engine & format canonicalizer
 │   └── validator.py              # GSTIN format, tax math, dates & item validation
 ├── worker/                       # Celery asynchronous task definitions
@@ -215,10 +230,12 @@ ai-invoice/
 │   ├── src/pages/InvoiceListPage.jsx # Invoices dashboard & upload manager
 │   └── src/index.css             # Tailored styling & design system
 ├── scripts/                      # Training & migration CLI utilities
+│   ├── build_ollama_model.py     # Custom Ollama Modelfile compiler
+│   ├── export_reviewed_to_llm.py # Ground-truth exporter for LLM fine-tuning
+│   ├── train_llm_lora.py         # LoRA / PEFT fine-tuning script
 │   ├── export_reviewed_to_layoutlm.py # Ground-truth exporter for BIO tagging
 │   ├── train_layoutlm.py         # LayoutLMv3 fine-tuning script
-│   ├── train_yolo.py             # YOLOv8 bounding box training script
-│   └── test_pipeline.py          # End-to-end extraction CLI tester
+│   └── train_yolo.py             # DocLayout-YOLO fine-tuning script
 ├── data/                         # Local models, annotations & datasets
 │   ├── models/                   # Active YOLO (.pt) & LayoutLM model weights
 │   └── raw/                      # Sample input documents

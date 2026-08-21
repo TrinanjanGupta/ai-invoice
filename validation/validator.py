@@ -27,7 +27,7 @@ from understanding.layoutlm import ExtractedInvoice, ExtractedField
 # -------------------------------------------------------------------
 
 class LineItem(BaseModel):
-    description: str
+    description: str = ""
     quantity: float = 1.0
     unit: Optional[str] = "NOS"
     rate: float = 0.0
@@ -41,6 +41,9 @@ class LineItem(BaseModel):
     sgst_amount: Optional[float] = 0.0
     igst_rate: Optional[float] = 0.0
     igst_amount: Optional[float] = 0.0
+
+    class Config:
+        extra = "allow"
 
 
 class InvoiceSchema(BaseModel):
@@ -75,6 +78,7 @@ class InvoiceSchema(BaseModel):
 
     # Line items
     line_items: list[LineItem] = Field(default_factory=list)
+    columns: list[dict] = Field(default_factory=list)
 
     # Totals & Tax
     subtotal: Optional[float] = None
@@ -83,6 +87,10 @@ class InvoiceSchema(BaseModel):
     igst: Optional[float] = None
     tax_amount: Optional[float] = None
     discount: Optional[float] = None
+    global_discount: Optional[float] = 0.0
+    global_cgst_rate: Optional[float] = 0.0
+    global_sgst_rate: Optional[float] = 0.0
+    global_igst_rate: Optional[float] = 0.0
     round_off: Optional[float] = 0.0
     grand_total: Optional[float] = None
     amount_in_words: Optional[str] = None
@@ -96,6 +104,7 @@ class InvoiceSchema(BaseModel):
     ifsc_code: Optional[str] = None
     payment_terms: Optional[str] = None
     remarks: Optional[str] = None
+    certified_remarks: list[str] = Field(default_factory=list)
 
     overall_confidence: float = 0.0
     needs_review: bool = False
@@ -114,6 +123,30 @@ class InvoiceSchema(BaseModel):
         b_lines = (self.buyer_address or "").strip().split("\n")
         b_addr1 = self.buyer_address_line1 or (b_lines[0] if b_lines else "")
         b_addr2 = self.buyer_address_line2 or ("\n".join(b_lines[1:]) if len(b_lines) > 1 else "")
+
+        items = []
+        for item in self.line_items:
+            item_dict = item.model_dump() if hasattr(item, "model_dump") else item.dict()
+            base_item = {
+                "description": item.description or "",
+                "hsnSac": item.hsn_code or "",
+                "quantity": item.quantity or 1,
+                "unit": item.unit or "NOS",
+                "rate": item.rate or 0,
+                "discount": item.discount or 0,
+                "taxableValue": item.taxable_value if item.taxable_value is not None else item.amount,
+                "cgstRate": item.cgst_rate or 0,
+                "cgstAmount": item.cgst_amount or 0,
+                "sgstRate": item.sgst_rate or 0,
+                "sgstAmount": item.sgst_amount or 0,
+                "igstRate": item.igst_rate or 0,
+                "igstAmount": item.igst_amount or 0,
+            }
+            # Include any custom dynamic column fields
+            for k, v in item_dict.items():
+                if k not in base_item and k not in ("amount", "hsn_code", "cgst_rate", "cgst_amount", "sgst_rate", "sgst_amount", "igst_rate", "igst_amount", "taxable_value"):
+                    base_item[k] = v
+            items.append(base_item)
 
         return {
             "company": {
@@ -135,41 +168,26 @@ class InvoiceSchema(BaseModel):
             },
             "meta": {
                 "invoiceNo": self.invoice_number or "",
+                "poNumber": self.po_number or "",
                 "category": self.category or "",
                 "subcategory": self.subcategory or "",
                 "date": self.invoice_date or "",
                 "placeOfSupply": self.place_of_supply or "",
                 "dueDate": self.due_date or "",
             },
-            "items": [
-                {
-                    "description": item.description or "",
-                    "hsnSac": item.hsn_code or "",
-                    "quantity": item.quantity or 1,
-                    "unit": item.unit or "NOS",
-                    "rate": item.rate or 0,
-                    "discount": item.discount or 0,
-                    "taxableValue": item.taxable_value if item.taxable_value is not None else item.amount,
-                    "cgstRate": item.cgst_rate or 0,
-                    "cgstAmount": item.cgst_amount or 0,
-                    "sgstRate": item.sgst_rate or 0,
-                    "sgstAmount": item.sgst_amount or 0,
-                    "igstRate": item.igst_rate or 0,
-                    "igstAmount": item.igst_amount or 0,
-                }
-                for item in self.line_items
-            ],
+            "columns": self.columns or [],
+            "items": items,
             "totals": {
                 "taxableAmount": self.subtotal or 0,
                 "totalDiscount": self.discount or 0,
-                "netTaxable": (self.subtotal or 0) - (self.discount or 0),
-                "globalDiscount": 0,
+                "netTaxable": (self.subtotal or 0) - (self.discount or 0) - (self.global_discount or 0),
+                "globalDiscount": self.global_discount or 0,
                 "totalCgst": self.cgst or 0,
                 "totalSgst": self.sgst or 0,
                 "totalIgst": self.igst or 0,
-                "globalCgstRate": 0,
-                "globalSgstRate": 0,
-                "globalIgstRate": 0,
+                "globalCgstRate": self.global_cgst_rate or 0,
+                "globalSgstRate": self.global_sgst_rate or 0,
+                "globalIgstRate": self.global_igst_rate or 0,
                 "roundOff": self.round_off or 0,
                 "grandTotal": self.grand_total or 0,
                 "amountInWords": self.amount_in_words or "",
@@ -181,9 +199,10 @@ class InvoiceSchema(BaseModel):
                 "accountName": self.account_name or self.vendor_name or "",
                 "accountNumber": self.account_number or "",
                 "confirmAccountNumber": self.account_number or "",
+                "paymentTerms": self.payment_terms or "",
             },
             "remarks": self.remarks or "",
-            "certifiedRemarks": [],
+            "certifiedRemarks": self.certified_remarks or [],
         }
 
     @classmethod
@@ -198,26 +217,33 @@ class InvoiceSchema(BaseModel):
         totals = data.get("totals") or {}
         bank = data.get("bankDetails") or {}
         raw_items = data.get("items") or []
+        columns = data.get("columns") or []
+        certified_remarks = data.get("certifiedRemarks") or data.get("certified_remarks") or []
 
         line_items = []
         for it in raw_items:
             if isinstance(it, dict):
-                line_items.append(LineItem(
-                    description=it.get("description") or "",
-                    hsn_code=it.get("hsnSac") or it.get("hsn_code"),
-                    quantity=float(it.get("quantity", 1) or 1),
-                    unit=str(it.get("unit") or "NOS"),
-                    rate=float(it.get("rate", 0) or 0),
-                    discount=float(it.get("discount", 0) or 0),
-                    taxable_value=float(it.get("taxableValue", it.get("taxable_value", 0)) or 0),
-                    amount=float(it.get("taxableValue", it.get("amount", 0)) or 0),
-                    cgst_rate=float(it.get("cgstRate", it.get("cgst_rate", 0)) or 0),
-                    cgst_amount=float(it.get("cgstAmount", it.get("cgst_amount", 0)) or 0),
-                    sgst_rate=float(it.get("sgstRate", it.get("sgst_rate", 0)) or 0),
-                    sgst_amount=float(it.get("sgstAmount", it.get("sgst_amount", 0)) or 0),
-                    igst_rate=float(it.get("igstRate", it.get("igst_rate", 0)) or 0),
-                    igst_amount=float(it.get("igstAmount", it.get("igst_amount", 0)) or 0),
-                ))
+                item_data = {
+                    "description": it.get("description") or "",
+                    "hsn_code": it.get("hsnSac") or it.get("hsn_code"),
+                    "quantity": float(it.get("quantity", 1) or 1),
+                    "unit": str(it.get("unit") or "NOS"),
+                    "rate": float(it.get("rate", 0) or 0),
+                    "discount": float(it.get("discount", 0) or 0),
+                    "taxable_value": float(it.get("taxableValue", it.get("taxable_value", 0)) or 0),
+                    "amount": float(it.get("taxableValue", it.get("amount", 0)) or 0),
+                    "cgst_rate": float(it.get("cgstRate", it.get("cgst_rate", 0)) or 0),
+                    "cgst_amount": float(it.get("cgstAmount", it.get("cgst_amount", 0)) or 0),
+                    "sgst_rate": float(it.get("sgstRate", it.get("sgst_rate", 0)) or 0),
+                    "sgst_amount": float(it.get("sgstAmount", it.get("sgst_amount", 0)) or 0),
+                    "igst_rate": float(it.get("igstRate", it.get("igst_rate", 0)) or 0),
+                    "igst_amount": float(it.get("igstAmount", it.get("igst_amount", 0)) or 0),
+                }
+                # Preserve any custom dynamic column fields
+                for k, v in it.items():
+                    if k not in item_data and k not in ("hsnSac", "cgstRate", "cgstAmount", "sgstRate", "sgstAmount", "igstRate", "igstAmount", "taxableValue"):
+                        item_data[k] = v
+                line_items.append(LineItem(**item_data))
 
         v_lines = [l for l in [company.get("addressLine1"), company.get("addressLine2")] if l]
         v_addr = "\n".join(v_lines) if v_lines else None
@@ -231,17 +257,22 @@ class InvoiceSchema(BaseModel):
         igst = float(totals.get("totalIgst", 0) or 0)
         tax_amount = cgst + sgst + igst
         discount = float(totals.get("totalDiscount", 0) or 0)
+        global_discount = float(totals.get("globalDiscount", 0) or 0)
+        global_cgst_rate = float(totals.get("globalCgstRate", 0) or 0)
+        global_sgst_rate = float(totals.get("globalSgstRate", 0) or 0)
+        global_igst_rate = float(totals.get("globalIgstRate", 0) or 0)
         round_off = float(totals.get("roundOff", 0) or 0)
         grand_total = float(totals.get("grandTotal", 0) or 0)
 
         return cls(
-            invoice_number=meta.get("invoiceNo"),
+            invoice_number=meta.get("invoiceNo") or meta.get("invoice_number"),
+            po_number=meta.get("poNumber") or meta.get("po_number"),
             category=meta.get("category"),
             subcategory=meta.get("subcategory"),
-            invoice_date=meta.get("date"),
-            place_of_supply=meta.get("placeOfSupply"),
-            due_date=meta.get("dueDate"),
-            vendor_name=company.get("name"),
+            invoice_date=meta.get("date") or meta.get("invoice_date"),
+            place_of_supply=meta.get("placeOfSupply") or meta.get("place_of_supply"),
+            due_date=meta.get("dueDate") or meta.get("due_date"),
+            vendor_name=company.get("name") or company.get("vendor_name"),
             vendor_address=v_addr,
             vendor_address_line1=company.get("addressLine1"),
             vendor_address_line2=company.get("addressLine2"),
@@ -249,29 +280,36 @@ class InvoiceSchema(BaseModel):
             vendor_phone=company.get("phone"),
             vendor_gstin=company.get("gstin"),
             vendor_pan=company.get("pan"),
-            buyer_name=client.get("name"),
+            buyer_name=client.get("name") or client.get("buyer_name"),
             buyer_address=b_addr,
             buyer_address_line1=client.get("addressLine1"),
             buyer_address_line2=client.get("addressLine2"),
             buyer_gstin=client.get("gstin"),
             buyer_phone=client.get("phone"),
-            sls_code=client.get("slsCode"),
+            sls_code=client.get("slsCode") or client.get("sls_code"),
             line_items=line_items,
+            columns=columns,
             subtotal=subtotal,
             cgst=cgst,
             sgst=sgst,
             igst=igst,
             tax_amount=tax_amount,
             discount=discount,
+            global_discount=global_discount,
+            global_cgst_rate=global_cgst_rate,
+            global_sgst_rate=global_sgst_rate,
+            global_igst_rate=global_igst_rate,
             round_off=round_off,
             grand_total=grand_total,
-            amount_in_words=totals.get("amountInWords"),
-            bank_name=bank.get("bankName"),
-            branch_name=bank.get("branchName"),
-            account_name=bank.get("accountName"),
-            account_number=bank.get("accountNumber"),
-            ifsc_code=bank.get("ifsc"),
+            amount_in_words=totals.get("amountInWords") or totals.get("amount_in_words"),
+            bank_name=bank.get("bankName") or bank.get("bank_name"),
+            branch_name=bank.get("branchName") or bank.get("branch_name"),
+            account_name=bank.get("accountName") or bank.get("account_name"),
+            account_number=bank.get("accountNumber") or bank.get("account_number"),
+            ifsc_code=bank.get("ifsc") or bank.get("ifsc_code"),
+            payment_terms=bank.get("paymentTerms") or data.get("paymentTerms") or data.get("payment_terms"),
             remarks=data.get("remarks"),
+            certified_remarks=certified_remarks,
         )
 
 
@@ -626,19 +664,24 @@ class InvoiceValidator:
                   else f"CGST({s.cgst})+SGST({s.sgst})={computed:.2f} ≠ tax={s.tax_amount:.2f}",
                   "error" if not ok else "info")
 
-        # 3. subtotal + tax - discount = grand_total
+        # 3. subtotal + tax - discount + round_off = grand_total
         if s.subtotal and s.grand_total and s.tax_amount is not None:
-            discount = s.discount or 0.0
-            computed_total = s.subtotal + s.tax_amount - discount
+            discount = (s.discount or 0.0) + (s.global_discount or 0.0)
+            round_off = s.round_off or 0.0
+            computed_total = s.subtotal + s.tax_amount - discount + round_off
             diff = abs(computed_total - s.grand_total)
             ok = diff <= max(s.grand_total * tol, 1.0)
             r.add("grand_total_math", ok,
                   f"Grand total math checks out ({computed_total:.2f} ≈ {s.grand_total:.2f})" if ok
-                  else f"Grand total mismatch: {s.subtotal}+{s.tax_amount}-{discount}={computed_total:.2f} ≠ {s.grand_total:.2f}",
+                  else f"Grand total mismatch: {s.subtotal}+{s.tax_amount}-{discount}+{round_off}={computed_total:.2f} ≠ {s.grand_total:.2f}",
                   "error" if not ok else "info")
 
     def _check_dates(self, s: InvoiceSchema, r: ValidationReport):
-        date_formats = ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"]
+        date_formats = [
+            "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y",
+            "%d-%b-%Y", "%d-%b-%y", "%d/%m/%y", "%d-%m-%y", "%d %b %y", "%d %B %y",
+            "%m/%d/%Y", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y"
+        ]
 
         def parse_date(d: str) -> Optional[datetime]:
             for fmt in date_formats:

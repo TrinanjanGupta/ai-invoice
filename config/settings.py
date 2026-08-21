@@ -17,9 +17,9 @@ class Settings(BaseSettings):
     minio_secure: bool = False
 
     ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "mistral"
+    ollama_model: str = "invoice-expert"
 
-    yolo_model_path: str = "data/models/invoice_yolo.pt"
+    yolo_model_path: str = "data/models/doclayout_yolo_v8s/weights/best.pt"
     layoutlm_model_path: str = "data/models/layoutlmv3-finetuned"
     layoutlm_base_model: str = "microsoft/layoutlmv3-base"
 

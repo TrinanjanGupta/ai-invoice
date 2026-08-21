@@ -309,7 +309,38 @@ export default function InvoiceListPage() {
     }
   }
 
+  const clearUnreviewedAndPending = async () => {
+    if (!window.confirm("Are you sure you want to clear all unreviewed, pending, and failed invoices from the list?\n\nVerified Ground Truth invoices will NOT be deleted.")) {
+      return
+    }
+    setTriggering(true)
+    try {
+      const { data } = await axios.post('/api/invoices/bulk-delete?clear_pending=true&clear_unreviewed=true&clear_failed=true')
+      toast.success(data.message || `Cleared ${data.deleted_count} invoice(s) from queue!`)
+      fetchJobs({}, false)
+    } catch (e) {
+      toast.error('Bulk clear failed: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setTriggering(false)
+    }
+  }
+
+  const cancelProcessing = async () => {
+    setTriggering(true)
+    try {
+      const { data } = await axios.post('/api/invoices/cancel-processing')
+      toast.success(data.message || 'Stopped all invoice processing!')
+      setRescanningIds(new Set())
+      fetchJobs({}, false)
+    } catch (e) {
+      toast.error('Cancel failed: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setTriggering(false)
+    }
+  }
+
   const verifiedCount = jobs.filter(j => j.status === 'reviewed').length
+  const processingCount = jobs.filter(j => j.status === 'processing').length
   const failedCount = jobs.filter(j => j.status === 'failed').length
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize))
 
@@ -319,24 +350,30 @@ export default function InvoiceListPage() {
       {/* ── Top Header ─────────────────────────────────────────────────────── */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900 tracking-tight">All Invoices</h1>
-          <p className="text-slate-500 mt-0.5 text-xs md:text-sm flex items-center gap-2 flex-wrap">
-            <span className="font-semibold text-slate-700">{totalCount} total record{totalCount !== 1 ? 's' : ''}</span>
-            <span>&bull;</span>
-            <span className="text-slate-500">
-              Showing page {page} of {totalPages}
+          <h1 className="text-xl md:text-2xl font-black text-slate-900 dark:text-white tracking-tight flex items-center gap-2">
+            <span>Invoice Pipeline & Ground Truth Review</span>
+            <span className="text-xs font-mono font-normal px-2.5 py-0.5 rounded-full bg-blue-100 dark:bg-blue-950/80 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+              {totalCount} Total
             </span>
-            {activeSearch && (
-              <>
-                <span>&bull;</span>
-                <span className="font-medium text-blue-700 bg-blue-50 px-2 py-0.5 rounded-full border border-blue-200">
-                  Search: "{activeSearch}"
-                </span>
-              </>
-            )}
+          </h1>
+          <p className="text-xs md:text-sm text-slate-500 dark:text-slate-400 mt-1">
+            Review AI extractions, verify invoice details for ground-truth training, or trigger model fine-tuning.
           </p>
         </div>
         <div className="flex items-center gap-2">
+          {/* Stop / Cancel Processing Button */}
+          {(processingCount > 0 || rescanningIds.size > 0) && (
+            <button
+              onClick={cancelProcessing}
+              disabled={triggering}
+              className="btn-secondary text-xs bg-red-600 hover:bg-red-700 text-white border-red-700 shadow-sm flex items-center gap-1.5 font-bold animate-pulse"
+              title="Immediately cancel all ongoing invoice processing and re-scans"
+            >
+              <XCircle size={13} />
+              <span>Stop Processing ({processingCount || rescanningIds.size})</span>
+            </button>
+          )}
+
           {failedCount > 0 && (
             <button
               onClick={retryAllFailed}
@@ -377,6 +414,18 @@ export default function InvoiceListPage() {
                 <span>Re-scan Unreviewed</span>
               </>
             )}
+          </button>
+
+          <button
+            onClick={clearUnreviewedAndPending}
+            disabled={triggering}
+            className={`btn-secondary text-xs bg-rose-50 hover:bg-rose-100 text-rose-800 dark:bg-rose-950/40 dark:text-rose-300 border-rose-200 dark:border-rose-800 transition-all shadow-sm ${
+              triggering ? 'opacity-60 cursor-not-allowed' : ''
+            }`}
+            title="Clear unreviewed, pending, and failed invoices so you can start a clean batch"
+          >
+            <Trash2 size={13} className="text-rose-600 dark:text-rose-400" />
+            <span>Clear Unreviewed & Pending</span>
           </button>
 
           <button onClick={() => navigate('/')} className="btn-primary text-xs shadow-sm">

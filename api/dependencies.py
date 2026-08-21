@@ -5,7 +5,12 @@ from config.settings import get_settings
 
 
 def get_pipeline(request: Request):
-    return request.app.state.pipeline
+    pipeline = getattr(request.app.state, "pipeline", None)
+    if pipeline is None:
+        from api.pipeline_runner import InvoicePipeline
+        pipeline = InvoicePipeline(get_settings())
+        request.app.state.pipeline = pipeline
+    return pipeline
 
 
 def get_db(request: Request):

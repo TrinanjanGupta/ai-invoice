@@ -100,6 +100,18 @@ class DatabaseManager:
             await session.commit()
             return result.rowcount > 0
 
+    async def bulk_delete_jobs(self, statuses: list[str]) -> int:
+        from sqlalchemy import update
+        async with self.session_factory() as session:
+            stmt = (
+                update(InvoiceRecord)
+                .where(InvoiceRecord.status.in_(statuses))
+                .values(status="deleted")
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount or 0
+
     async def list_jobs(
         self,
         limit: int = 50,

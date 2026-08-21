@@ -48,6 +48,7 @@ class InvoicePreprocessor:
 
         img, orient_angle = self._auto_orient(img)
         img = self._normalise_dpi(img)
+        img = self._enhance_handwriting_contrast(img)
         img = self._denoise(img)
         img, angle = self._deskew(img)
         img, binarized = self._adaptive_binarize(img)
@@ -147,6 +148,23 @@ class InvoicePreprocessor:
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
             logger.debug(f"Upscaled {w}x{h} → {new_w}x{new_h}")
         return img
+
+    def _enhance_handwriting_contrast(self, img: np.ndarray) -> np.ndarray:
+        """
+        Enhances handwritten strokes (ballpoint pen, pencil, gel ink, stamps)
+        by applying CLAHE to the Luminance channel in LAB color space.
+        Preserves color fidelity for colored stamps and signatures while boosting ink stroke clarity.
+        """
+        try:
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            l_channel, a_channel, b_channel = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+            cl = clahe.apply(l_channel)
+            merged = cv2.merge((cl, a_channel, b_channel))
+            return cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+        except Exception as e:
+            logger.debug(f"Handwriting contrast enhancement fallback: {e}")
+            return img
 
     def _denoise(self, img: np.ndarray) -> np.ndarray:
         """Fast Non-Local Means denoising — handles scanner noise well."""

@@ -121,6 +121,7 @@ class ExtractedInvoice:
     ifsc_code: Optional[ExtractedField] = None
     payment_terms: Optional[ExtractedField] = None
     remarks: Optional[ExtractedField] = None
+    certified_remarks: list[str] = field(default_factory=list)
 
     # Meta
     overall_confidence: float = 0.0
@@ -236,8 +237,8 @@ class LayoutLMExtractor:
     IFSC_PATTERN = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b")
     DATE_PATTERNS = [
         re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b"),
-        re.compile(r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+(\d{4})\b", re.IGNORECASE),
-        re.compile(r"\b(\d{1,2})[-](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-](\d{4})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+(\d{2,4})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,2})[-](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-](\d{2,4})\b", re.IGNORECASE),
         re.compile(r"\b(\d{2})(\d{2})/(\d{4})\b"),  # e.g. 0307/2026 -> 03/07/2026
     ]
     AMOUNT_PATTERN = re.compile(r"(?:\u20b9|Rs\.?|INR|USD|\$)?\s*(\d[\d,]*\.\d{1,2}|\d{2,}[\d,]*)")
@@ -247,6 +248,101 @@ class LayoutLMExtractor:
         r"(?:invoice\s*(?:no|number|#)|inv\.?\s*(?:no\.?|#)|bill\s*no\.?\s*(?:&|and)?\s*bd\s*date|bill\s*(?:no|number|#)|reference\s*no|ref\s*no\.?|sanction\s*no|memo\s*no|voucher\s*no|token\s*no|challan\s*no)[\s:=]*([A-Z0-9/_-]{2,30})",
         re.IGNORECASE
     )
+
+    MONTH_MAP = {
+        "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+        "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12"
+    }
+
+    @staticmethod
+    def words_to_number(text: str) -> float:
+        """Converts Indian and international English amount in words to a float number."""
+        if not text:
+            return 0.0
+        cleaned = re.sub(r'[^a-zA-Z\s]', ' ', text.lower())
+        tokens = cleaned.split()
+
+        units = {
+            'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+            'eleven': 11, 'twelve': 12, 'thirteen': 13, 'fourteen': 14, 'fifteen': 15,
+            'sixteen': 16, 'seventeen': 17, 'eighteen': 18, 'nineteen': 19,
+            'twenty': 20, 'thirty': 30, 'forty': 40, 'fifty': 50,
+            'sixty': 60, 'seventy': 70, 'eighty': 80, 'ninety': 90
+        }
+        multipliers = {
+            'hundred': 100, 'thousand': 1000, 'lakh': 100000, 'lakhs': 100000,
+            'lac': 100000, 'lacs': 100000, 'crore': 10000000, 'crores': 10000000,
+            'million': 1000000, 'billion': 1000000000
+        }
+
+        total = 0
+        current_segment = 0
+
+        for token in tokens:
+            if token in ['rupees', 'rupee', 'only', 'inr', 'rs', 'and', 'paise', 'paisa']:
+                continue
+            if token in units:
+                current_segment += units[token]
+            elif token == 'hundred':
+                if current_segment == 0:
+                    current_segment = 1
+                current_segment *= 100
+            elif token in multipliers:
+                mult = multipliers[token]
+                if current_segment == 0:
+                    current_segment = 1
+                total += current_segment * mult
+                current_segment = 0
+
+        total += current_segment
+        return float(total)
+
+    @staticmethod
+    def normalize_gstin_candidate(cand: str) -> Optional[str]:
+        """Auto-repairs common OCR character confusions (O/0, I/1, S/5, Z/2) in 15-char GSTINs."""
+        if not cand:
+            return None
+        c = cand.strip().upper().replace(' ', '').replace('-', '').replace('/', '').replace(':', '')
+        if len(c) < 14 or len(c) > 16:
+            return None
+        if len(c) == 16 and c.startswith(('I', '1', '0')):
+            c = c[1:]
+        if len(c) == 14:
+            c = c[:13] + 'Z' + c[13:]
+        if len(c) != 15:
+            return None
+
+        chars = list(c)
+        d_map = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8'}
+        l_map = {'0': 'O', '1': 'I', '5': 'S', '8': 'B', '2': 'Z'}
+
+        # 0, 1 -> 2 digits state code
+        for i in [0, 1]:
+            if chars[i] in d_map:
+                chars[i] = d_map[chars[i]]
+        # 2..6 -> 5 letters (PAN)
+        for i in range(2, 7):
+            if chars[i] in l_map:
+                chars[i] = l_map[chars[i]]
+        # 7..10 -> 4 digits (PAN number)
+        for i in range(7, 11):
+            if chars[i] in d_map:
+                chars[i] = d_map[chars[i]]
+        # 11 -> 1 letter (PAN check)
+        if chars[11] in l_map:
+            chars[11] = l_map[chars[11]]
+        # 12 -> 1 digit / entity
+        if chars[12] in d_map:
+            chars[12] = d_map[chars[12]]
+        # 13 -> default Z
+        if chars[13] in ['2', 'S']:
+            chars[13] = 'Z'
+
+        res = ''.join(chars)
+        if re.match(r'^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z0-9]{1}[A-Z0-9]{1}[A-Z0-9]{1}$', res):
+            return res
+        return None
 
     def __init__(self, model_path: Optional[str] = None, base_model: str = "microsoft/layoutlmv3-base"):
         self.model_path = model_path
@@ -293,12 +389,16 @@ class LayoutLMExtractor:
         import torch
 
         all_words, all_boxes = [], []
-        for region_label, ocr_result in ocr_results.items():
+        # Prefer full_page OCR so token order is preserved and not duplicated by region crops
+        full_page_results = [v for k, v in ocr_results.items() if "full_page" in k]
+        target_ocr_list = full_page_results if full_page_results else list(ocr_results.values())
+
+        seen_spans = set()
+        for ocr_result in target_ocr_list:
             for block in ocr_result.text_blocks:
                 text_clean = block.text.strip()
                 if not text_clean:
                     continue
-                all_words.append(text_clean)
                 bbox = block.bbox
                 xs = [p[0] for p in bbox]
                 ys = [p[1] for p in bbox]
@@ -310,6 +410,11 @@ class LayoutLMExtractor:
                     max(0, min(1000, int(1000 * x2 / max(1, w)))),
                     max(0, min(1000, int(1000 * y2 / max(1, h)))),
                 ]
+                span_key = (text_clean, norm_bbox[0], norm_bbox[1], norm_bbox[2], norm_bbox[3])
+                if span_key in seen_spans:
+                    continue
+                seen_spans.add(span_key)
+                all_words.append(text_clean)
                 all_boxes.append(norm_bbox)
 
         if not all_words:
@@ -402,6 +507,12 @@ class LayoutLMExtractor:
             elif s_valid:
                 setattr(merged, fname, s_val)
 
+        # Certified remarks
+        if primary.certified_remarks and len(primary.certified_remarks) > 0:
+            merged.certified_remarks = primary.certified_remarks
+        else:
+            merged.certified_remarks = secondary.certified_remarks
+
         # Line items
         if primary.line_items and len(primary.line_items) > 0:
             merged.line_items = primary.line_items
@@ -455,25 +566,40 @@ class LayoutLMExtractor:
             "DUE_DATE": "due_date",
             "PO_NUMBER": "po_number",
             "PLACE_OF_SUPPLY": "place_of_supply",
+            "CATEGORY": "category",
+            "SUBCATEGORY": "subcategory",
             "VENDOR_NAME": "vendor_name",
             "BILLER_NAME": "vendor_name",
             "VENDOR_ADDRESS": "vendor_address",
             "BILLER_ADDRESS": "vendor_address",
             "VENDOR_GSTIN": "vendor_gstin",
+            "VENDOR_PAN": "vendor_pan",
+            "VENDOR_EMAIL": "vendor_email",
+            "VENDOR_PHONE": "vendor_phone",
             "GST": "vendor_gstin",
             "BUYER_NAME": "buyer_name",
             "BUYER_ADDRESS": "buyer_address",
             "BUYER_GSTIN": "buyer_gstin",
+            "BUYER_PHONE": "buyer_phone",
+            "SLS_CODE": "sls_code",
             "SUBTOTAL": "subtotal",
             "TAX_AMOUNT": "tax_amount",
             "CGST": "cgst",
             "SGST": "sgst",
             "IGST": "igst",
+            "DISCOUNT": "discount",
+            "ROUND_OFF": "round_off",
             "GRAND_TOTAL": "grand_total",
             "TOTAL": "grand_total",
+            "AMOUNT_IN_WORDS": "amount_in_words",
+            "CURRENCY": "currency",
             "BANK_NAME": "bank_name",
+            "BRANCH_NAME": "branch_name",
+            "ACCOUNT_NAME": "account_name",
             "ACCOUNT_NUMBER": "account_number",
             "IFSC_CODE": "ifsc_code",
+            "PAYMENT_TERMS": "payment_terms",
+            "REMARKS": "remarks",
         }
         for label_key, field_name in mapping.items():
             if label_key in fields:
@@ -488,8 +614,13 @@ class LayoutLMExtractor:
         Parses standard invoices, government bill details, HRMS annexures, vouchers, and challans.
         """
         inv = ExtractedInvoice()
-        region_texts = {k: v.full_text for k, v in ocr_results.items()}
-        all_text = " ".join(region_texts.values())
+        region_texts = {k: v.full_text for k, v in ocr_results.items() if "full_page" not in k}
+        full_page_texts = [v.full_text for k, v in sorted(ocr_results.items()) if "full_page" in k]
+        
+        if full_page_texts:
+            all_text = "\n".join(full_page_texts)
+        else:
+            all_text = "\n".join(v.full_text for v in ocr_results.values())
 
         # Clean noise characters
         clean_text = all_text.replace("\r", "\n")
@@ -511,6 +642,14 @@ class LayoutLMExtractor:
             if ref_match:
                 inv.invoice_number = ExtractedField(ref_match.group(1).strip(), 0.82, "heuristic")
 
+        # --- 1b. Purchase Order (PO) / Work Order Number ---
+        po_match = re.search(
+            r"(?:P\.?O\.?\s*(?:No\.?|Number|#)|Purchase\s*Order\s*(?:No\.?|#)?|Work\s*Order\s*(?:No\.?|#)?|WO\s*(?:No\.?|#))[\s:=]*([A-Z0-9/_-]{2,30})",
+            clean_text, re.IGNORECASE
+        )
+        if po_match:
+            inv.po_number = ExtractedField(po_match.group(1).strip(), 0.85, "heuristic")
+
         # --- 2. Invoice / Bill Date ---
         # Look for explicit date keywords first (BD Date, Invoice Date, Bill Date, Date:)
         date_explicit = re.search(
@@ -525,9 +664,14 @@ class LayoutLMExtractor:
             for pat in self.DATE_PATTERNS:
                 m = pat.search(search_scope)
                 if m:
-                    if len(m.groups()) == 3 and m.group(1).isdigit() and m.group(2).isdigit() and len(m.group(1)) == 2 and len(m.group(2)) == 2:
-                        formatted = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
-                        inv.invoice_date = ExtractedField(formatted, 0.85, "heuristic")
+                    g = m.groups()
+                    if len(g) == 3:
+                        d_str = str(g[0]).zfill(2)
+                        m_raw = str(g[1]).lower()
+                        m_str = self.MONTH_MAP.get(m_raw[:3], m_raw.zfill(2))
+                        y_raw = str(g[2])
+                        y_str = f"20{y_raw}" if len(y_raw) == 2 and int(y_raw) <= 50 else y_raw
+                        inv.invoice_date = ExtractedField(f"{d_str}/{m_str}/{y_str}", 0.88, "heuristic")
                     else:
                         inv.invoice_date = ExtractedField(m.group(0).strip(), 0.80, "heuristic")
                     break
@@ -623,6 +767,15 @@ class LayoutLMExtractor:
 
         # Vendor GSTIN, PAN, Email, Phone
         all_gstins = self.GSTIN_PATTERN.findall(clean_text)
+        if len(all_gstins) < 2:
+            # Fuzzy GSTIN search (detects OCR typos like O->0, I->1, GSTINIUIN prefix)
+            fuzzy_cands = re.findall(r"(?:GSTIN|GST|UIN|GSTN|INUIN)[:\sI/_-]*([A-Za-z0-9]{14,16})", clean_text, re.IGNORECASE)
+            fuzzy_cands += re.findall(r"\b([0-9A-Za-z]{15})\b", clean_text)
+            for cand in fuzzy_cands:
+                norm_g = self.normalize_gstin_candidate(cand)
+                if norm_g and norm_g not in all_gstins:
+                    all_gstins.append(norm_g)
+
         if all_gstins:
             inv.vendor_gstin = ExtractedField(all_gstins[0], 0.92, "heuristic")
             if len(all_gstins) > 1:
@@ -747,7 +900,13 @@ class LayoutLMExtractor:
         if words_match:
             words_val = words_match.group(1).split("\n")[0].strip()
             if len(words_val) > 5 and len(words_val) < 150:
-                inv.amount_in_words = ExtractedField(words_val, 0.80, "heuristic")
+                inv.amount_in_words = ExtractedField(words_val, 0.85, "heuristic")
+        elif not inv.amount_in_words:
+            words_match_global = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:=]*([A-Za-z\s/-]+(?:only)?)", clean_text, re.IGNORECASE)
+            if words_match_global:
+                words_val = words_match_global.group(1).split("\n")[0].strip()
+                if len(words_val) > 5 and len(words_val) < 150:
+                    inv.amount_in_words = ExtractedField(words_val, 0.85, "heuristic")
 
         # Tax
         tax_text = region_texts.get("tax_block", totals_text)
@@ -766,8 +925,50 @@ class LayoutLMExtractor:
         tax_amount = self._find_amount_near_keyword(
             tax_text, ["total tax", "tax total", "total gst", "gst total", "vat total"]
         )
+        def safe_float(v) -> float:
+            if v is None:
+                return 0.0
+            if isinstance(v, (int, float)):
+                return float(v)
+            try:
+                clean_v = str(v).replace(",", "").replace("₹", "").replace("Rs", "").strip()
+                return float(clean_v)
+            except (ValueError, TypeError):
+                return 0.0
+
         if tax_amount:
-            inv.tax_amount = ExtractedField(tax_amount, 0.70, "heuristic")
+            inv.tax_amount = ExtractedField(safe_float(tax_amount), 0.70, "heuristic")
+        elif inv.cgst or inv.sgst or inv.igst:
+            cgst_v = safe_float(inv.cgst.value if inv.cgst else 0.0)
+            sgst_v = safe_float(inv.sgst.value if inv.sgst else 0.0)
+            igst_v = safe_float(inv.igst.value if inv.igst else 0.0)
+            calc_tax = cgst_v + sgst_v + igst_v
+            if calc_tax > 0:
+                inv.tax_amount = ExtractedField(round(calc_tax, 2), 0.85, "heuristic_calculated")
+
+        # --- Math Auto-Reconciliation & Inversion Guard ---
+        total_tax_val = safe_float(inv.tax_amount.value if inv.tax_amount else 0.0)
+        subtotal_val = safe_float(inv.subtotal.value if inv.subtotal else 0.0)
+        grand_total_val = safe_float(inv.grand_total.value if inv.grand_total else 0.0)
+
+        if inv.amount_in_words:
+            num_from_words = self.words_to_number(inv.amount_in_words.value)
+            if num_from_words > 0:
+                if not inv.grand_total or abs(grand_total_val - num_from_words) > 1.0:
+                    if subtotal_val > 0 and abs((subtotal_val + total_tax_val) - num_from_words) <= 2.0:
+                        inv.grand_total = ExtractedField(num_from_words, 0.95, "heuristic_reconciled")
+                    elif grand_total_val > 0 and grand_total_val < num_from_words:
+                        inv.subtotal = ExtractedField(grand_total_val, 0.90, "heuristic_reconciled")
+                        inv.grand_total = ExtractedField(num_from_words, 0.95, "heuristic_reconciled")
+                    elif not inv.grand_total:
+                        inv.grand_total = ExtractedField(num_from_words, 0.90, "heuristic_reconciled")
+
+        # Subtotal sanity: if subtotal > grand_total, reconstruct subtotal = grand_total - tax
+        subtotal_val = safe_float(inv.subtotal.value if inv.subtotal else 0.0)
+        grand_total_val = safe_float(inv.grand_total.value if inv.grand_total else 0.0)
+        if subtotal_val > 0 and grand_total_val > 0 and subtotal_val > grand_total_val:
+            if grand_total_val > total_tax_val and total_tax_val > 0:
+                inv.subtotal = ExtractedField(round(grand_total_val - total_tax_val, 2), 0.90, "heuristic_reconciled")
 
         # Currency
         if "₹" in clean_text or "INR" in clean_text or "Rs" in clean_text or "Rupees" in clean_text:
@@ -868,6 +1069,35 @@ class LayoutLMExtractor:
             micr_m = re.search(r"(?:MICR|MKCR)[\s:=]*(?:No\.?)?[\s:=]*(\d{9})", clean_text, re.I)
             if micr_m:
                 inv.branch_name = ExtractedField(f"MICR: {micr_m.group(1)}", 0.85, "heuristic")
+
+        # Payment Terms
+        pt_m = re.search(r"(?:Payment\s*Terms?|Terms\s*of\s*Payment)[\s:=]*([A-Za-z0-9\s,./-]{3,50})", clean_text, re.IGNORECASE)
+        if pt_m and not inv.payment_terms:
+            inv.payment_terms = ExtractedField(pt_m.group(1).strip(), 0.82, "heuristic")
+
+        # Remarks & Declarations
+        rem_m = re.search(r"(?:Remarks?|Notes?)[\s:=]*([^\n]{5,150})", clean_text, re.IGNORECASE)
+        if rem_m and not inv.remarks:
+            inv.remarks = ExtractedField(rem_m.group(1).strip(), 0.80, "heuristic")
+
+        # Dynamic Extraction of Certified Remarks / Declarations from Invoice
+        extracted_certs = []
+        for pattern in [
+            r"(?:Certified\s+that[^\n]{10,250})",
+            r"(?:Declaration[\s:=]+[^\n]{10,250})",
+            r"(?:We\s+(?:hereby\s+)?declare\s+that[^\n]{10,250})",
+            r"(?:It\s+is\s+certified\s+that[^\n]{10,250})",
+            r"(?:Subject\s+to\s+[A-Za-z\s]+\s+Jurisdiction[^\n]*)",
+            r"(?:Stock\s+Entry\s+No\.?[^\n]{5,120})",
+            r"(?:The\s+rates\s+charged\s+are\s+as\s+per[^\n]{10,150})",
+            r"(?:The\s+claim\s+has\s+not\s+been\s+paid[^\n]{10,150})",
+            r"(?:Goods\s+once\s+sold\s+will\s+not\s+be\s+taken\s+back[^\n]*)",
+        ]:
+            for m in re.finditer(pattern, clean_text, re.IGNORECASE):
+                c_text = re.sub(r"\s+", " ", m.group(0).strip())
+                if len(c_text) >= 15 and c_text not in extracted_certs:
+                    extracted_certs.append(c_text)
+        inv.certified_remarks = extracted_certs
 
         # --- 8. Line Items ---
         region_items = self._extract_line_items(region_texts.get("line_items", ""))
