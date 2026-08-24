@@ -1448,6 +1448,7 @@ class LayoutLMExtractor:
 
         # Deduplicate candidates across regions by (field_name, normalized_value)
         # Retains the best candidate with closer nearby label distance or higher confidence
+        import math
         deduped: dict[tuple[str, str], SpatialCandidate] = {}
         for cand in candidates:
             norm_val = str(cand.value).strip().upper().replace(" ", "")
@@ -1456,8 +1457,10 @@ class LayoutLMExtractor:
                 deduped[key] = cand
             else:
                 existing = deduped[key]
-                existing_score = existing.confidence + (1.0 / (1.0 + existing.distance_px) if existing.nearby_label else 0.0)
-                cand_score = cand.confidence + (1.0 / (1.0 + cand.distance_px) if cand.nearby_label else 0.0)
+                existing_prox = math.exp(-existing.distance_px / 60.0) if existing.nearby_label else 0.0
+                cand_prox = math.exp(-cand.distance_px / 60.0) if cand.nearby_label else 0.0
+                existing_score = existing.confidence * 0.6 + existing_prox * 0.4
+                cand_score = cand.confidence * 0.6 + cand_prox * 0.4
                 if cand_score > existing_score:
                     deduped[key] = cand
 

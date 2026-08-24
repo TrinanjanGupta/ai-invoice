@@ -197,7 +197,7 @@ class InvoicePipeline:
         self.preprocessor = InvoicePreprocessor()
         self.pdf_converter = PDFConverter()
         self.detector      = InvoiceDetector(model_path=settings.yolo_model_path)
-        self.ocr           = InvoiceOCR(lang="en", use_gpu=False)
+        self.ocr           = InvoiceOCR(languages=settings.ocr_languages, use_gpu=False)
         self.extractor     = LayoutLMExtractor(
             model_path=settings.layoutlm_model_path,
             base_model=settings.layoutlm_base_model,

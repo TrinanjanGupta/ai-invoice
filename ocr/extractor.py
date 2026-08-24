@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from loguru import logger
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any, Union
 
 
 import re
@@ -72,10 +72,17 @@ def _char_width_weight(char: str) -> float:
     return 1.0
 
 
-def decompose_line_into_words(text: str, bbox: list, confidence: float) -> list[OCRWord]:
+def decompose_line_into_words(
+    text: str,
+    bbox: list,
+    confidence: float,
+    line_image: Optional[np.ndarray] = None,
+) -> list[OCRWord]:
     """
-    Decomposes an OCR text line into individual word tokens with
-    weighted character metric spatial bounding boxes.
+    Decomposes an OCR text line into individual word tokens.
+    If line_image is provided, uses pixel-level vertical projection profiling
+    to find actual glyph ink boundaries and word whitespace valleys on real pixels.
+    Falls back to typographical metric projection if image is unavailable.
     """
     if not text or not text.strip():
         return []
@@ -90,7 +97,49 @@ def decompose_line_into_words(text: str, bbox: list, confidence: float) -> list[
         ys = [p[1] for p in bbox]
         x_min, y_min, x_max, y_max = min(xs), min(ys), max(xs), max(ys)
 
-    # Compute typographical cumulative weights across the line
+    words_in_text = [m.group() for m in re.finditer(r"\S+", text)]
+    if not words_in_text:
+        return []
+
+    # Attempt Pixel-Grounded Image Projection Profiling
+    if line_image is not None and line_image.size > 0 and len(words_in_text) > 1:
+        try:
+            import cv2
+            gray = cv2.cvtColor(line_image, cv2.COLOR_BGR2GRAY) if len(line_image.shape) == 3 else line_image
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            col_sums = np.sum(thresh, axis=0)
+
+            # Find active ink column segments separated by whitespace gaps
+            in_ink = False
+            seg_start = 0
+            segments = []
+            min_ink = max(1.0, np.max(col_sums) * 0.05) if col_sums.size > 0 else 1.0
+
+            for col_idx, val in enumerate(col_sums):
+                if val >= min_ink:
+                    if not in_ink:
+                        in_ink = True
+                        seg_start = col_idx
+                else:
+                    if in_ink:
+                        in_ink = False
+                        segments.append((seg_start, col_idx))
+            if in_ink:
+                segments.append((seg_start, len(col_sums) - 1))
+
+            # If segment count matches word count, use exact pixel segments
+            if len(segments) == len(words_in_text):
+                words: list[OCRWord] = []
+                for w_str, (s_px, e_px) in zip(words_in_text, segments):
+                    w_x1 = x_min + float(s_px)
+                    w_x2 = x_min + float(e_px)
+                    word_bbox = [[w_x1, y_min], [w_x2, y_min], [w_x2, y_max], [w_x1, y_max]]
+                    words.append(OCRWord(text=w_str, confidence=confidence, bbox=word_bbox))
+                return words
+        except Exception:
+            pass
+
+    # Typographical Cumulative Metric Projection
     weights = [_char_width_weight(c) for c in text]
     total_weight = sum(weights)
     if total_weight <= 0:
@@ -135,12 +184,20 @@ class OCRResult:
 class InvoiceOCR:
     """
     PaddleOCR wrapper optimised for invoice text extraction.
-    Supports multi-language (English + Hindi by default).
+    Supports multi-language (English + Hindi/Indic scripts configurable).
     Explicitly tracks and logs the active OCR engine.
     """
 
-    def __init__(self, lang: str = "en", use_gpu: bool = False):
-        self.lang = lang
+    def __init__(self, languages: Any = None, lang: Optional[str] = None, use_gpu: bool = False):
+        langs_input = languages or lang or "en,hi"
+        if isinstance(langs_input, str):
+            self.languages = [l.strip() for l in langs_input.split(",") if l.strip()]
+        elif isinstance(langs_input, (list, tuple)):
+            self.languages = list(langs_input)
+        else:
+            self.languages = ["en"]
+        
+        self.primary_lang = self.languages[0] if self.languages else "en"
         self.use_gpu = use_gpu
         self._ocr = None
         self._easyocr = None
@@ -151,18 +208,18 @@ class InvoiceOCR:
         try:
             from paddleocr import PaddleOCR
             try:
-                self._ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, use_gpu=self.use_gpu, enable_mkldnn=False)
+                self._ocr = PaddleOCR(use_angle_cls=True, lang=self.primary_lang, use_gpu=self.use_gpu, enable_mkldnn=False)
             except Exception:
-                self._ocr = PaddleOCR(lang=self.lang, enable_mkldnn=False)
+                self._ocr = PaddleOCR(lang=self.primary_lang, enable_mkldnn=False)
             self.engine_name = "PaddleOCR"
-            logger.info(f"[OCR] Initialised ENGINE: PaddleOCR (lang={self.lang}, gpu={self.use_gpu})")
+            logger.info(f"[OCR] Initialised ENGINE: PaddleOCR (lang={self.primary_lang}, gpu={self.use_gpu})")
         except (ImportError, Exception) as e:
             logger.warning(f"[OCR WARNING] PaddleOCR initialization failed ({e}). Engaging EasyOCR fallback...")
             try:
                 import easyocr
-                self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
+                self._easyocr = easyocr.Reader(self.languages, gpu=self.use_gpu, verbose=False)
                 self.engine_name = "EasyOCR"
-                logger.info(f"[OCR] Initialised ENGINE: EasyOCR fallback (lang={self.lang}, gpu={self.use_gpu})")
+                logger.info(f"[OCR] Initialised ENGINE: EasyOCR fallback (langs={self.languages}, gpu={self.use_gpu})")
             except ImportError:
                 logger.error("[OCR CRITICAL] Neither PaddleOCR nor EasyOCR is installed. Run: pip install easyocr")
                 raise ImportError("Neither PaddleOCR nor EasyOCR is installed.") from e
@@ -173,7 +230,7 @@ class InvoiceOCR:
     def extract_region(self, crop: np.ndarray, region_label: str) -> OCRResult:
         """
         Run OCR on a single region crop.
-        Returns structured OCRResult with per-word confidence.
+        Returns structured OCRResult with pixel-grounded per-word confidence.
         """
         if crop is None or crop.size == 0:
             return OCRResult(
@@ -200,7 +257,18 @@ class InvoiceOCR:
                                 text, conf = str(line[1]), 0.9
                             text = str(text).strip()
                             if text:
-                                words = decompose_line_into_words(text, bbox, float(conf))
+                                # Extract line crop slice for pixel-grounded projection
+                                line_slice = None
+                                try:
+                                    xs = [p[0] for p in bbox]
+                                    ys = [p[1] for p in bbox]
+                                    x1, y1, x2, y2 = int(max(0, min(xs))), int(max(0, min(ys))), int(min(crop.shape[1], max(xs))), int(min(crop.shape[0], max(ys)))
+                                    if x2 > x1 and y2 > y1:
+                                        line_slice = crop[y1:y2, x1:x2]
+                                except Exception:
+                                    pass
+
+                                words = decompose_line_into_words(text, bbox, float(conf), line_image=line_slice)
                                 text_blocks.append(TextBlock(
                                     text=text,
                                     confidence=float(conf),
@@ -217,7 +285,7 @@ class InvoiceOCR:
             if self._easyocr is None:
                 try:
                     import easyocr
-                    self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
+                    self._easyocr = easyocr.Reader(self.languages, gpu=self.use_gpu, verbose=False)
                     self.engine_name = "EasyOCR"
                 except Exception as ex:
                     logger.error(f"[OCR CRITICAL] EasyOCR init error: {ex}")
@@ -231,7 +299,18 @@ class InvoiceOCR:
                         bbox, text, conf = line
                         text = str(text).strip()
                         if text:
-                            words = decompose_line_into_words(text, bbox, float(conf))
+                            # Extract line slice
+                            line_slice = None
+                            try:
+                                xs = [p[0] for p in bbox]
+                                ys = [p[1] for p in bbox]
+                                x1, y1, x2, y2 = int(max(0, min(xs))), int(max(0, min(ys))), int(min(crop.shape[1], max(xs))), int(min(crop.shape[0], max(ys)))
+                                if x2 > x1 and y2 > y1:
+                                    line_slice = crop[y1:y2, x1:x2]
+                            except Exception:
+                                pass
+
+                            words = decompose_line_into_words(text, bbox, float(conf), line_image=line_slice)
                             text_blocks.append(TextBlock(
                                 text=text,
                                 confidence=float(conf),

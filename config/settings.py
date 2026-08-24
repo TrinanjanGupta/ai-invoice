@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     layoutlm_model_path: str = "data/models/layoutlmv3-finetuned"
     layoutlm_base_model: str = "microsoft/layoutlmv3-base"
 
+    ocr_languages: str = "en,hi,bn"
     confidence_threshold: float = 0.80
     llm_fallback_threshold: float = 0.60
     max_file_size_mb: int = 50

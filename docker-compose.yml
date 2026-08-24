@@ -69,6 +69,7 @@ services:
       MINIO_SECURE: "false"
       OLLAMA_BASE_URL: http://host.docker.internal:11434   # Ollama runs on host
       OLLAMA_MODEL: invoice-expert
+      OCR_LANGUAGES: "en,hi,bn"
       YOLO_MODEL_PATH: /app/data/models/doclayout_yolo_v8s/weights/best.pt
       LAYOUTLM_MODEL_PATH: /app/data/models/layoutlmv3-finetuned
     volumes:
@@ -96,6 +97,7 @@ services:
       MINIO_SECRET_KEY: minioadmin
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       OLLAMA_MODEL: invoice-expert
+      OCR_LANGUAGES: "en,hi,bn"
     volumes:
       - ./data:/app/data
     depends_on:

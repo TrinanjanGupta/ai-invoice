@@ -305,7 +305,8 @@ class OllamaClient:
         few_shot_sec = self._get_dynamic_few_shot_context()
 
         prompt = (
-            "You are an expert AI Invoice Digitization Engine specialized in Indian GST, multi-state commercial invoices, and handwriting normalization.\n"
+            "You are an expert AI Invoice Digitization Engine specialized in Indian GST, multi-state commercial invoices, and bilingual Indic script extraction.\n"
+            "Support bilingual documents with English headers and Indic scripts (Devanagari, Bengali, Tamil, Gujarati, Marathi, Kannada) or Romanized transliterations for company and customer names.\n"
             "From the targeted OCR context and spatial candidate evidence below, extract or verify the requested fields.\n"
             "Return your answer as a JSON object with field names as keys and extracted values as strings. If a field is not found, set its value to null.\n\n"
             f"Fields to extract:\n{fields_desc}\n\n"
@@ -369,7 +370,7 @@ class OllamaClient:
         """
         Scan all fields in an ExtractedInvoice.
         For any field below threshold, call Ollama with rich spatial candidate evidence.
-        Calculates calibrated dynamic confidence rather than static values.
+        Calculates calibrated dynamic confidence grounded in arithmetic reconciliation and GSTIN checksums.
         """
         if not self.is_available():
             logger.warning("Ollama not available — skipping LLM enhancement")
@@ -420,6 +421,8 @@ class OllamaClient:
 
         enhanced_count = 0
         gstin_pattern = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}$")
+        from validation.validator import verify_gstin_checksum
+
         for field_name, value in results.items():
             if field_name in missing_fields and value:
                 val_str = str(value).strip()
@@ -429,20 +432,19 @@ class OllamaClient:
 
                 # Calibrate dynamic confidence
                 base_conf = 0.55
-                if any(cand.value.lower() in val_str.lower() for cand in spatial_cands):
+                has_cand_match = any(cand.value.lower() in val_str.lower() for cand in spatial_cands)
+                if has_cand_match:
                     base_conf += 0.15
-                if "gstin" in field_name and gstin_pattern.match(val_str.upper()):
-                    base_conf += 0.10
+
+                if "gstin" in field_name:
+                    if verify_gstin_checksum(val_str):
+                        base_conf += 0.15
+                    else:
+                        base_conf = min(base_conf, 0.45)
                 elif "date" in field_name and re.match(r"^\d{2}/\d{2}/\d{4}$", val_str):
                     base_conf += 0.10
                 elif "ifsc" in field_name and re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", val_str.upper()):
                     base_conf += 0.10
-                elif any(k in field_name for k in ["total", "subtotal", "amount", "cgst", "sgst", "igst"]):
-                    try:
-                        if float(val_str.replace(",", "")) > 0:
-                            base_conf += 0.10
-                    except ValueError:
-                        pass
 
                 calibrated_conf = round(min(0.85, base_conf), 2)
                 setattr(invoice, field_name, ExtractedField(
@@ -450,6 +452,19 @@ class OllamaClient:
                 ))
                 enhanced_count += 1
                 logger.debug(f"  LLM extracted {field_name} (conf={calibrated_conf}): {val_str[:60]}")
+
+        # Post-pass: Cross-field arithmetic consistency boost
+        try:
+            st = float(str(invoice.subtotal.value).replace(",", "")) if invoice.subtotal and invoice.subtotal.value else 0.0
+            tx = float(str(invoice.tax_amount.value).replace(",", "")) if invoice.tax_amount and invoice.tax_amount.value else 0.0
+            gt = float(str(invoice.grand_total.value).replace(",", "")) if invoice.grand_total and invoice.grand_total.value else 0.0
+            if gt > 0 and st > 0 and abs((st + tx) - gt) <= max(1.0, gt * 0.02):
+                if invoice.subtotal and invoice.subtotal.source == "llm":
+                    invoice.subtotal.confidence = min(0.85, round(invoice.subtotal.confidence + 0.10, 2))
+                if invoice.grand_total and invoice.grand_total.source == "llm":
+                    invoice.grand_total.confidence = min(0.85, round(invoice.grand_total.confidence + 0.10, 2))
+        except Exception:
+            pass
 
         if enhanced_count:
             logger.info(f"LLM enhanced {enhanced_count}/{len(missing_fields)} low-confidence fields")
