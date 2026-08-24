@@ -109,6 +109,9 @@ class InvoiceSchema(BaseModel):
     overall_confidence: float = 0.0
     needs_review: bool = False
     review_reasons: list[str] = Field(default_factory=list)
+    field_confidences: dict[str, float] = Field(default_factory=dict)
+    fields_needing_review: list[str] = Field(default_factory=list)
+    auto_accepted_fields: list[str] = Field(default_factory=list)
 
     def to_invoice_builder_json(self) -> dict:
         """
@@ -466,12 +469,21 @@ class InvoiceValidator:
         self._check_dates(schema, report)
         self._check_amounts(schema, report)
 
-        schema.needs_review = report.needs_review
-        schema.review_reasons = report.errors + report.warnings
+        # Multi-evidence field-level confidence and arithmetic consistency evaluation
+        from validation.confidence_engine import FieldConfidenceEngine
+        conf_eval = FieldConfidenceEngine().evaluate(schema.model_dump(), ocr_avg_conf=0.90)
+
+        schema.field_confidences = conf_eval["field_confidences"]
+        schema.fields_needing_review = conf_eval["fields_needing_review"]
+        schema.auto_accepted_fields = conf_eval["auto_accepted_fields"]
+        schema.overall_confidence = conf_eval["overall_confidence"]
+        schema.needs_review = report.needs_review or conf_eval["needs_review"]
+        schema.review_reasons = list(dict.fromkeys(report.errors + report.warnings + conf_eval["review_reasons"]))
 
         logger.info(
             f"Validation: valid={report.is_valid}, "
-            f"errors={len(report.errors)}, warnings={len(report.warnings)}"
+            f"errors={len(report.errors)}, warnings={len(report.warnings)}, "
+            f"review_fields={len(schema.fields_needing_review)}, auto_accepted={len(schema.auto_accepted_fields)}"
         )
         return schema, report
 

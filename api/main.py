@@ -958,18 +958,33 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
         else:
             schema.review_reasons = schema.review_reasons or ["Partially reviewed draft"]
 
+        # Active learning: track human field corrections against initial AI output
+        from active_learning.correction_tracker import compute_field_corrections, classify_review_status
+        ai_data = record.ai_output_json or record.output_json or {}
+        human_data = schema.model_dump()
+        corrections_list = compute_field_corrections(ai_data, human_data)
+        review_status = classify_review_status(corrections_list, schema.needs_review, schema.overall_confidence)
+
         updated_rec = await db.update_job(
             job_id,
             output_json=schema.model_dump(),
+            field_confidences=schema.field_confidences,
+            corrections=corrections_list,
+            review_status=review_status,
             needs_review=not is_verified,
             review_reasons=schema.review_reasons,
             status=target_status,
         )
-        logger.info(f"[{job_id}] Saved to DB: status='{updated_rec.status}', needs_review={updated_rec.needs_review}")
+        logger.info(
+            f"[{job_id}] Saved to DB: status='{updated_rec.status}', review_status='{review_status}', "
+            f"corrections={len(corrections_list)}, needs_review={updated_rec.needs_review}"
+        )
         return {
             "status": target_status,
             "job_id": job_id,
             "is_verified": is_verified,
+            "review_status": review_status,
+            "corrections_recorded": len(corrections_list),
             "message": "Invoice marked as verified ground truth" if is_verified else "Invoice progress saved as partial draft"
         }
     except Exception as e:
@@ -1442,6 +1457,9 @@ async def _run_pipeline_task(
             job_id,
             status="done",
             output_json=result.invoice.model_dump(),
+            ai_output_json=result.invoice.model_dump(),
+            field_confidences=result.invoice.field_confidences,
+            review_status="auto_accepted" if not result.invoice.needs_review else "pending",
             output_pdf_key=pdf_key,
             storage_key=storage_key,
             overall_confidence=result.invoice.overall_confidence,
@@ -1468,11 +1486,132 @@ async def _run_pipeline_task(
             "progress_pct": 0,
             "stage_label": f"Failed: {str(e)}",
         })
-        await db.update_job(job_id, status="failed", error_message=str(e))
+    
+# ------------------------------------------------------------------
+# Active Learning & Intelligent Review Queue Endpoints
+# ------------------------------------------------------------------
+
+@app.get("/api/active-learning/queue", tags=["Active Learning"])
+async def get_active_learning_queue(limit: int = 50):
+    """
+    Returns pending invoices ranked by Active Learning Informativeness Score.
+    Reviewers are presented with the most informative/uncertain invoices first.
+    """
+    db: DatabaseManager = app.state.db
+    from sqlalchemy import select
+    from active_learning.sample_selector import prioritize_review_queue
+
+    async with db.session() as session:
+        stmt = (
+            select(InvoiceRecord)
+            .where(
+                InvoiceRecord.output_json.isnot(None),
+                InvoiceRecord.status.in_(["done", "partially_reviewed", "pending"]),
+                InvoiceRecord.needs_review == True,
+            )
+            .limit(limit * 2)
+        )
+        result = await session.execute(stmt)
+        records = result.scalars().all()
+
+    invoices_data = []
+    for r in records:
+        inv = r.output_json or {}
+        invoices_data.append({
+            "job_id": r.job_id,
+            "filename": r.filename,
+            "status": r.status,
+            "review_status": r.review_status,
+            "overall_confidence": r.overall_confidence or 0.0,
+            "field_confidences": r.field_confidences or inv.get("field_confidences", {}),
+            "fields_needing_review": inv.get("fields_needing_review", []),
+            "auto_accepted_fields": inv.get("auto_accepted_fields", []),
+            "review_reasons": r.review_reasons or inv.get("review_reasons", []),
+            "vendor_name": inv.get("vendor_name") or inv.get("company", {}).get("name"),
+            "grand_total": inv.get("grand_total") or inv.get("totals", {}).get("grandTotal"),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        })
+
+    ranked = prioritize_review_queue(invoices_data)[:limit]
+    return {
+        "total_in_queue": len(ranked),
+        "queue": ranked,
+    }
+
+
+@app.post("/api/active-learning/auto-accept", tags=["Active Learning"])
+async def auto_accept_high_confidence():
+    """
+    Batch auto-accepts all invoices with confidence >= 0.85 and 0 error flags.
+    Converts them directly into verified Ground Truth without manual button clicking.
+    """
+    db: DatabaseManager = app.state.db
+    from sqlalchemy import select, update
+
+    async with db.session() as session:
+        stmt = select(InvoiceRecord.job_id, InvoiceRecord.review_reasons, InvoiceRecord.output_json).where(
+            InvoiceRecord.output_json.isnot(None),
+            InvoiceRecord.status.in_(["done", "partially_reviewed", "pending"]),
+            InvoiceRecord.overall_confidence >= 0.85,
+        )
+        result = await session.execute(stmt)
+        rows = result.all()
+
+    eligible_job_ids = []
+    for job_id, review_reasons, output_json in rows:
+        inv = output_json or {}
+        reasons = review_reasons or inv.get("review_reasons", [])
+        if not reasons or all("error" not in str(err).lower() for err in reasons):
+            eligible_job_ids.append(job_id)
+
+    if eligible_job_ids:
+        async with db.session() as session:
+            stmt = (
+                update(InvoiceRecord)
+                .where(InvoiceRecord.job_id.in_(eligible_job_ids))
+                .values(
+                    status="reviewed",
+                    review_status="auto_accepted",
+                    needs_review=False,
+                    review_reasons=[],
+                )
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    return {
+        "auto_accepted_count": len(eligible_job_ids),
+        "message": f"Successfully auto-accepted {len(eligible_job_ids)} high-confidence invoices as verified ground truth.",
+    }
+
+
+@app.get("/api/active-learning/stats", tags=["Active Learning"])
+async def get_active_learning_stats():
+    """
+    Returns active learning dataset and human feedback loop metrics.
+    """
+    db: DatabaseManager = app.state.db
+    from sqlalchemy import select, func
+
+    async with db.session() as session:
+        total = (await session.execute(select(func.count(InvoiceRecord.id)))).scalar() or 0
+        verified = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.status == "reviewed"))).scalar() or 0
+        pending_review = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.needs_review == True))).scalar() or 0
+        corrected = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.review_status == "human_corrected"))).scalar() or 0
+        auto_accepted = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.review_status == "auto_accepted"))).scalar() or 0
+
+    return {
+        "total_invoices": total,
+        "verified_ground_truth": verified,
+        "pending_review": pending_review,
+        "human_corrected_samples": corrected,
+        "auto_accepted_samples": auto_accepted,
+    }
 
 
 # ------------------------------------------------------------------
 # Serve built React UI (production / LAN hosting)
+
 # Build first: cd review_ui && npm run build
 # ------------------------------------------------------------------
 

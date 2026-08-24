@@ -150,50 +150,96 @@ npm run dev
 
 ---
 
-## 🎯 Model Training & Fine-Tuning Guide
+## 🎯 Active Learning & Model Training Guide
 
-### When to Train Which Model?
+The system uses a **Human-in-the-Loop Active Learning Flywheel** designed to scale from 30 verified invoices to thousands with minimal human review effort.
 
-| Model | What it Learns | Recommended Frequency |
-|---|---|---|
-| **LayoutLMv3** *(Entity Classifier)* | Learns specific field names, numbers, GSTINs, totals, and line item tokens from your reviewed field corrections. | **Regularly** (Every 5–15 reviewed invoices) |
-| **DocLayout-YOLO** *(Region Detector)* | Pretrained zero-shot on 80,000+ documents for high-precision table and block segmentation. Fine-tuning is optional. | **Optional** (Only when you have 100+ annotated samples) |
-
-### 1. In-App Retraining (Recommended)
-1. Open the Review UI at [http://localhost:5173](http://localhost:5173).
-2. Click **Train Models** in the top navigation bar.
-3. Click **Fine-tune LayoutLMv3** or **Fine-tune DocLayout-YOLO**.
-
-### 2. Command-Line Training
-
-#### Fine-Tune LayoutLMv3:
-```bash
-# 1. Export reviewed ground-truth invoices from database to LayoutLM BIO format
-python scripts/export_reviewed_to_layoutlm.py --output-dir data/layoutlm_dataset
-
-# 2. Run fine-tuning on verified ground truth
-python scripts/train_layoutlm.py --data-dir data/layoutlm_dataset --epochs 10 --output-dir data/models/layoutlmv3-finetuned
+```text
+                 NEW INVOICE
+                      ↓
+                  Current AI
+                      ↓
+       Multi-Evidence Confidence Engine
+         (OCR + Checksums + Arithmetic)
+                ↙            ↘
+        HIGH CONFIDENCE     UNCERTAIN / MISMATCH
+             ↓                       ↓
+     AUTO ACCEPT (≥85%)    PRIORITIZED REVIEW QUEUE
+             ↓                       ↓
+             └───────┬───────────────┘
+                     ↓
+      Track Human Corrections (Diffs)
+                     ↓
+     Self-Contained Dataset Generation
+                     ↓
+         LayoutLMv3 Fine-Tuning
+                     ↓
+       Trained Model → Less Review Needed
 ```
 
-#### Fine-Tune DocLayout-YOLO (Optional):
-```bash
-python scripts/train_yolo.py --data data/annotations/dataset.yaml --epochs 60 --output data/models/invoice_yolo.pt
+---
+
+### ⚡ Step-by-Step Training Workflow
+
+| Step | Action | Command | Estimated Time |
+|---|---|---|---|
+| **1. Auto-Accept** | Batch approve high-confidence ($\ge 0.85$) invoices | `python scripts/auto_accept_high_confidence.py --min-confidence 0.85` | **~0.05 seconds** |
+| **2. Export Dataset** | Generate self-contained LayoutLM dataset + QA validation | `python scripts/export_reviewed_to_layoutlm.py --output-dir data/layoutlm_dataset --val-ratio 0.2` | **~1.5 minutes** (for 31 samples) |
+| **3. Visual Inspection** | Verify token bounding boxes on generated image samples | `python scripts/visualize_layoutlm_sample.py --sample data/layoutlm_dataset/train/<job_id>.json` | **~0.5 seconds** |
+| **4. Benchmark Baseline** | Measure pre-training extraction accuracy scorecard | `python scripts/benchmark_accuracy.py --limit 31` | **~1 minute** |
+| **5. Train LayoutLMv3** | Fine-tune spatial token classification transformer | `python scripts/train_layoutlm.py --data_dir data/layoutlm_dataset --epochs 10` | **~3 to 5 minutes** |
+
+---
+
+### Detailed Step Instructions
+
+#### Step 1: Batch Auto-Accept High-Confidence Invoices
+Eliminates manual review of standard invoices with valid math and high confidence:
+```powershell
+python scripts/auto_accept_high_confidence.py --min-confidence 0.85
 ```
 
-#### Build Custom Ollama Model (`invoice-expert`):
-```bash
-# Registers specialized low-temperature Indian GST & handwriting expert in Ollama
-python scripts/build_ollama_model.py
+#### Step 2: Export Ground Truth to LayoutLM Format
+Extracts pixel-grounded word coordinates, aligns them to verified semantic fields using the focused 24-field header/financial taxonomy, bundles images into `data/layoutlm_dataset/images/`, and runs automated QA validation:
+```powershell
+python scripts/export_reviewed_to_layoutlm.py --output-dir data/layoutlm_dataset --val-ratio 0.2
+```
+*Creates:*
+```text
+data/layoutlm_dataset/
+├── train/          # JSON files with words, boxes, BIO labels
+├── val/            # 20% validation split JSON files
+├── images/         # Bundled page PNG images (self-contained & portable)
+└── metadata.json   # Dataset metrics & alignment statistics
 ```
 
-#### LoRA Fine-Tuning on Verified Invoices (Method 4):
-```bash
-# 1. Export reviewed ground-truth to Alpaca instruction format
-python scripts/export_reviewed_to_llm.py --output-dir data/llm_dataset
-
-# 2. Run LoRA fine-tuning on base LLM
-python scripts/train_llm_lora.py --data-dir data/llm_dataset --epochs 3 --output-dir data/models/invoice_llm_lora
+#### Step 3: Visually Verify Token Labels (Optional)
+Renders colored bounding boxes for labeled tokens on top of the original invoice image:
+```powershell
+python scripts/visualize_layoutlm_sample.py --sample data/layoutlm_dataset/train/ceddc6c6-9705-4cb1-99bb-f05dc4d0d094.json
 ```
+*(Outputs annotated PNG to `output/debug_viz/`)*.
+
+#### Step 4: Establish Accuracy Benchmark
+Computes exact field-by-field precision, recall, and accuracy against ground truth:
+```powershell
+python scripts/benchmark_accuracy.py --limit 31
+```
+
+#### Step 5: Fine-Tune LayoutLMv3
+Trains the spatial transformer on the exported dataset:
+```powershell
+python scripts/train_layoutlm.py --data_dir data/layoutlm_dataset --epochs 10
+```
+
+---
+
+### Active Learning APIs
+
+The FastAPI backend exposes endpoints for active learning queue integration:
+- `GET /api/active-learning/queue?limit=50`: Returns pending invoices ranked by **Informativeness Score** (uncertainty + arithmetic errors + model divergence).
+- `POST /api/active-learning/auto-accept`: Batch auto-approves all invoices with $\ge 0.85$ confidence.
+- `GET /api/active-learning/stats`: Real-time tracking of auto-accepted, human-confirmed, and human-corrected dataset pools.
 
 ---
 

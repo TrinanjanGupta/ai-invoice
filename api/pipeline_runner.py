@@ -341,9 +341,11 @@ class InvoicePipeline:
             if next_p.line_items:
                 extracted.line_items.extend(next_p.line_items)
 
-        # Global heuristic pass over all accumulated text
+        # Global heuristic pass over authoritative full-page text (or combined if no full page)
         _notify("understanding", 4, 88, "AI Understanding: Synthesizing line items & taxes")
-        global_heuristic = self.extractor._extract_heuristic(combined_ocr_results)
+        full_page_ocrs = {k: v for k, v in combined_ocr_results.items() if "full_page" in k}
+        heuristic_input = full_page_ocrs if full_page_ocrs else combined_ocr_results
+        global_heuristic = self.extractor._extract_heuristic(heuristic_input)
         extracted = self.extractor._merge_invoices(extracted, global_heuristic)
 
         # ── Stage 4b: LLM fallback ───────────────────────────────────────────

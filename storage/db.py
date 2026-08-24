@@ -32,6 +32,11 @@ class InvoiceRecord(Base):
     status: Mapped[str] = mapped_column(String(50), default="pending")
     storage_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     output_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    ai_output_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    field_confidences: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    corrections: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    review_status: Mapped[str] = mapped_column(String(50), default="pending")
+    template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     output_pdf_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     overall_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -57,7 +62,20 @@ class DatabaseManager:
     async def init_db(self):
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
-        logger.info("Database tables initialised")
+            from sqlalchemy import text
+            columns_to_add = [
+                ("ai_output_json", "JSON"),
+                ("field_confidences", "JSON"),
+                ("corrections", "JSON"),
+                ("review_status", "VARCHAR(50) DEFAULT 'pending'"),
+                ("template_id", "VARCHAR(64)"),
+            ]
+            for col_name, col_type in columns_to_add:
+                try:
+                    await conn.execute(text(f"ALTER TABLE invoices ADD COLUMN IF NOT EXISTS {col_name} {col_type};"))
+                except Exception as ex:
+                    logger.debug(f"Migration notice for {col_name}: {ex}")
+        logger.info("Database tables initialised and migrated")
 
     async def create_job(self, job_id: str, filename: str) -> InvoiceRecord:
         async with self.session_factory() as session:
