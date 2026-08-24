@@ -53,7 +53,12 @@ export default function Layout() {
   }
 
   useEffect(() => {
-    axios.get('/health').then(r => setHealth(r.data)).catch(() => {})
+    const fetchHealth = () => {
+      axios.get('/health').then(r => setHealth(r.data)).catch(() => {})
+    }
+    fetchHealth()
+    const timer = setInterval(fetchHealth, 15000)
+    return () => clearInterval(timer)
   }, [])
 
   const allActive = health?.yolo_loaded && health?.layoutlm_loaded && health?.ollama_available

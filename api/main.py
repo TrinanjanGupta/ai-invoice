@@ -68,6 +68,8 @@ async def lifespan(app: FastAPI):
         except Exception as ex:
             logger.warning(f"Background pipeline warmup: {ex}")
 
+    asyncio.create_task(_warmup())
+
     # Start Autonomous Active Learning Background Worker (polls every 15 mins)
     try:
         from active_learning.auto_trainer import continuous_learning_worker
@@ -138,10 +140,10 @@ def _push_progress(job_id: str, payload: dict):
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
-async def health_check():
+async def health_check(request: Request):
     """Check API health and pipeline component status."""
     settings = get_settings()
-    pipeline = getattr(app.state, "pipeline", None)
+    pipeline = get_pipeline(request)
 
     ollama_ok = False
     if pipeline:
