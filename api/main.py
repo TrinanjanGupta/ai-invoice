@@ -978,7 +978,7 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
         elif is_verified:
             ground_truth_source = "human_confirmed"
         else:
-            ground_truth_source = "auto_accepted"
+            ground_truth_source = "partial"
 
         schema.ground_truth_source = ground_truth_source
 
