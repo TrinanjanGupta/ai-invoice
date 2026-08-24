@@ -20,6 +20,26 @@ class OCRWord:
     confidence: float
     bbox: list          # [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] or [x1, y1, x2, y2]
 
+    def to_xyxy(self) -> list[float]:
+        """Return [x1, y1, x2, y2] bounding box."""
+        if len(self.bbox) == 4 and isinstance(self.bbox[0], (int, float)):
+            return [float(self.bbox[0]), float(self.bbox[1]), float(self.bbox[2]), float(self.bbox[3])]
+        xs = [p[0] for p in self.bbox]
+        ys = [p[1] for p in self.bbox]
+        return [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
+
+    def to_poly(self) -> list[list[float]]:
+        """Return 4-point polygon [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]."""
+        if len(self.bbox) == 4 and isinstance(self.bbox[0], (int, float)):
+            x1, y1, x2, y2 = self.bbox
+            return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+        return self.bbox
+
+    def center(self) -> tuple[float, float]:
+        """Return (cx, cy) center coordinate."""
+        x1, y1, x2, y2 = self.to_xyxy()
+        return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
 
 @dataclass
 class TextBlock:
@@ -28,6 +48,15 @@ class TextBlock:
     bbox: list          # [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] (PaddleOCR format)
     region_label: str   # which invoice region this came from
     words: list[OCRWord] = field(default_factory=list)
+
+    def to_xyxy(self) -> list[float]:
+        if len(self.bbox) == 4 and isinstance(self.bbox[0], (int, float)):
+            return [float(self.bbox[0]), float(self.bbox[1]), float(self.bbox[2]), float(self.bbox[3])]
+        if not self.bbox:
+            return [0.0, 0.0, 0.0, 0.0]
+        xs = [p[0] for p in self.bbox]
+        ys = [p[1] for p in self.bbox]
+        return [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
 
 
 def decompose_line_into_words(text: str, bbox: list, confidence: float) -> list[OCRWord]:
@@ -76,12 +105,14 @@ class OCRResult:
     text_blocks: list[TextBlock]
     full_text: str      # concatenated text of the region with preserved newlines
     avg_confidence: float
+    engine: str = "paddleocr"  # "paddleocr" or "easyocr" or "native_pdf"
 
 
 class InvoiceOCR:
     """
     PaddleOCR wrapper optimised for invoice text extraction.
     Supports multi-language (English + Hindi by default).
+    Explicitly tracks and logs the active OCR engine.
     """
 
     def __init__(self, lang: str = "en", use_gpu: bool = False):
@@ -89,6 +120,7 @@ class InvoiceOCR:
         self.use_gpu = use_gpu
         self._ocr = None
         self._easyocr = None
+        self.engine_name = "unknown"
         self._init_ocr()
 
     def _init_ocr(self):
@@ -98,18 +130,20 @@ class InvoiceOCR:
                 self._ocr = PaddleOCR(use_angle_cls=True, lang=self.lang, use_gpu=self.use_gpu, enable_mkldnn=False)
             except Exception:
                 self._ocr = PaddleOCR(lang=self.lang, enable_mkldnn=False)
-            logger.info(f"PaddleOCR initialised (lang={self.lang}, gpu={self.use_gpu})")
+            self.engine_name = "PaddleOCR"
+            logger.info(f"[OCR] Initialised ENGINE: PaddleOCR (lang={self.lang}, gpu={self.use_gpu})")
         except (ImportError, Exception) as e:
-            logger.warning(f"PaddleOCR initialisation failed/not installed ({e}). Trying EasyOCR fallback...")
+            logger.warning(f"[OCR WARNING] PaddleOCR initialization failed ({e}). Engaging EasyOCR fallback...")
             try:
                 import easyocr
                 self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
-                logger.info(f"EasyOCR initialised (lang={self.lang}, gpu={self.use_gpu}) as fallback")
+                self.engine_name = "EasyOCR"
+                logger.info(f"[OCR] Initialised ENGINE: EasyOCR fallback (lang={self.lang}, gpu={self.use_gpu})")
             except ImportError:
-                logger.error("Neither PaddleOCR nor EasyOCR is installed. Run: pip install easyocr")
+                logger.error("[OCR CRITICAL] Neither PaddleOCR nor EasyOCR is installed. Run: pip install easyocr")
                 raise ImportError("Neither PaddleOCR nor EasyOCR is installed.") from e
             except Exception as ex:
-                logger.error(f"EasyOCR init failed: {ex}")
+                logger.error(f"[OCR CRITICAL] EasyOCR init failed: {ex}")
                 raise ex
 
     def extract_region(self, crop: np.ndarray, region_label: str) -> OCRResult:
@@ -151,16 +185,18 @@ class InvoiceOCR:
                                     words=words,
                                 ))
             except Exception as e:
-                logger.debug(f"PaddleOCR extraction fallback triggered: {e}")
+                logger.warning(f"[OCR WARNING] PaddleOCR runtime extraction error: {e}. Falling back to EasyOCR...")
                 self._ocr = None
+                self.engine_name = "EasyOCR"
 
         if not text_blocks:
             if self._easyocr is None:
                 try:
                     import easyocr
                     self._easyocr = easyocr.Reader([self.lang], gpu=self.use_gpu, verbose=False)
+                    self.engine_name = "EasyOCR"
                 except Exception as ex:
-                    logger.debug(f"EasyOCR init error: {ex}")
+                    logger.error(f"[OCR CRITICAL] EasyOCR init error: {ex}")
 
             if self._easyocr is not None:
                 try:
@@ -180,7 +216,7 @@ class InvoiceOCR:
                                 words=words,
                             ))
                 except Exception as e:
-                    logger.debug(f"EasyOCR extraction error: {e}")
+                    logger.error(f"[OCR CRITICAL] EasyOCR extraction error: {e}")
 
         full_text = "\n".join(b.text for b in text_blocks)
         avg_conf = (
@@ -193,6 +229,7 @@ class InvoiceOCR:
             text_blocks=text_blocks,
             full_text=full_text,
             avg_confidence=avg_conf,
+            engine=self.engine_name.lower(),
         )
 
     def extract_all_regions(

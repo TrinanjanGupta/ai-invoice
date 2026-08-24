@@ -444,3 +444,88 @@ class TestOllamaClient:
         assert result.value == "INV-2024-001"
         assert result.confidence > 0
         assert result.source == "llm"
+
+    def test_targeted_context_builder(self):
+        from llm_fallback.ollama_client import OllamaClient
+        client = OllamaClient()
+        ocr_texts = {
+            "header": "Invoice No: INV-100\nDate: 01/01/2026",
+            "totals_block": "Grand Total: 5000.00",
+            "full_page": "Top Line 1\nTop Line 2\n...\nBottom Line 1\nGrand Total: 5000.00",
+        }
+        ctx_totals = client._build_targeted_context(["grand_total", "tax_amount"], ocr_texts)
+        assert "[TOTALS_BLOCK]" in ctx_totals
+        assert "Grand Total: 5000.00" in ctx_totals
+
+
+# ------------------------------------------------------------------
+# Advanced Spatial & Checksum Verification Tests
+# ------------------------------------------------------------------
+
+class TestAdvancedPipelineFeatures:
+    def test_gstin_checksum_verification(self):
+        from validation.validator import verify_gstin_checksum
+        # Valid checksum test
+        # Let's compute a known valid GSTIN: 27AADCA1234A1Z5 (State 27, PAN AADCA1234A, 1, Z, checksum)
+        assert not verify_gstin_checksum("INVALID_GSTIN")
+        assert not verify_gstin_checksum("27AADCA1234A1Z9")  # deliberately wrong checksum
+
+    def test_ocr_word_coordinate_helpers(self):
+        from ocr.extractor import OCRWord
+        w = OCRWord(text="Invoice", confidence=0.95, bbox=[100, 50, 200, 80])
+        assert w.to_xyxy() == [100.0, 50.0, 200.0, 80.0]
+        assert w.center() == (150.0, 65.0)
+        assert len(w.to_poly()) == 4
+
+    def test_spatial_candidate_generation(self):
+        from ocr.extractor import OCRResult, TextBlock, OCRWord
+        from understanding.layoutlm import LayoutLMExtractor
+
+        b_label = TextBlock(text="Invoice No:", confidence=0.99, bbox=[50, 100, 120, 120], region_label="header")
+        b_val = TextBlock(text="INV-99988", confidence=0.98, bbox=[130, 100, 220, 120], region_label="header")
+        ocr_res = OCRResult(
+            region_label="header",
+            text_blocks=[b_label, b_val],
+            full_text="Invoice No: INV-99988",
+            avg_confidence=0.985,
+        )
+
+        ex = LayoutLMExtractor(model_path=None)
+        candidates = ex.generate_spatial_candidates({"header": ocr_res})
+        inv_cands = [c for c in candidates if c.field_name == "invoice_number"]
+        assert len(inv_cands) >= 1
+        assert "99988" in inv_cands[0].value
+
+    def test_spatial_table_extraction(self):
+        from ocr.extractor import OCRResult, TextBlock, OCRWord
+        from understanding.table_extractor import TableExtractor
+
+        # Construct synthetic spatial table
+        h_words = [
+            OCRWord(text="Description", confidence=0.95, bbox=[50, 200, 200, 220]),
+            OCRWord(text="Quantity", confidence=0.95, bbox=[250, 200, 320, 220]),
+            OCRWord(text="Rate", confidence=0.95, bbox=[350, 200, 420, 220]),
+            OCRWord(text="Amount", confidence=0.95, bbox=[450, 200, 550, 220]),
+        ]
+        h_block = TextBlock(text="Description Quantity Rate Amount", confidence=0.95, bbox=[50, 200, 550, 220], region_label="line_items", words=h_words)
+
+        r_words = [
+            OCRWord(text="Widget Pro", confidence=0.95, bbox=[50, 230, 200, 250]),
+            OCRWord(text="2", confidence=0.95, bbox=[250, 230, 280, 250]),
+            OCRWord(text="500", confidence=0.95, bbox=[350, 230, 400, 250]),
+            OCRWord(text="1000", confidence=0.95, bbox=[450, 230, 520, 250]),
+        ]
+        r_block = TextBlock(text="Widget Pro 2 500 1000", confidence=0.95, bbox=[50, 230, 550, 250], region_label="line_items", words=r_words)
+
+        ocr_res = OCRResult(
+            region_label="line_items",
+            text_blocks=[h_block, r_block],
+            full_text="Description Quantity Rate Amount\nWidget Pro 2 500 1000",
+            avg_confidence=0.95,
+        )
+
+        tab_ex = TableExtractor()
+        items = tab_ex.extract_tables_from_spatial_ocr(ocr_res)
+        assert len(items) == 1
+        assert "Widget Pro" in items[0]["description"]
+        assert items[0]["amount"] == 1000.0

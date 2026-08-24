@@ -143,14 +143,16 @@ def _native_page_to_ocr_results(
                 region_line_groups[region.label].append(line_words)
                 placed = True
                 break
-        if not placed and det_regions:
-            # Assign unplaced line to the nearest region by center distance
-            best_r = min(det_regions, key=lambda r: abs((r.bbox[1] + r.bbox[3]) / 2 - cy))
-            region_line_groups[best_r.label].append(line_words)
+        if not placed:
+            # Do not force unassigned lines into arbitrary regions by distance;
+            # they are preserved cleanly in the unified full_page OCRResult.
+            pass
 
     results = {}
     for region in det_regions:
         lines = region_line_groups[region.label]
+        if not lines:
+            continue
         blocks = [line_to_textblock(lw, region.label) for lw in lines]
         full_text = "\n".join(b.text for b in blocks)
         results[region.label] = OCRResult(
@@ -158,6 +160,7 @@ def _native_page_to_ocr_results(
             text_blocks=blocks,
             full_text=full_text,
             avg_confidence=0.99 if blocks else 0.0,
+            engine="native_pdf",
         )
 
     # Always provide unified full_page OCR result
@@ -167,6 +170,7 @@ def _native_page_to_ocr_results(
         text_blocks=all_blocks,
         full_text="\n".join(b.text for b in all_blocks),
         avg_confidence=0.99,
+        engine="native_pdf",
     )
     return results
 
@@ -204,7 +208,13 @@ class InvoicePipeline:
         self.validator = InvoiceValidator()
         self.renderer  = InvoiceRenderer()
 
-        logger.info("Pipeline initialised successfully")
+        logger.info("=" * 65)
+        logger.info("   INVOICE DIGITIZATION PIPELINE INITIALIZED")
+        logger.info(f"   OCR Engine:      {self.ocr.engine_name}")
+        logger.info(f"   Detector:        {'DocLayout-YOLO' if self.detector.is_doclaynet else ('Custom-YOLO' if self.detector.model else 'Heuristic')}")
+        logger.info(f"   LayoutLM Model:  {settings.layoutlm_model_path if Path(settings.layoutlm_model_path).exists() else 'Heuristic Fallback'}")
+        logger.info(f"   Ollama LLM:      {settings.ollama_model} ({settings.ollama_base_url})")
+        logger.info("=" * 65)
 
     def process(
         self,

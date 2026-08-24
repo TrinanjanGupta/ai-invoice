@@ -34,16 +34,16 @@ REGION_IDS = {v: k for k, v in REGION_LABELS.items()}
 # DocLayNet 11-class Schema
 DOCLAYNET_MAP = {
     "table": "line_items",
-    "title": "header",
+    "title": "title",
     "page-header": "header",
-    "page-footer": "totals_block",
-    "picture": "qr_barcode",
-    "section-header": "payment_terms",
+    "page-footer": "footer",
+    "picture": "figure",
+    "section-header": "section_header",
     "text": "text_block",
-    "caption": "header",
-    "footnote": "payment_terms",
-    "formula": "totals_block",
-    "list-item": "line_items",
+    "caption": "caption",
+    "footnote": "footnote",
+    "formula": "formula",
+    "list-item": "list_item",
 }
 
 

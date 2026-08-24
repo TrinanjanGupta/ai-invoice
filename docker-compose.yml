@@ -68,8 +68,8 @@ services:
       MINIO_BUCKET: invoices
       MINIO_SECURE: "false"
       OLLAMA_BASE_URL: http://host.docker.internal:11434   # Ollama runs on host
-      OLLAMA_MODEL: mistral
-      YOLO_MODEL_PATH: /app/data/models/invoice_yolo.pt
+      OLLAMA_MODEL: invoice-expert
+      YOLO_MODEL_PATH: /app/data/models/doclayout_yolo_v8s/weights/best.pt
       LAYOUTLM_MODEL_PATH: /app/data/models/layoutlmv3-finetuned
     volumes:
       - ./data:/app/data
@@ -95,6 +95,7 @@ services:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
       OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: invoice-expert
     volumes:
       - ./data:/app/data
     depends_on:

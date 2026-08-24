@@ -166,3 +166,103 @@ class TableExtractor:
             line_items.append(item)
 
         return line_items
+
+    def extract_tables_from_spatial_ocr(self, ocr_result) -> list[dict]:
+        """
+        Reconstructs table line items from scanned OCR text blocks & words using
+        spatial 2D bounding box column alignment.
+        """
+        if not ocr_result or not getattr(ocr_result, "text_blocks", None):
+            return []
+
+        blocks = ocr_result.text_blocks
+        if not blocks:
+            return []
+
+        # 1. Group blocks/lines by vertical Y-coordinate bands
+        sorted_blocks = sorted(blocks, key=lambda b: (b.to_xyxy()[1] if hasattr(b, "to_xyxy") else 0.0))
+
+        # Detect potential header row by keyword match
+        header_idx = -1
+        header_cols: dict[str, tuple[float, float]] = {}  # col_name -> (x_min, x_max)
+
+        for idx, block in enumerate(sorted_blocks):
+            line_words = block.words if getattr(block, "words", None) else []
+            line_text = block.text.lower()
+            matched_cols = {}
+            for col_name, kws in self.COLUMN_KEYWORDS.items():
+                for kw in kws:
+                    if kw in line_text:
+                        # Find word bounding box for this keyword if available
+                        col_box = block.to_xyxy() if hasattr(block, "to_xyxy") else [0, 0, 100, 20]
+                        for w in line_words:
+                            if kw in w.text.lower():
+                                col_box = w.to_xyxy() if hasattr(w, "to_xyxy") else col_box
+                                break
+                        matched_cols[col_name] = (col_box[0], col_box[2])
+                        break
+            if len(matched_cols) >= 2 and ("description" in matched_cols or "amount" in matched_cols):
+                header_idx = idx
+                header_cols = matched_cols
+                break
+
+        if header_idx == -1 or not header_cols:
+            return []
+
+        # Establish column X boundaries
+        items = []
+        for block in sorted_blocks[header_idx + 1:]:
+            line_text = block.text.strip()
+            if not line_text:
+                continue
+
+            # Skip summary / total lines
+            if any(term in line_text.lower() for term in ["grand total", "subtotal", "total amount", "tax amount"]):
+                break
+
+            words = block.words if getattr(block, "words", None) else []
+            if not words:
+                continue
+
+            row_data: dict[str, list[str]] = {k: [] for k in self.COLUMN_KEYWORDS}
+            unmatched_words = []
+
+            for w in words:
+                w_box = w.to_xyxy() if hasattr(w, "to_xyxy") else [0, 0, 0, 0]
+                w_cx = (w_box[0] + w_box[2]) / 2.0
+                assigned = False
+                for col_name, (c_x1, c_x2) in header_cols.items():
+                    # Tolerant column width matching
+                    tol = max(20.0, (c_x2 - c_x1) * 0.5)
+                    if (c_x1 - tol) <= w_cx <= (c_x2 + tol):
+                        row_data[col_name].append(w.text)
+                        assigned = True
+                        break
+                if not assigned:
+                    unmatched_words.append(w.text)
+
+            desc = " ".join(row_data["description"])
+            if not desc and unmatched_words:
+                desc = " ".join(unmatched_words)
+
+            if not desc or len(desc) < 2:
+                continue
+
+            amount = self._clean_number(" ".join(row_data["amount"]))
+            rate = self._clean_number(" ".join(row_data["rate"])) if row_data["rate"] else amount
+            qty = self._clean_number(" ".join(row_data["quantity"])) if row_data["quantity"] else 1.0
+            if qty <= 0:
+                qty = 1.0
+            if rate <= 0 and amount > 0:
+                rate = amount
+
+            items.append({
+                "description": desc,
+                "quantity": qty,
+                "unit": " ".join(row_data["unit"]) or "NOS",
+                "rate": rate if rate > 0 else amount,
+                "amount": amount if amount > 0 else (rate * qty),
+                "hsn_code": " ".join(row_data["hsn_code"]) or None,
+            })
+
+        return items

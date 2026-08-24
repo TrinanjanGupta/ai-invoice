@@ -261,6 +261,38 @@ class OllamaClient:
             logger.debug(f"Dynamic few-shot loading skipped: {e}")
         return ""
 
+    def _build_targeted_context(self, field_names: list, ocr_texts: dict) -> str:
+        """
+        Builds targeted, multi-page context tailored to the requested fields,
+        avoiding blind document truncation.
+        """
+        context_parts = []
+        full_page_text = ocr_texts.get("full_page", "")
+
+        # Always include specific regional crops if available
+        for region, text in ocr_texts.items():
+            if region != "full_page" and text.strip():
+                context_parts.append(f"[{region.upper()}]\n{text.strip()}")
+
+        # If regional crops are sparse or full_page is available, extract targeted slices
+        has_meta = any(f in field_names for f in ["invoice_number", "invoice_date", "due_date", "place_of_supply"])
+        has_parties = any(f in field_names for f in ["vendor_name", "vendor_gstin", "buyer_name", "buyer_gstin"])
+        has_totals = any(f in field_names for f in ["grand_total", "subtotal", "tax_amount", "cgst", "sgst", "igst", "round_off", "amount_in_words"])
+        has_bank = any(f in field_names for f in ["bank_name", "branch_name", "account_name", "account_number", "ifsc_code", "payment_terms"])
+
+        if full_page_text:
+            lines = [l.strip() for l in full_page_text.split("\n") if l.strip()]
+            if has_meta or has_parties:
+                # Top slice (Header / Parties)
+                top_slice = "\n".join(lines[:40])
+                context_parts.append(f"[DOCUMENT_HEADER_AND_PARTIES]\n{top_slice}")
+            if has_totals or has_bank:
+                # Bottom slice (Totals / Bank / Payment)
+                bot_slice = "\n".join(lines[-40:])
+                context_parts.append(f"[DOCUMENT_TOTALS_AND_PAYMENT]\n{bot_slice}")
+
+        return "\n\n".join(context_parts)
+
     def _extract_multiple_fields_batch(
         self,
         field_names: list,
@@ -268,39 +300,31 @@ class OllamaClient:
         candidate_hints: Optional[list[str]] = None,
     ) -> dict:
         """
-        Ask the LLM to extract ALL missing fields in a single prompt.
-        Returns a dict of {field_name: value_string}.
-        Uses dynamic few-shot learning, candidate evidence, and strict normalization rules.
+        Ask the LLM to extract or verify low-confidence fields using targeted context
+        and rich spatial candidate evidence.
         """
-        context = "\n".join(
-            f"[{region}]\n{text}"
-            for region, text in ocr_texts.items()
-            if text.strip()
-        )
-
-        fields_desc = "\n".join(
-            f"- {name}" for name in field_names
-        )
+        context = self._build_targeted_context(field_names, ocr_texts)
+        fields_desc = "\n".join(f"- {name}" for name in field_names)
 
         candidates_sec = ""
         if candidate_hints:
-            candidates_sec = "Candidate Evidence (from layout/spatial extraction):\n" + "\n".join(candidate_hints) + "\n\n"
+            candidates_sec = "SPATIAL CANDIDATE EVIDENCE (Geometric coordinates & OCR confidence):\n" + "\n".join(candidate_hints) + "\n\n"
 
         few_shot_sec = self._get_dynamic_few_shot_context()
 
         prompt = (
             "You are an expert AI Invoice Digitization Engine specialized in Indian GST, multi-state commercial invoices, and handwriting normalization.\n"
-            "From the OCR text and candidate evidence below, extract or verify the requested fields.\n"
+            "From the targeted OCR context and spatial candidate evidence below, extract or verify the requested fields.\n"
             "Return your answer as a JSON object with field names as keys and extracted values as strings. If a field is not found, set its value to null.\n\n"
             f"Fields to extract:\n{fields_desc}\n\n"
             f"{candidates_sec}"
             "Strict Normalization Rules:\n"
             "- Dates MUST be formatted as DD/MM/YYYY (convert 2-digit years like '22-Dec-25' -> '22/12/2025')\n"
             "- Numbers MUST be plain numeric (no currency symbols)\n"
-            "- GSTIN MUST be strictly 15 alphanumeric characters. Auto-correct OCR typos: 'O' -> '0' in numeric positions, 'I'/'l' -> '1', 'S' -> '5' (e.g. '19AFKPGO717KIZD' -> '19AFKPG0717K1ZD')\n"
+            "- GSTIN MUST be strictly 15 alphanumeric characters. Auto-correct obvious character confusions: 'O' <-> '0' in numeric positions, 'I'/'l' <-> '1', 'S' <-> '5'\n"
             "- Reconcile Math: Subtotal + CGST + SGST = Grand Total\n"
             f"{few_shot_sec}"
-            f"---\nINVOICE TEXT TO EXTRACT:\n{context[:4000]}\n---\n\n"
+            f"---\nTARGETED INVOICE CONTEXT:\n{context}\n---\n\n"
             "Return ONLY the JSON object, no other text."
         )
 
@@ -323,7 +347,6 @@ class OllamaClient:
             resp.raise_for_status()
             raw = resp.json().get("response", "").strip()
 
-            # Try to parse JSON — the model may wrap it in markdown fences
             if "```" in raw:
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
@@ -353,9 +376,8 @@ class OllamaClient:
     ):
         """
         Scan all fields in an ExtractedInvoice.
-        For any field below the threshold, call Ollama to improve it.
-        Uses a SINGLE batched prompt for all missing fields (much faster on CPU).
-        Modifies the invoice in-place.
+        For any field below threshold, call Ollama with rich spatial candidate evidence.
+        Calculates calibrated dynamic confidence rather than static values.
         """
         if not self.is_available():
             logger.warning("Ollama not available — skipping LLM enhancement")
@@ -371,16 +393,26 @@ class OllamaClient:
             "amount_in_words",
         ]
 
-        # Collect fields that need LLM help
         missing_fields = []
         candidate_hints = []
+        spatial_cands = getattr(invoice, "spatial_candidates", [])
+
         for field_name in fields_to_check:
             current = getattr(invoice, field_name, None)
             if current is None or current.confidence < confidence_threshold:
                 missing_fields.append(field_name)
-                if current and current.value:
+                # Find matching spatial candidate evidence if available
+                field_cands = [c for c in spatial_cands if c.field_name == field_name]
+                if field_cands:
+                    for fc in field_cands[:2]:
+                        candidate_hints.append(
+                            f"Field: {field_name} | Candidate: '{fc.value}' | Bbox: {fc.bbox} | "
+                            f"Nearby Label: '{fc.nearby_label}' | Label Bbox: {fc.label_bbox} | "
+                            f"Distance: {fc.distance_px:.0f}px | Conf: {fc.confidence:.2f} | Region: {fc.region}"
+                        )
+                elif current and current.value:
                     candidate_hints.append(
-                        f"- {field_name}: current candidate '{current.value}' (source: {current.source}, conf: {current.confidence:.2f})"
+                        f"Field: {field_name} | Candidate: '{current.value}' | Source: {current.source} | Conf: {current.confidence:.2f}"
                     )
 
         if not missing_fields:
@@ -392,7 +424,6 @@ class OllamaClient:
             f"{', '.join(missing_fields)}"
         )
 
-        # Single batched LLM call for all missing fields with candidate evidence
         results = self._extract_multiple_fields_batch(missing_fields, ocr_texts, candidate_hints=candidate_hints)
 
         enhanced_count = 0
@@ -403,12 +434,30 @@ class OllamaClient:
                 if "gstin" in field_name and not gstin_pattern.match(val_str.upper()):
                     logger.debug(f"  Discarding LLM non-compliant GSTIN for {field_name}: {val_str}")
                     continue
+
+                # Calibrate dynamic confidence
+                base_conf = 0.55
+                if any(cand.value.lower() in val_str.lower() for cand in spatial_cands):
+                    base_conf += 0.15
+                if "gstin" in field_name and gstin_pattern.match(val_str.upper()):
+                    base_conf += 0.10
+                elif "date" in field_name and re.match(r"^\d{2}/\d{2}/\d{4}$", val_str):
+                    base_conf += 0.10
+                elif "ifsc" in field_name and re.match(r"^[A-Z]{4}0[A-Z0-9]{6}$", val_str.upper()):
+                    base_conf += 0.10
+                elif any(k in field_name for k in ["total", "subtotal", "amount", "cgst", "sgst", "igst"]):
+                    try:
+                        if float(val_str.replace(",", "")) > 0:
+                            base_conf += 0.10
+                    except ValueError:
+                        pass
+
+                calibrated_conf = round(min(0.85, base_conf), 2)
                 setattr(invoice, field_name, ExtractedField(
-                    value=val_str, confidence=0.82, source="llm"
+                    value=val_str, confidence=calibrated_conf, source="llm"
                 ))
                 enhanced_count += 1
-                logger.debug(f"  LLM extracted {field_name}: {val_str[:60]}")
-
+                logger.debug(f"  LLM extracted {field_name} (conf={calibrated_conf}): {val_str[:60]}")
 
         if enhanced_count:
             logger.info(f"LLM enhanced {enhanced_count}/{len(missing_fields)} low-confidence fields")

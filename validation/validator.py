@@ -352,6 +352,45 @@ class ValidationReport:
 GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$")
 PAN_RE   = re.compile(r"^[A-Z]{5}\d{4}[A-Z]$")
 IFSC_RE  = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
+GST_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def verify_gstin_checksum(gstin: Optional[str]) -> bool:
+    """
+    Verifies 15-character Indian GSTIN checksum using Modulo 36 algorithm.
+    Structure:
+      - Positions 1-2: State code (01-37)
+      - Positions 3-12: PAN (5 letters + 4 digits + 1 letter)
+      - Position 13: Entity code (1-9, A-Z)
+      - Position 14: Default 'Z'
+      - Position 15: Check digit (0-9, A-Z)
+    """
+    if not gstin:
+        return False
+    clean = gstin.strip().upper().replace(" ", "")
+    if len(clean) != 15 or not GSTIN_RE.match(clean):
+        return False
+
+    try:
+        chars = list(clean)
+        total = 0
+        for i in range(14):
+            c = chars[i]
+            if c not in GST_CHARS:
+                return False
+            val = GST_CHARS.index(c)
+            multiplier = 1 if (i % 2 == 0) else 2
+            product = val * multiplier
+            quotient = product // 36
+            remainder = product % 36
+            total += quotient + remainder
+
+        rem = total % 36
+        check_idx = (36 - rem) % 36
+        expected_char = GST_CHARS[check_idx]
+        return chars[14] == expected_char
+    except Exception:
+        return False
 
 GST_STATE_CODES: dict[str, str] = {
     "01": "Jammu & Kashmir", "02": "Himachal Pradesh", "03": "Punjab", "04": "Chandigarh",
@@ -617,6 +656,11 @@ class InvoiceValidator:
             r.add("gstin_format", ok,
                   "Vendor GSTIN format valid" if ok else f"Invalid GSTIN format: {s.vendor_gstin}",
                   "error" if not ok else "info")
+            if ok:
+                chk_ok = verify_gstin_checksum(clean)
+                r.add("gstin_checksum", chk_ok,
+                      "Vendor GSTIN checksum valid" if chk_ok else f"Vendor GSTIN checksum mismatch: {s.vendor_gstin}",
+                      "warning" if not chk_ok else "info")
 
         if s.buyer_gstin:
             clean = s.buyer_gstin.replace(" ", "").upper()
@@ -624,6 +668,11 @@ class InvoiceValidator:
             r.add("buyer_gstin_format", ok,
                   "Buyer GSTIN format valid" if ok else f"Invalid buyer GSTIN: {s.buyer_gstin}",
                   "warning")
+            if ok:
+                chk_ok = verify_gstin_checksum(clean)
+                r.add("buyer_gstin_checksum", chk_ok,
+                      "Buyer GSTIN checksum valid" if chk_ok else f"Buyer GSTIN checksum mismatch: {s.buyer_gstin}",
+                      "warning" if not chk_ok else "info")
 
         if s.vendor_pan:
             ok = bool(PAN_RE.match(s.vendor_pan.upper()))

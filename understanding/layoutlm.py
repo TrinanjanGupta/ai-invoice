@@ -69,6 +69,18 @@ IFSC_BANK_MAP: dict[str, str] = {
 
 
 @dataclass
+class SpatialCandidate:
+    field_name: str
+    value: str
+    bbox: list          # [x1, y1, x2, y2]
+    nearby_label: Optional[str] = None
+    label_bbox: Optional[list] = None
+    distance_px: float = 0.0
+    confidence: float = 0.85
+    region: str = "full_page"
+
+
+@dataclass
 class ExtractedInvoice:
     # Header
     invoice_number: Optional[ExtractedField] = None
@@ -125,6 +137,9 @@ class ExtractedInvoice:
     payment_terms: Optional[ExtractedField] = None
     remarks: Optional[ExtractedField] = None
     certified_remarks: list[str] = field(default_factory=list)
+
+    # Spatial Candidates (label <-> value evidence for LLM / verification)
+    spatial_candidates: list[SpatialCandidate] = field(default_factory=list)
 
     # Meta
     overall_confidence: float = 0.0
@@ -424,47 +439,72 @@ class LayoutLMExtractor:
             return self._extract_heuristic(ocr_results)
 
         try:
-            encoding = self.processor(
-                image,
-                all_words,
-                boxes=all_boxes,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-            )
-
-            with torch.no_grad():
-                outputs = self.model(**encoding)
-
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=-1)
-            predictions = logits.argmax(-1).squeeze().tolist()
-            confidences = probs.max(-1).values.squeeze().tolist()
-
-            id2label = self.model.config.id2label
-            token_labels = [id2label.get(p, "O") for p in predictions] if isinstance(predictions, list) else [id2label.get(predictions, "O")]
-            token_confs = confidences if isinstance(confidences, list) else [confidences]
-
-            word_ids = encoding.word_ids(0) if hasattr(encoding, "word_ids") else None
+            import torch
+            max_chunk = 512
+            stride = 256
             word_labels = ["O"] * len(all_words)
             word_confs = [0.0] * len(all_words)
 
-            if word_ids:
-                for token_idx, word_idx in enumerate(word_ids):
-                    if word_idx is None or word_idx >= len(all_words):
-                        continue
-                    lbl = token_labels[token_idx] if token_idx < len(token_labels) else "O"
-                    cnf = float(token_confs[token_idx]) if token_idx < len(token_confs) else 0.0
-                    if lbl != "O":
-                        if word_labels[word_idx] == "O" or cnf > word_confs[word_idx]:
-                            word_labels[word_idx] = lbl
-                            word_confs[word_idx] = cnf
-                    elif word_labels[word_idx] == "O":
-                        word_confs[word_idx] = cnf
+            chunks = []
+            if len(all_words) <= max_chunk:
+                chunks.append((0, len(all_words)))
             else:
-                for i in range(min(len(all_words), len(token_labels))):
-                    word_labels[i] = token_labels[i]
-                    word_confs[i] = float(token_confs[i])
+                for start in range(0, len(all_words), stride):
+                    end = min(len(all_words), start + max_chunk)
+                    chunks.append((start, end))
+                    if end == len(all_words):
+                        break
+
+            for start_idx, end_idx in chunks:
+                chunk_words = all_words[start_idx:end_idx]
+                chunk_boxes = all_boxes[start_idx:end_idx]
+                try:
+                    encoding = self.processor(
+                        image,
+                        chunk_words,
+                        boxes=chunk_boxes,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=512,
+                    )
+
+                    with torch.no_grad():
+                        outputs = self.model(**encoding)
+
+                    logits = outputs.logits
+                    probs = torch.softmax(logits, dim=-1)
+                    predictions = logits.argmax(-1).squeeze().tolist()
+                    confidences = probs.max(-1).values.squeeze().tolist()
+
+                    id2label = self.model.config.id2label
+                    token_labels = [id2label.get(p, "O") for p in predictions] if isinstance(predictions, list) else [id2label.get(predictions, "O")]
+                    token_confs = confidences if isinstance(confidences, list) else [confidences]
+
+                    word_ids = encoding.word_ids(0) if hasattr(encoding, "word_ids") else None
+
+                    if word_ids:
+                        for token_idx, local_word_idx in enumerate(word_ids):
+                            if local_word_idx is None or local_word_idx >= len(chunk_words):
+                                continue
+                            global_idx = start_idx + local_word_idx
+                            lbl = token_labels[token_idx] if token_idx < len(token_labels) else "O"
+                            cnf = float(token_confs[token_idx]) if token_idx < len(token_confs) else 0.0
+                            if lbl != "O":
+                                if word_labels[global_idx] == "O" or cnf > word_confs[global_idx]:
+                                    word_labels[global_idx] = lbl
+                                    word_confs[global_idx] = cnf
+                            elif word_labels[global_idx] == "O":
+                                word_confs[global_idx] = max(word_confs[global_idx], cnf)
+                    else:
+                        for i in range(min(len(chunk_words), len(token_labels))):
+                            global_idx = start_idx + i
+                            lbl = token_labels[i]
+                            cnf = float(token_confs[i])
+                            if lbl != "O" and (word_labels[global_idx] == "O" or cnf > word_confs[global_idx]):
+                                word_labels[global_idx] = lbl
+                                word_confs[global_idx] = cnf
+                except Exception as chunk_err:
+                    logger.debug(f"LayoutLM chunk [{start_idx}:{end_idx}] error: {chunk_err}")
 
             fields = self._group_token_labels(all_words, word_labels, word_confs)
             layoutlm_inv = self._fields_to_invoice(fields, source="layoutlm")
@@ -474,7 +514,9 @@ class LayoutLMExtractor:
 
         # Fusion: Merge with comprehensive heuristic extraction
         heuristic_inv = self._extract_heuristic(ocr_results)
-        return self._merge_invoices(layoutlm_inv, heuristic_inv)
+        merged = self._merge_invoices(layoutlm_inv, heuristic_inv)
+        merged.spatial_candidates = self.generate_spatial_candidates(ocr_results)
+        return merged
 
     def _merge_invoices(self, primary: ExtractedInvoice, secondary: ExtractedInvoice) -> ExtractedInvoice:
         """
@@ -1110,6 +1152,9 @@ class LayoutLMExtractor:
             # Full-page line items fallback
             inv.line_items = self._extract_full_page_line_items(clean_text, inv)
 
+        # Generate spatial candidates (label <-> value pairs with coordinates)
+        inv.spatial_candidates = self.generate_spatial_candidates(ocr_results)
+
         # Calculate realistic overall confidence score
         inv.overall_confidence = calculate_realistic_confidence(inv)
         return inv
@@ -1228,3 +1273,177 @@ class LayoutLMExtractor:
                 pass
 
         return items
+
+    def generate_spatial_candidates(self, ocr_results: dict) -> list[SpatialCandidate]:
+        """
+        Extracts spatial candidates (invoice numbers, dates, GSTINs, totals, IFSC)
+        paired with their nearest spatial key labels and coordinates.
+        """
+        candidates: list[SpatialCandidate] = []
+        blocks = []
+        for region_label, ocr_res in ocr_results.items():
+            for b in ocr_res.text_blocks:
+                blocks.append((b, region_label))
+
+        def bbox_center(box):
+            if len(box) == 4 and isinstance(box[0], (int, float)):
+                return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
+            xs = [p[0] for p in box]
+            ys = [p[1] for p in box]
+            return (min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0
+
+        def calc_dist(b1, b2):
+            c1 = bbox_center(b1)
+            c2 = bbox_center(b2)
+            return ((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)**0.5
+
+        # 1. Invoice Number Candidates
+        label_blocks = [b for b, r in blocks if any(k in b.text.lower() for k in ["invoice no", "inv no", "bill no", "reference no", "invoice #", "bill #", "invoice"])]
+        for b, r in blocks:
+            val = None
+            m = self.INVOICE_NUM_PATTERN.search(b.text)
+            if m:
+                val = m.group(1).strip()
+            elif label_blocks and not any(k in b.text.lower() for k in ["invoice no", "inv no", "bill no", "date", "gstin", "total", "amount"]):
+                clean_t = b.text.strip()
+                if re.match(r"^[A-Z0-9/_-]{2,30}$", clean_t, re.IGNORECASE) and not clean_t.lower().startswith("gst"):
+                    val = clean_t
+
+            if val:
+                nearest_label = None
+                label_box = None
+                min_d = 9999.0
+                for lb in label_blocks:
+                    if lb.bbox and b.bbox and lb is not b:
+                        d = calc_dist(b.bbox, lb.bbox)
+                        if d < min_d:
+                            min_d = d
+                            nearest_label = lb.text.strip()
+                            label_box = lb.to_xyxy()
+                candidates.append(SpatialCandidate(
+                    field_name="invoice_number",
+                    value=val,
+                    bbox=b.to_xyxy(),
+                    nearby_label=nearest_label,
+                    label_bbox=label_box,
+                    distance_px=min_d if min_d < 9999 else 0.0,
+                    confidence=b.confidence,
+                    region=r,
+                ))
+
+        # 2. Date Candidates
+        date_label_blocks = [b for b, r in blocks if any(k in b.text.lower() for k in ["date", "inv date", "bill date", "dated"])]
+        for b, r in blocks:
+            for pat in self.DATE_PATTERNS:
+                m = pat.search(b.text)
+                if m:
+                    val = m.group(0).strip()
+                    min_d = 9999.0
+                    nearest_label = None
+                    label_box = None
+                    for lb in date_label_blocks:
+                        if lb.bbox and b.bbox:
+                            d = calc_dist(b.bbox, lb.bbox)
+                            if d < min_d:
+                                min_d = d
+                                nearest_label = lb.text.strip()
+                                label_box = lb.to_xyxy()
+                    candidates.append(SpatialCandidate(
+                        field_name="invoice_date",
+                        value=val,
+                        bbox=b.to_xyxy(),
+                        nearby_label=nearest_label,
+                        label_bbox=label_box,
+                        distance_px=min_d if min_d < 9999 else 0.0,
+                        confidence=b.confidence,
+                        region=r,
+                    ))
+                    break
+
+        # 3. GSTIN Candidates
+        gst_label_blocks = [b for b, r in blocks if any(k in b.text.lower() for k in ["gstin", "gst no", "gstin/uin"])]
+        for b, r in blocks:
+            m = self.GSTIN_PATTERN.search(b.text)
+            if m:
+                val = m.group(0).strip()
+                min_d = 9999.0
+                nearest_label = None
+                label_box = None
+                for lb in gst_label_blocks:
+                    if lb.bbox and b.bbox:
+                        d = calc_dist(b.bbox, lb.bbox)
+                        if d < min_d:
+                            min_d = d
+                            nearest_label = lb.text.strip()
+                            label_box = lb.to_xyxy()
+                candidates.append(SpatialCandidate(
+                    field_name="vendor_gstin",
+                    value=val,
+                    bbox=b.to_xyxy(),
+                    nearby_label=nearest_label,
+                    label_bbox=label_box,
+                    distance_px=min_d if min_d < 9999 else 0.0,
+                    confidence=b.confidence,
+                    region=r,
+                ))
+
+        # 4. Grand Total / Financial Candidates
+        total_label_blocks = [b for b, r in blocks if any(k in b.text.lower() for k in ["grand total", "total amount", "total", "net amount"])]
+        for b, r in blocks:
+            if any(kw in b.text.lower() for kw in ["total", "amount", "rs", "inr", "₹"]):
+                m = self.AMOUNT_PATTERN.search(b.text)
+                if m:
+                    val = m.group(1).strip().replace(",", "")
+                    try:
+                        if float(val) > 0:
+                            min_d = 9999.0
+                            nearest_label = None
+                            label_box = None
+                            for lb in total_label_blocks:
+                                if lb.bbox and b.bbox:
+                                    d = calc_dist(b.bbox, lb.bbox)
+                                    if d < min_d:
+                                        min_d = d
+                                        nearest_label = lb.text.strip()
+                                        label_box = lb.to_xyxy()
+                            candidates.append(SpatialCandidate(
+                                field_name="grand_total",
+                                value=val,
+                                bbox=b.to_xyxy(),
+                                nearby_label=nearest_label,
+                                label_bbox=label_box,
+                                distance_px=min_d if min_d < 9999 else 0.0,
+                                confidence=b.confidence,
+                                region=r,
+                            ))
+                    except ValueError:
+                        pass
+
+        # 5. Bank / IFSC Candidates
+        ifsc_label_blocks = [b for b, r in blocks if "ifsc" in b.text.lower()]
+        for b, r in blocks:
+            m = self.IFSC_PATTERN.search(b.text.upper())
+            if m:
+                val = m.group(0).strip()
+                min_d = 9999.0
+                nearest_label = None
+                label_box = None
+                for lb in ifsc_label_blocks:
+                    if lb.bbox and b.bbox:
+                        d = calc_dist(b.bbox, lb.bbox)
+                        if d < min_d:
+                            min_d = d
+                            nearest_label = lb.text.strip()
+                            label_box = lb.to_xyxy()
+                candidates.append(SpatialCandidate(
+                    field_name="ifsc_code",
+                    value=val,
+                    bbox=b.to_xyxy(),
+                    nearby_label=nearest_label,
+                    label_bbox=label_box,
+                    distance_px=min_d if min_d < 9999 else 0.0,
+                    confidence=b.confidence,
+                    region=r,
+                ))
+
+        return candidates
