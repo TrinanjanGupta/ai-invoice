@@ -112,6 +112,10 @@ class InvoiceSchema(BaseModel):
     field_confidences: dict[str, float] = Field(default_factory=dict)
     fields_needing_review: list[str] = Field(default_factory=list)
     auto_accepted_fields: list[str] = Field(default_factory=list)
+    template_id: Optional[str] = None
+    disagreement_score: Optional[float] = 0.0
+    is_novel_template: bool = False
+    ground_truth_source: str = "auto_accepted"
 
     def to_invoice_builder_json(self) -> dict:
         """

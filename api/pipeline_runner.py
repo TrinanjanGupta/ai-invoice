@@ -361,7 +361,42 @@ class InvoicePipeline:
         _notify("validation", 6, 95, "Validation: Rules engine & arithmetic reconciliation")
         logger.info(f"[{job_id}] Stage 4c: Validation")
         invoice_schema, validation_report = self.validator.validate(extracted)
-        invoice_schema.overall_confidence = extracted.overall_confidence
+
+        # ── Template Fingerprinting & Disagreement Analysis ────────────────
+        try:
+            from active_learning.template_fingerprint import compute_template_fingerprint, TemplateManager
+            from active_learning.disagreement_engine import evaluate_model_disagreement
+
+            all_region_dicts = []
+            if all_page_regions:
+                for r_obj in all_page_regions[0]:
+                    all_region_dicts.append({"label": getattr(r_obj, "label", "region"), "bbox": getattr(r_obj, "bbox", [0, 0, 0, 0])})
+
+            img_w, img_h = 1200, 1600
+            if pages:
+                img_w, img_h = pages[0].image.size
+
+            tpl_id = compute_template_fingerprint(
+                img_w, img_h, all_region_dicts, vendor_gstin=invoice_schema.vendor_gstin
+            )
+            tpl_info = TemplateManager().register_invoice(tpl_id, vendor_name=invoice_schema.vendor_name)
+
+            disagreement_res = evaluate_model_disagreement(
+                layoutlm_preds=extracted.model_dump() if hasattr(extracted, "model_dump") else {},
+                heuristic_preds=invoice_schema.model_dump(),
+            )
+
+            invoice_schema.template_id = tpl_id
+            invoice_schema.is_novel_template = tpl_info.get("is_novel", False)
+            invoice_schema.disagreement_score = disagreement_res.get("disagreement_score", 0.0)
+            if invoice_schema.is_novel_template:
+                invoice_schema.review_reasons.append(f"Novel layout template ({tpl_id})")
+            if disagreement_res.get("has_contradiction"):
+                invoice_schema.needs_review = True
+                for d in disagreement_res.get("disagreements", []):
+                    invoice_schema.review_reasons.append(d["reason"])
+        except Exception as tpl_ex:
+            logger.debug(f"Template/disagreement error: {tpl_ex}")
 
         # ── Stage 5: Render ──────────────────────────────────────────────────
         logger.info(f"[{job_id}] Stage 5: Rendering output")
@@ -386,7 +421,8 @@ class InvoicePipeline:
 
         logger.info(
             f"[{job_id}] Done — confidence={invoice_schema.overall_confidence:.2f}, "
-            f"needs_review={invoice_schema.needs_review}, model={model_used}"
+            f"needs_review={invoice_schema.needs_review}, template={invoice_schema.template_id}, "
+            f"disagreement={invoice_schema.disagreement_score}, model={model_used}"
         )
 
         return PipelineResult(

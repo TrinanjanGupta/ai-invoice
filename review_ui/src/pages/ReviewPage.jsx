@@ -1392,6 +1392,49 @@ export default function ReviewPage() {
         </div>
       )}
 
+      {/* ── Fast-Review Active Learning Focus Banner ────────────────────────── */}
+      {job && (
+        <div className="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 text-white px-4 md:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 border-b border-indigo-500/30 text-xs shadow-md">
+          <div className="flex items-center gap-2.5 flex-wrap">
+            <span className="px-2 py-0.5 rounded-md bg-indigo-500/20 text-indigo-300 border border-indigo-500/40 font-bold flex items-center gap-1">
+              <Sparkles size={12} /> Active Learning Review
+            </span>
+            {job.template_id && (
+              <span className="text-[11px] text-slate-300 bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700 font-mono">
+                Template: {job.template_id} {job.is_novel_template ? '🔥 (Novel Layout)' : '✓ (Known)'}
+              </span>
+            )}
+            {job.review_reasons && job.review_reasons.length > 0 ? (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-amber-400 font-semibold flex items-center gap-1">
+                  <AlertTriangle size={12} /> Needs Attention:
+                </span>
+                {job.review_reasons.slice(0, 3).map((r, idx) => (
+                  <span key={idx} className="bg-amber-500/20 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded text-[11px] font-medium">
+                    {r}
+                  </span>
+                ))}
+              </div>
+            ) : (
+              <span className="text-emerald-400 font-medium flex items-center gap-1">
+                <CheckCircle size={12} /> 100% High Confidence & Verified Math
+              </span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => save(true)}
+              disabled={saving}
+              className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-semibold rounded-lg shadow transition-all flex items-center gap-1.5 text-xs"
+              title="Accept high confidence fields and mark as verified ground truth"
+            >
+              <CheckCircle size={12} /> Fast Accept Ground Truth
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ── Retrain Modal ────────────────────────────────────────────────────── */}
       {showTrainModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">

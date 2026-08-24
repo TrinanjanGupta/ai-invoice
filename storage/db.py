@@ -36,7 +36,9 @@ class InvoiceRecord(Base):
     field_confidences: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     corrections: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     review_status: Mapped[str] = mapped_column(String(50), default="pending")
+    ground_truth_source: Mapped[str] = mapped_column(String(50), default="auto_accepted")
     template_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    disagreement_score: Mapped[Optional[float]] = mapped_column(Float, default=0.0)
     output_pdf_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     overall_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -68,7 +70,9 @@ class DatabaseManager:
                 ("field_confidences", "JSON"),
                 ("corrections", "JSON"),
                 ("review_status", "VARCHAR(50) DEFAULT 'pending'"),
+                ("ground_truth_source", "VARCHAR(50) DEFAULT 'auto_accepted'"),
                 ("template_id", "VARCHAR(64)"),
+                ("disagreement_score", "FLOAT DEFAULT 0.0"),
             ]
             for col_name, col_type in columns_to_add:
                 try:

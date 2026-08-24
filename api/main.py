@@ -965,12 +965,22 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
         corrections_list = compute_field_corrections(ai_data, human_data)
         review_status = classify_review_status(corrections_list, schema.needs_review, schema.overall_confidence)
 
+        if len(corrections_list) > 0 and is_verified:
+            ground_truth_source = "human_corrected"
+        elif is_verified:
+            ground_truth_source = "human_confirmed"
+        else:
+            ground_truth_source = "auto_accepted"
+
+        schema.ground_truth_source = ground_truth_source
+
         updated_rec = await db.update_job(
             job_id,
             output_json=schema.model_dump(),
             field_confidences=schema.field_confidences,
             corrections=corrections_list,
             review_status=review_status,
+            ground_truth_source=ground_truth_source,
             needs_review=not is_verified,
             review_reasons=schema.review_reasons,
             status=target_status,
@@ -1588,25 +1598,58 @@ async def auto_accept_high_confidence():
 @app.get("/api/active-learning/stats", tags=["Active Learning"])
 async def get_active_learning_stats():
     """
-    Returns active learning dataset and human feedback loop metrics.
+    Returns active learning dataset, ground truth tiers, and human feedback loop metrics.
     """
     db: DatabaseManager = app.state.db
     from sqlalchemy import select, func
+    from active_learning.auto_trainer import get_champion_metadata, check_retraining_trigger
 
     async with db.session() as session:
         total = (await session.execute(select(func.count(InvoiceRecord.id)))).scalar() or 0
         verified = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.status == "reviewed"))).scalar() or 0
         pending_review = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.needs_review == True))).scalar() or 0
-        corrected = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.review_status == "human_corrected"))).scalar() or 0
-        auto_accepted = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.review_status == "auto_accepted"))).scalar() or 0
+        gold_corrected = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.ground_truth_source == "human_corrected"))).scalar() or 0
+        silver_confirmed = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.ground_truth_source == "human_confirmed"))).scalar() or 0
+        bronze_auto = (await session.execute(select(func.count(InvoiceRecord.id)).where(InvoiceRecord.ground_truth_source == "auto_accepted"))).scalar() or 0
+
+    champion = get_champion_metadata()
+    trigger_status = await check_retraining_trigger()
 
     return {
         "total_invoices": total,
         "verified_ground_truth": verified,
         "pending_review": pending_review,
-        "human_corrected_samples": corrected,
-        "auto_accepted_samples": auto_accepted,
+        "tiers": {
+            "gold_human_corrected": gold_corrected,
+            "silver_human_confirmed": silver_confirmed,
+            "bronze_auto_accepted": bronze_auto,
+        },
+        "champion_model": champion,
+        "retraining_trigger": trigger_status,
     }
+
+
+@app.get("/api/active-learning/champion-status", tags=["Active Learning"])
+async def get_champion_status():
+    """
+    Returns current production champion model performance and holdout benchmark accuracy.
+    """
+    from active_learning.auto_trainer import get_champion_metadata
+    return get_champion_metadata()
+
+
+@app.post("/api/active-learning/auto-train", tags=["Active Learning"])
+async def trigger_champion_retraining(epochs: int = 10):
+    """
+    Triggers Champion/Challenger candidate training run and auto-promotion gate.
+    """
+    from active_learning.auto_trainer import run_champion_challenger_retraining
+    try:
+        res = await run_champion_challenger_retraining(epochs=epochs)
+        return res
+    except Exception as e:
+        logger.exception(f"Auto-training failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Training error: {e}")
 
 
 # ------------------------------------------------------------------

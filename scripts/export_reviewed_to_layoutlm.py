@@ -319,7 +319,7 @@ def validate_dataset(dataset_dir: Path) -> bool:
 async def export_layoutlm_dataset(
     output_dir: str = "data/layoutlm_dataset",
     val_ratio: float = 0.2,
-    only_verified: bool = True,
+    tier: str = "human_verified",
     max_samples: Optional[int] = None,
     include_line_items: bool = False,
 ):
@@ -346,16 +346,22 @@ async def export_layoutlm_dataset(
 
     async with db.session() as session:
         from sqlalchemy import select
-        if only_verified:
+        if tier == "gold":
+            stmt = select(InvoiceRecord).where(
+                InvoiceRecord.output_json.isnot(None),
+                InvoiceRecord.ground_truth_source == "human_corrected",
+            )
+            logger.info("Filtering for Gold Tier: Human-Corrected invoices only...")
+        elif tier == "human_verified":
             stmt = select(InvoiceRecord).where(
                 InvoiceRecord.output_json.isnot(None),
                 InvoiceRecord.status.in_(["reviewed", "partially_reviewed"]),
                 InvoiceRecord.needs_review == False,
             )
-            logger.info("Filtering for Verified Ground Truth invoices (status in ['reviewed', 'partially_reviewed'])...")
+            logger.info("Filtering for Verified Tier: Human-Corrected + Human-Confirmed ground truth...")
         else:
             stmt = select(InvoiceRecord).where(InvoiceRecord.output_json.isnot(None))
-            logger.info("Exporting all invoices with output_json (including unverified)...")
+            logger.info("Exporting all invoices (including auto-accepted predictions)...")
 
         result = await session.execute(stmt)
         jobs = result.scalars().all()
@@ -579,7 +585,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export reviewed invoices to LayoutLMv3 dataset")
     parser.add_argument("--output-dir", default="data/layoutlm_dataset", help="Output directory")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio")
-    parser.add_argument("--include-unverified", action="store_true", help="Include unverified predictions (default: False, only verified ground truth)")
+    parser.add_argument("--tier", choices=["gold", "human_verified", "all"], default="human_verified", help="Ground truth tier to export (default: human_verified)")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit number of samples to process")
     parser.add_argument("--include-line-items", action="store_true", help="Include fine-grained line item labels (default: False, header/financial focus)")
     args = parser.parse_args()
@@ -587,7 +593,7 @@ if __name__ == "__main__":
     asyncio.run(export_layoutlm_dataset(
         args.output_dir,
         args.val_ratio,
-        only_verified=not args.include_unverified,
+        tier=args.tier,
         max_samples=args.max_samples,
         include_line_items=args.include_line_items,
     ))

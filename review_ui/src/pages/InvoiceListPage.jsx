@@ -18,12 +18,12 @@ const STATUS_CONFIG = {
 }
 
 const FILTER_TABS = [
-  { id: 'non_pending',        label: 'Active & Done (Non-Pending)', icon: Sparkles },
-  { id: 'all',                label: 'All Invoices',               icon: FileText },
+  { id: 'active_learning_queue', label: '🔥 AI Learning Queue', icon: Sparkles, color: 'text-rose-600' },
+  { id: 'non_pending',        label: 'Active & Done',              icon: FileText },
   { id: 'reviewed',           label: 'Verified Ground Truth',      icon: CheckCircle, color: 'text-emerald-600' },
   { id: 'partially_reviewed', label: 'Partially Reviewed',         icon: Clock,       color: 'text-amber-600' },
   { id: 'done',               label: 'AI Extracted (Unreviewed)',  icon: FileText,    color: 'text-blue-600' },
-  { id: 'processing',         label: 'Processing',                 icon: RefreshCw,   color: 'text-purple-600' },
+  { id: 'all',                label: 'All Invoices',               icon: FileText },
   { id: 'failed',             label: 'Failed',                     icon: XCircle,     color: 'text-red-600' },
 ]
 
@@ -67,17 +67,20 @@ export default function InvoiceListPage() {
     try {
       const offset = (p - 1) * ps
       let url = `/api/invoices?limit=${ps}&offset=${offset}&status=${sf}`
-      if (s && s.trim()) {
+      if (sf === 'active_learning_queue') {
+        url = `/api/active-learning/queue?limit=${ps}`
+      } else if (s && s.trim()) {
         url += `&search=${encodeURIComponent(s.trim())}`
       }
 
       const { data } = await axios.get(url)
-      setJobs(data.jobs || [])
-      setTotalCount(data.total || 0)
+      const jobList = sf === 'active_learning_queue' ? (data.queue || []) : (data.jobs || [])
+      setJobs(jobList)
+      setTotalCount(sf === 'active_learning_queue' ? (data.total_in_queue || jobList.length) : (data.total || 0))
 
       setRescanningIds(prev => {
         const next = new Set(prev)
-        for (const job of (data.jobs || [])) {
+        for (const job of jobList) {
           if (job.status !== 'processing' && next.has(job.job_id)) {
             next.delete(job.job_id)
           }
@@ -199,6 +202,38 @@ export default function InvoiceListPage() {
     const size = parseInt(newSize, 10)
     setPageSize(size)
     setPage(1)
+  }
+
+  const autoAcceptHighConfidence = async () => {
+    setTriggering(true)
+    try {
+      const { data } = await axios.post('/api/active-learning/auto-accept')
+      toast.success(data.message || 'Auto-accepted high-confidence invoices!')
+      fetchJobs({}, true)
+    } catch (e) {
+      toast.error('Auto-accept error: ' + (e.response?.data?.detail || e.message))
+    } finally {
+      setTriggering(false)
+    }
+  }
+
+  const triggerChampionRetraining = async () => {
+    setTriggering(true)
+    try {
+      toast.loading('Champion/Challenger auto-retraining started...', { id: 'retrain' })
+      const { data } = await axios.post('/api/active-learning/auto-train?epochs=10')
+      if (data.status === 'PROMOTED') {
+        toast.success(`🏆 Candidate promoted! New accuracy: ${(data.champion_accuracy * 100).toFixed(1)}%`, { id: 'retrain' })
+      } else {
+        toast.error(`❌ Model rejected: Candidate accuracy was ${(data.candidate_accuracy * 100).toFixed(1)}%`, { id: 'retrain' })
+      }
+      fetchTrainingStatus()
+      fetchJobs({}, true)
+    } catch (e) {
+      toast.error('Retraining failed: ' + (e.response?.data?.detail || e.message), { id: 'retrain' })
+    } finally {
+      setTriggering(false)
+    }
   }
 
   const startTraining = async (modelType) => {
@@ -466,20 +501,20 @@ export default function InvoiceListPage() {
                 <button
                   type="button"
                   disabled={triggering}
-                  onClick={() => startTraining('yolo')}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-500 active:bg-blue-700 text-white transition-all shadow disabled:opacity-40"
-                  title="Retrain YOLOv8 on all reviewed ground-truth bounding boxes"
+                  onClick={autoAcceptHighConfidence}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white transition-all shadow disabled:opacity-40"
+                  title="Batch auto-accept all invoices with confidence >= 85% and valid arithmetic"
                 >
-                  <Play size={12} fill="currentColor" /> Retrain YOLO
+                  <CheckCircle size={12} /> ⚡ Auto-Accept (≥85%)
                 </button>
                 <button
                   type="button"
                   disabled={triggering}
-                  onClick={() => startTraining('layoutlm')}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-teal-600 hover:bg-teal-500 active:bg-teal-700 text-white transition-all shadow disabled:opacity-40"
-                  title="Export reviewed invoices and fine-tune LayoutLMv3"
+                  onClick={triggerChampionRetraining}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 text-white transition-all shadow disabled:opacity-40"
+                  title="Train candidate model on Gold corrections and auto-promote if holdout accuracy improves"
                 >
-                  <Sparkles size={12} /> Train LayoutLMv3
+                  <Sparkles size={12} /> 🏆 Champion Auto-Train
                 </button>
               </>
             )}
