@@ -322,6 +322,7 @@ async def export_layoutlm_dataset(
     tier: str = "human_verified",
     max_samples: Optional[int] = None,
     include_line_items: bool = False,
+    exclude_locked_test: bool = True,
 ):
     settings = get_settings()
     db = DatabaseManager(settings.database_url)
@@ -351,20 +352,44 @@ async def export_layoutlm_dataset(
                 InvoiceRecord.output_json.isnot(None),
                 InvoiceRecord.ground_truth_source == "human_corrected",
             )
-            logger.info("Filtering for Gold Tier: Human-Corrected invoices only...")
+            logger.info("Filtering for Gold Tier: strictly 'human_corrected' ground truth...")
         elif tier == "human_verified":
             stmt = select(InvoiceRecord).where(
                 InvoiceRecord.output_json.isnot(None),
-                InvoiceRecord.status.in_(["reviewed", "partially_reviewed"]),
-                InvoiceRecord.needs_review == False,
+                InvoiceRecord.ground_truth_source.in_(["human_corrected", "human_confirmed"]),
             )
-            logger.info("Filtering for Verified Tier: Human-Corrected + Human-Confirmed ground truth...")
+            logger.info("Filtering for Verified Tier: strictly 'human_corrected' + 'human_confirmed' (Zero Bronze contamination)...")
         else:
             stmt = select(InvoiceRecord).where(InvoiceRecord.output_json.isnot(None))
             logger.info("Exporting all invoices (including auto-accepted predictions)...")
 
         result = await session.execute(stmt)
         jobs = result.scalars().all()
+
+        # Fallback if no records have been tagged with ground_truth_source yet
+        if not jobs and tier == "human_verified":
+            logger.info("No records tagged with ground_truth_source yet. Falling back to reviewed records (excluding auto-accepted)...")
+            stmt_fallback = select(InvoiceRecord).where(
+                InvoiceRecord.output_json.isnot(None),
+                InvoiceRecord.status.in_(["reviewed", "partially_reviewed"]),
+                InvoiceRecord.needs_review == False,
+                InvoiceRecord.ground_truth_source != "auto_accepted",
+            )
+            jobs = (await session.execute(stmt_fallback)).scalars().all()
+
+    # Exclude locked holdout evaluation set if requested
+    if exclude_locked_test:
+        locked_file = Path("data/evaluation/locked_test/locked_job_ids.json")
+        if locked_file.exists():
+            try:
+                with open(locked_file, "r", encoding="utf-8") as lf:
+                    locked_ids = set(json.load(lf))
+                prev_len = len(jobs)
+                jobs = [j for j in jobs if j.job_id not in locked_ids]
+                if len(jobs) < prev_len:
+                    logger.info(f"Excluded {prev_len - len(jobs)} locked test samples from training dataset.")
+            except Exception as e:
+                logger.warning(f"Could not load locked test IDs: {e}")
 
     if max_samples and max_samples > 0:
         jobs = jobs[:max_samples]
@@ -588,6 +613,7 @@ if __name__ == "__main__":
     parser.add_argument("--tier", choices=["gold", "human_verified", "all"], default="human_verified", help="Ground truth tier to export (default: human_verified)")
     parser.add_argument("--max-samples", type=int, default=None, help="Limit number of samples to process")
     parser.add_argument("--include-line-items", action="store_true", help="Include fine-grained line item labels (default: False, header/financial focus)")
+    parser.add_argument("--include-locked-test", action="store_true", help="Include locked test samples in export (default: False, excluded)")
     args = parser.parse_args()
 
     asyncio.run(export_layoutlm_dataset(
@@ -596,4 +622,5 @@ if __name__ == "__main__":
         tier=args.tier,
         max_samples=args.max_samples,
         include_line_items=args.include_line_items,
+        exclude_locked_test=not args.include_locked_test,
     ))

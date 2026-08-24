@@ -68,11 +68,19 @@ async def lifespan(app: FastAPI):
         except Exception as ex:
             logger.warning(f"Background pipeline warmup: {ex}")
 
-    asyncio.create_task(_warmup())
+    # Start Autonomous Active Learning Background Worker (polls every 15 mins)
+    try:
+        from active_learning.auto_trainer import continuous_learning_worker
+        app.state.learning_worker = asyncio.create_task(continuous_learning_worker(interval_seconds=900))
+    except Exception as ex:
+        logger.warning(f"Could not start active learning background worker: {ex}")
+        app.state.learning_worker = None
 
     yield
 
     logger.info("Shutting down...")
+    if getattr(app.state, "learning_worker", None):
+        app.state.learning_worker.cancel()
 
 
 # ------------------------------------------------------------------
@@ -1650,6 +1658,18 @@ async def trigger_champion_retraining(epochs: int = 10):
     except Exception as e:
         logger.exception(f"Auto-training failed: {e}")
         raise HTTPException(status_code=500, detail=f"Training error: {e}")
+
+
+@app.post("/api/active-learning/rollback", tags=["Active Learning"])
+async def trigger_champion_rollback():
+    """
+    Rolls back the active LayoutLM champion to the most recent archived version.
+    """
+    from active_learning.auto_trainer import rollback_champion
+    res = rollback_champion()
+    if res.get("status") == "ERROR":
+        raise HTTPException(status_code=400, detail=res.get("message"))
+    return res
 
 
 # ------------------------------------------------------------------

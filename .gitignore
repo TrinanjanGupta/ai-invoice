@@ -73,6 +73,7 @@ data/annotations/
 data/layoutlm_dataset/
 data/outputs/
 data/temp_raw/
+data/evaluation/
 output/
 output/debug_viz/
 *.zip
