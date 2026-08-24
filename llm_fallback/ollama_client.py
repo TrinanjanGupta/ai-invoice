@@ -150,17 +150,9 @@ class OllamaClient:
             f"Extract the {field_name} from the text. Return ONLY the value."
         )
 
-        context = ""
-        if context_texts:
-            context = "\n".join(
-                f"[{region}]\n{text}"
-                for region, text in context_texts.items()
-                if text.strip()
-            )
-        else:
-            context = raw_text
-
-        user_message = f"{system_prompt}\n\n---\nINVOICE TEXT:\n{context[:3000]}\n---"
+        context_dict = context_texts if context_texts else {"full_page": raw_text}
+        context = self._build_targeted_context([field_name], context_dict)
+        user_message = f"{system_prompt}\n\n---\nTARGETED INVOICE CONTEXT:\n{context}\n---"
 
         try:
             resp = httpx.post(

@@ -59,10 +59,23 @@ class TextBlock:
         return [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
 
 
+def _char_width_weight(char: str) -> float:
+    """Approximate relative typographical width for Latin, digits, and Indian currency glyphs."""
+    if char in " .:,;!|'\"`iIl1()-[]{}":
+        return 0.5
+    elif char in "MWmw%@#":
+        return 1.4
+    elif char in "₹₹$€£":
+        return 1.3
+    elif char.isspace():
+        return 0.6
+    return 1.0
+
+
 def decompose_line_into_words(text: str, bbox: list, confidence: float) -> list[OCRWord]:
     """
     Decomposes an OCR text line into individual word tokens with
-    character-proportional bounding boxes.
+    weighted character metric spatial bounding boxes.
     """
     if not text or not text.strip():
         return []
@@ -77,19 +90,30 @@ def decompose_line_into_words(text: str, bbox: list, confidence: float) -> list[
         ys = [p[1] for p in bbox]
         x_min, y_min, x_max, y_max = min(xs), min(ys), max(xs), max(ys)
 
-    total_len = max(1, len(text))
+    # Compute typographical cumulative weights across the line
+    weights = [_char_width_weight(c) for c in text]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        total_weight = max(1.0, float(len(text)))
+        weights = [1.0] * len(text)
+
+    cum_weights = [0.0]
+    for w in weights:
+        cum_weights.append(cum_weights[-1] + w)
+
     words: list[OCRWord] = []
+    line_width = max(1.0, float(x_max - x_min))
 
     for m in re.finditer(r"\S+", text):
         w_text = m.group()
         s_idx = m.start()
         e_idx = m.end()
 
-        ratio_start = s_idx / total_len
-        ratio_end = e_idx / total_len
+        ratio_start = cum_weights[s_idx] / total_weight
+        ratio_end = cum_weights[e_idx] / total_weight
 
-        w_x1 = x_min + (x_max - x_min) * ratio_start
-        w_x2 = x_min + (x_max - x_min) * ratio_end
+        w_x1 = x_min + line_width * ratio_start
+        w_x2 = x_min + line_width * ratio_end
         w_y1 = y_min
         w_y2 = y_max
 

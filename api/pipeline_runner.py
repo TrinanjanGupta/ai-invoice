@@ -28,10 +28,11 @@ from PIL import Image
 
 from config.settings import Settings
 from preprocessing.pipeline import InvoicePreprocessor
-from preprocessing.pdf_converter import PDFConverter, NativePDFPage
+from preprocessing.pdf_converter import PDFConverter, NativePDFPage, PreprocessResult
 from detection.detector import InvoiceDetector
 from ocr.extractor import InvoiceOCR, OCRResult, TextBlock, OCRWord
-from understanding.layoutlm import LayoutLMExtractor
+from understanding.layoutlm import LayoutLMExtractor, ExtractedInvoice
+from understanding.table_extractor import TableExtractor
 from llm_fallback.ollama_client import OllamaClient
 from validation.validator import InvoiceValidator, InvoiceSchema, ValidationReport
 from output.renderer import InvoiceRenderer
@@ -201,6 +202,7 @@ class InvoicePipeline:
             model_path=settings.layoutlm_model_path,
             base_model=settings.layoutlm_base_model,
         )
+        self.table_extractor = TableExtractor()
         self.llm      = OllamaClient(
             base_url=settings.ollama_base_url,
             model=settings.ollama_model,
@@ -314,6 +316,20 @@ class InvoicePipeline:
             p_extracted = self.extractor.extract(p_ocr, image=pil_image)
             if isinstance(p_obj, NativePDFPage) and p_obj.line_items:
                 p_extracted.line_items = p_obj.line_items
+            else:
+                # Scanned image / OCR spatial table reconstruction
+                table_ocr_res = (
+                    p_ocr.get("line_items")
+                    or p_ocr.get(f"line_items_p{p_idx+1}")
+                    or p_ocr.get(f"full_page_p{p_idx+1}")
+                    or p_ocr.get("full_page")
+                )
+                if table_ocr_res:
+                    spatial_items = self.table_extractor.extract_tables_from_spatial_ocr(table_ocr_res)
+                    if spatial_items:
+                        p_extracted.line_items = spatial_items
+                        logger.info(f"[{job_id}] Page {p_idx+1}: Extracted {len(spatial_items)} line items via spatial OCR table reconstruction")
+
             extracted_per_page.append(p_extracted)
 
         # ── Stage 4a: Merge across pages ────────────────────────────────────
