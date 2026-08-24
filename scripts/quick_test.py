@@ -1,6 +1,10 @@
 """Quick end-to-end pipeline validation test."""
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from config.settings import get_settings
 from api.pipeline_runner import InvoicePipeline
 

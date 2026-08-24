@@ -12,19 +12,69 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+import re
+
+@dataclass
+class OCRWord:
+    text: str
+    confidence: float
+    bbox: list          # [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] or [x1, y1, x2, y2]
+
+
 @dataclass
 class TextBlock:
     text: str
     confidence: float
     bbox: list          # [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] (PaddleOCR format)
     region_label: str   # which invoice region this came from
+    words: list[OCRWord] = field(default_factory=list)
+
+
+def decompose_line_into_words(text: str, bbox: list, confidence: float) -> list[OCRWord]:
+    """
+    Decomposes an OCR text line into individual word tokens with
+    character-proportional bounding boxes.
+    """
+    if not text or not text.strip():
+        return []
+
+    if not bbox:
+        return [OCRWord(text=w, confidence=confidence, bbox=[0, 0, 0, 0]) for w in text.split()]
+
+    if len(bbox) == 4 and isinstance(bbox[0], (int, float)):
+        x_min, y_min, x_max, y_max = bbox
+    else:
+        xs = [p[0] for p in bbox]
+        ys = [p[1] for p in bbox]
+        x_min, y_min, x_max, y_max = min(xs), min(ys), max(xs), max(ys)
+
+    total_len = max(1, len(text))
+    words: list[OCRWord] = []
+
+    for m in re.finditer(r"\S+", text):
+        w_text = m.group()
+        s_idx = m.start()
+        e_idx = m.end()
+
+        ratio_start = s_idx / total_len
+        ratio_end = e_idx / total_len
+
+        w_x1 = x_min + (x_max - x_min) * ratio_start
+        w_x2 = x_min + (x_max - x_min) * ratio_end
+        w_y1 = y_min
+        w_y2 = y_max
+
+        word_bbox = [[w_x1, w_y1], [w_x2, w_y1], [w_x2, w_y2], [w_x1, w_y2]]
+        words.append(OCRWord(text=w_text, confidence=confidence, bbox=word_bbox))
+
+    return words
 
 
 @dataclass
 class OCRResult:
     region_label: str
     text_blocks: list[TextBlock]
-    full_text: str      # concatenated text of the region
+    full_text: str      # concatenated text of the region with preserved newlines
     avg_confidence: float
 
 
@@ -92,11 +142,13 @@ class InvoiceOCR:
                                 text, conf = str(line[1]), 0.9
                             text = str(text).strip()
                             if text:
+                                words = decompose_line_into_words(text, bbox, float(conf))
                                 text_blocks.append(TextBlock(
                                     text=text,
                                     confidence=float(conf),
                                     bbox=bbox,
                                     region_label=region_label,
+                                    words=words,
                                 ))
             except Exception as e:
                 logger.debug(f"PaddleOCR extraction fallback triggered: {e}")
@@ -119,16 +171,18 @@ class InvoiceOCR:
                         bbox, text, conf = line
                         text = str(text).strip()
                         if text:
+                            words = decompose_line_into_words(text, bbox, float(conf))
                             text_blocks.append(TextBlock(
                                 text=text,
                                 confidence=float(conf),
                                 bbox=bbox,
                                 region_label=region_label,
+                                words=words,
                             ))
                 except Exception as e:
                     logger.debug(f"EasyOCR extraction error: {e}")
 
-        full_text = " ".join(b.text for b in text_blocks)
+        full_text = "\n".join(b.text for b in text_blocks)
         avg_conf = (
             sum(b.confidence for b in text_blocks) / len(text_blocks)
             if text_blocks else 0.0

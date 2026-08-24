@@ -1,11 +1,8 @@
 """
-Stage 4b: Ollama LLM fallback.
+Stage 4b: Ollama LLM fallback (Llama 3.1 8B / invoice-expert).
 
-Called ONLY for fields that scored below the confidence threshold.
-Uses Mistral 7B (or any Ollama-hosted model) running locally — zero cost.
-
-Prompt engineering is structured so the model returns only the requested
-field value, nothing else, making parsing trivial and reliable.
+Called for fields that scored below the confidence threshold or are missing.
+Uses local Ollama inference with candidate evidence and spatial document context.
 """
 
 import re
@@ -120,7 +117,7 @@ class OllamaClient:
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
-        model: str = "mistral",
+        model: str = "invoice-expert",
         timeout: float = 3000.0,
     ):
         self.base_url = base_url.rstrip("/")
@@ -268,11 +265,12 @@ class OllamaClient:
         self,
         field_names: list,
         ocr_texts: dict,
+        candidate_hints: Optional[list[str]] = None,
     ) -> dict:
         """
         Ask the LLM to extract ALL missing fields in a single prompt.
         Returns a dict of {field_name: value_string}.
-        Uses dynamic few-shot learning and strict normalization rules.
+        Uses dynamic few-shot learning, candidate evidence, and strict normalization rules.
         """
         context = "\n".join(
             f"[{region}]\n{text}"
@@ -284,13 +282,18 @@ class OllamaClient:
             f"- {name}" for name in field_names
         )
 
+        candidates_sec = ""
+        if candidate_hints:
+            candidates_sec = "Candidate Evidence (from layout/spatial extraction):\n" + "\n".join(candidate_hints) + "\n\n"
+
         few_shot_sec = self._get_dynamic_few_shot_context()
 
         prompt = (
             "You are an expert AI Invoice Digitization Engine specialized in Indian GST, multi-state commercial invoices, and handwriting normalization.\n"
-            "From the OCR text below, extract the requested fields.\n"
+            "From the OCR text and candidate evidence below, extract or verify the requested fields.\n"
             "Return your answer as a JSON object with field names as keys and extracted values as strings. If a field is not found, set its value to null.\n\n"
             f"Fields to extract:\n{fields_desc}\n\n"
+            f"{candidates_sec}"
             "Strict Normalization Rules:\n"
             "- Dates MUST be formatted as DD/MM/YYYY (convert 2-digit years like '22-Dec-25' -> '22/12/2025')\n"
             "- Numbers MUST be plain numeric (no currency symbols)\n"
@@ -370,10 +373,15 @@ class OllamaClient:
 
         # Collect fields that need LLM help
         missing_fields = []
+        candidate_hints = []
         for field_name in fields_to_check:
             current = getattr(invoice, field_name, None)
             if current is None or current.confidence < confidence_threshold:
                 missing_fields.append(field_name)
+                if current and current.value:
+                    candidate_hints.append(
+                        f"- {field_name}: current candidate '{current.value}' (source: {current.source}, conf: {current.confidence:.2f})"
+                    )
 
         if not missing_fields:
             logger.info("All fields above confidence threshold — no LLM fallback needed")
@@ -384,8 +392,8 @@ class OllamaClient:
             f"{', '.join(missing_fields)}"
         )
 
-        # Single batched LLM call for all missing fields
-        results = self._extract_multiple_fields_batch(missing_fields, ocr_texts)
+        # Single batched LLM call for all missing fields with candidate evidence
+        results = self._extract_multiple_fields_batch(missing_fields, ocr_texts, candidate_hints=candidate_hints)
 
         enhanced_count = 0
         gstin_pattern = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}$")

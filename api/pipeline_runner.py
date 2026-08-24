@@ -30,7 +30,7 @@ from config.settings import Settings
 from preprocessing.pipeline import InvoicePreprocessor
 from preprocessing.pdf_converter import PDFConverter, NativePDFPage
 from detection.detector import InvoiceDetector
-from ocr.extractor import InvoiceOCR, OCRResult, TextBlock
+from ocr.extractor import InvoiceOCR, OCRResult, TextBlock, OCRWord
 from understanding.layoutlm import LayoutLMExtractor
 from llm_fallback.ollama_client import OllamaClient
 from validation.validator import InvoiceValidator, InvoiceSchema, ValidationReport
@@ -62,6 +62,7 @@ def _native_page_to_ocr_results(
 
     Words are grouped by their (block_no, line_no) to produce ONE TextBlock
     per PDF line — exactly matching the structure PaddleOCR produces.
+    Each TextBlock retains individual word tokens and word-level bounding boxes.
     This is critical: _extract_heuristic relies on full_text.split("\\n")
     to separate vendor name from address, header fields from body, etc.
 
@@ -91,18 +92,27 @@ def _native_page_to_ocr_results(
         key=lambda ws: (min(w.bbox[1] for w in ws), min(w.bbox[0] for w in ws))
     )
 
-    # Build TextBlock per line
+    # Build TextBlock per line with word tokens
     def line_to_textblock(line_words: list, region_label: str) -> TextBlock:
         text = " ".join(w.text for w in line_words)
         x0 = min(w.bbox[0] for w in line_words) * sx
         y0 = min(w.bbox[1] for w in line_words) * sy
         x1 = max(w.bbox[2] for w in line_words) * sx
         y1 = max(w.bbox[3] for w in line_words) * sy
+        words = [
+            OCRWord(
+                text=w.text,
+                confidence=0.99,
+                bbox=[[w.bbox[0] * sx, w.bbox[1] * sy], [w.bbox[2] * sx, w.bbox[1] * sy], [w.bbox[2] * sx, w.bbox[3] * sy], [w.bbox[0] * sx, w.bbox[3] * sy]],
+            )
+            for w in line_words
+        ]
         return TextBlock(
             text=text,
             confidence=0.99,
             bbox=[[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
             region_label=region_label,
+            words=words,
         )
 
     if not det_regions:
@@ -118,7 +128,7 @@ def _native_page_to_ocr_results(
             )
         }
 
-    # ── Assign each line to a detected region (or proportional zone fallback) ──
+    # ── Assign each line to a detected region ──
     region_line_groups: dict[str, list[list]] = {r.label: [] for r in det_regions}
 
     for line_words in sorted_lines:
@@ -133,23 +143,10 @@ def _native_page_to_ocr_results(
                 region_line_groups[region.label].append(line_words)
                 placed = True
                 break
-        if not placed:
-            # Proportional placement fallback based on vertical position
-            cy_pct = cy / max(1.0, img_h)
-            if cy_pct < 0.20 and "header" in region_line_groups:
-                region_line_groups["header"].append(line_words)
-            elif cy_pct < 0.35 and "vendor_block" in region_line_groups:
-                region_line_groups["vendor_block"].append(line_words)
-            elif cy_pct < 0.45 and "buyer_block" in region_line_groups:
-                region_line_groups["buyer_block"].append(line_words)
-            elif cy_pct < 0.75 and "line_items" in region_line_groups:
-                region_line_groups["line_items"].append(line_words)
-            elif cy_pct < 0.90 and "totals_block" in region_line_groups:
-                region_line_groups["totals_block"].append(line_words)
-            elif "payment_terms" in region_line_groups:
-                region_line_groups["payment_terms"].append(line_words)
-            elif det_regions:
-                region_line_groups[det_regions[0].label].append(line_words)
+        if not placed and det_regions:
+            # Assign unplaced line to the nearest region by center distance
+            best_r = min(det_regions, key=lambda r: abs((r.bbox[1] + r.bbox[3]) / 2 - cy))
+            region_line_groups[best_r.label].append(line_words)
 
     results = {}
     for region in det_regions:

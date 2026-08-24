@@ -16,6 +16,9 @@ from dataclasses import dataclass, field
 from typing import Optional, Any
 
 
+from ocr.extractor import OCRWord, decompose_line_into_words
+
+
 @dataclass
 class ExtractedField:
     value: str
@@ -132,29 +135,9 @@ def calculate_realistic_confidence(inv: ExtractedInvoice) -> float:
     """
     Calculates a realistic, block-filling weighted percentage score (0.0 to 1.0).
     
-    Instead of averaging only the non-empty fields (which resulted in a gimmick 80%
-    score when 90% of the invoice was blank), this evaluates both:
+    Evaluates:
     1. Field coverage across standard invoice blocks (Header, Parties, Items, Totals, Bank).
     2. Quality / confidence of each populated block.
-    
-    Weights Schema (100% total):
-    - Header & Meta (20%):
-        * Invoice / Bill Number: 10%
-        * Invoice / Bill Date:   10%
-    - Vendor / Biller (20%):
-        * Vendor Name:           12%
-        * Vendor Address / Tax / Contact: 8%
-    - Buyer / Client / Beneficiary (20%):
-        * Buyer Name:            12%
-        * Buyer Address / Phone / SLS Code: 8%
-    - Line Items (20%):
-        * At least 1 item with description: 10%
-        * Item rate/amount/quantity > 0:    10%
-    - Totals & Financials (15%):
-        * Grand Total:           10%
-        * Subtotal or Tax:        5%
-    - Bank & Settlement Details (5%):
-        * Account / IFSC / Bank Name: 5%
     """
     total_score = 0.0
 
@@ -192,12 +175,27 @@ def calculate_realistic_confidence(inv: ExtractedInvoice) -> float:
 
     # 4. Line Items (20%)
     if inv.line_items and len(inv.line_items) > 0:
-        has_desc = any(bool(str(it.get("description", "")).strip()) for it in inv.line_items)
-        has_amount = any(float(it.get("amount", 0) or it.get("rate", 0) or 0) > 0 for it in inv.line_items)
-        if has_desc:
-            total_score += 0.10
-        if has_amount:
-            total_score += 0.10
+        valid_desc_items = [
+            it for it in inv.line_items
+            if bool(str(it.get("description", "")).strip()) and len(str(it.get("description", "")).strip()) >= 2
+        ]
+        valid_amt_items = [
+            it for it in inv.line_items
+            if float(it.get("amount", 0) or it.get("rate", 0) or 0) > 0
+        ]
+        
+        # Calculate item confidences
+        item_confs = [
+            float(it.get("confidence", 0.85)) for it in inv.line_items if "confidence" in it
+        ]
+        avg_item_conf = (sum(item_confs) / len(item_confs)) if item_confs else 0.85
+
+        if valid_desc_items:
+            desc_ratio = min(1.0, len(valid_desc_items) / len(inv.line_items))
+            total_score += 0.10 * desc_ratio * max(0.2, min(1.0, avg_item_conf))
+        if valid_amt_items:
+            amt_ratio = min(1.0, len(valid_amt_items) / len(inv.line_items))
+            total_score += 0.10 * amt_ratio * max(0.2, min(1.0, avg_item_conf))
 
     # 5. Totals & Financials (15%)
     if inv.grand_total and str(inv.grand_total.value).strip():
@@ -393,29 +391,34 @@ class LayoutLMExtractor:
         full_page_results = [v for k, v in ocr_results.items() if "full_page" in k]
         target_ocr_list = full_page_results if full_page_results else list(ocr_results.values())
 
+        w, h = image.size
         seen_spans = set()
         for ocr_result in target_ocr_list:
             for block in ocr_result.text_blocks:
-                text_clean = block.text.strip()
-                if not text_clean:
-                    continue
-                bbox = block.bbox
-                xs = [p[0] for p in bbox]
-                ys = [p[1] for p in bbox]
-                x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
-                w, h = image.size
-                norm_bbox = [
-                    max(0, min(1000, int(1000 * x1 / max(1, w)))),
-                    max(0, min(1000, int(1000 * y1 / max(1, h)))),
-                    max(0, min(1000, int(1000 * x2 / max(1, w)))),
-                    max(0, min(1000, int(1000 * y2 / max(1, h)))),
-                ]
-                span_key = (text_clean, norm_bbox[0], norm_bbox[1], norm_bbox[2], norm_bbox[3])
-                if span_key in seen_spans:
-                    continue
-                seen_spans.add(span_key)
-                all_words.append(text_clean)
-                all_boxes.append(norm_bbox)
+                word_objs = block.words if block.words else decompose_line_into_words(block.text, block.bbox, block.confidence)
+                for w_obj in word_objs:
+                    w_text = w_obj.text.strip()
+                    if not w_text:
+                        continue
+                    w_bbox = w_obj.bbox
+                    if len(w_bbox) == 4 and isinstance(w_bbox[0], (int, float)):
+                        x1, y1, x2, y2 = w_bbox
+                    else:
+                        xs = [p[0] for p in w_bbox]
+                        ys = [p[1] for p in w_bbox]
+                        x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+                    norm_bbox = [
+                        max(0, min(1000, int(1000 * x1 / max(1, w)))),
+                        max(0, min(1000, int(1000 * y1 / max(1, h)))),
+                        max(0, min(1000, int(1000 * x2 / max(1, w)))),
+                        max(0, min(1000, int(1000 * y2 / max(1, h)))),
+                    ]
+                    span_key = (w_text, norm_bbox[0], norm_bbox[1], norm_bbox[2], norm_bbox[3])
+                    if span_key in seen_spans:
+                        continue
+                    seen_spans.add(span_key)
+                    all_words.append(w_text)
+                    all_boxes.append(norm_bbox)
 
         if not all_words:
             return self._extract_heuristic(ocr_results)

@@ -110,7 +110,7 @@ class TestPreprocessor:
 class TestDetector:
     def test_heuristic_fallback_produces_regions(self):
         from detection.detector import InvoiceDetector
-        d = InvoiceDetector(model_path=None)   # no model → heuristic
+        d = InvoiceDetector(model_path="")   # explicit empty model → heuristic
         img = make_white_image()
         result = d.detect(img)
         assert result.model_used == "heuristic"
@@ -118,7 +118,7 @@ class TestDetector:
 
     def test_region_labels_are_valid(self):
         from detection.detector import InvoiceDetector, REGION_LABELS
-        d = InvoiceDetector(model_path=None)
+        d = InvoiceDetector(model_path="")
         img = make_white_image()
         result = d.detect(img)
         valid_labels = set(REGION_LABELS.values())
@@ -127,7 +127,7 @@ class TestDetector:
 
     def test_regions_have_nonzero_crops(self):
         from detection.detector import InvoiceDetector
-        d = InvoiceDetector(model_path=None)
+        d = InvoiceDetector(model_path="")
         img = make_white_image()
         result = d.detect(img)
         for region in result.regions:
@@ -135,11 +135,50 @@ class TestDetector:
 
     def test_visualise_returns_image(self):
         from detection.detector import InvoiceDetector
-        d = InvoiceDetector(model_path=None)
+        d = InvoiceDetector(model_path="")
         img = make_white_image()
         result = d.detect(img)
         vis = d.visualise(img, result)
         assert vis.shape == img.shape
+
+
+# ------------------------------------------------------------------
+# OCR Word Token & Line Preservation tests
+# ------------------------------------------------------------------
+
+class TestOCRExtractor:
+    def test_decompose_line_into_words(self):
+        from ocr.extractor import decompose_line_into_words
+        text = "Invoice No: INV-12345"
+        bbox = [[100, 50], [400, 50], [400, 80], [100, 80]]
+        words = decompose_line_into_words(text, bbox, confidence=0.95)
+        assert len(words) == 3
+        assert words[0].text == "Invoice"
+        assert words[1].text == "No:"
+        assert words[2].text == "INV-12345"
+        # Bounding box x-coordinates should be strictly ascending
+        assert words[0].bbox[0][0] < words[1].bbox[0][0] < words[2].bbox[0][0]
+        assert words[2].bbox[1][0] <= 400
+
+    def test_full_text_preserves_newlines(self):
+        from ocr.extractor import TextBlock, OCRResult
+        blocks = [
+            TextBlock(text="Invoice No: INV-123", confidence=0.95, bbox=[], region_label="header"),
+            TextBlock(text="Date: 21/08/2026", confidence=0.98, bbox=[], region_label="header"),
+            TextBlock(text="Total: 11800.00", confidence=0.99, bbox=[], region_label="totals"),
+        ]
+        res = OCRResult(
+            region_label="header",
+            text_blocks=blocks,
+            full_text="\n".join(b.text for b in blocks),
+            avg_confidence=0.97,
+        )
+        assert "\n" in res.full_text
+        lines = res.full_text.split("\n")
+        assert len(lines) == 3
+        assert lines[0] == "Invoice No: INV-123"
+        assert lines[1] == "Date: 21/08/2026"
+        assert lines[2] == "Total: 11800.00"
 
 
 # ------------------------------------------------------------------
@@ -148,12 +187,18 @@ class TestDetector:
 
 class TestLayoutLMExtractor:
     def _make_mock_ocr_results(self, texts: dict):
-        from ocr.extractor import OCRResult, TextBlock
+        from ocr.extractor import OCRResult, TextBlock, decompose_line_into_words
         results = {}
         for label, text in texts.items():
+            lines = text.split("\n")
+            blocks = []
+            for line in lines:
+                if line.strip():
+                    words = decompose_line_into_words(line, [[0, 0], [100, 0], [100, 20], [0, 20]], 0.9)
+                    blocks.append(TextBlock(text=line, confidence=0.9, bbox=[[0, 0], [100, 0], [100, 20], [0, 20]], region_label=label, words=words))
             results[label] = OCRResult(
                 region_label=label,
-                text_blocks=[TextBlock(text=text, confidence=0.9, bbox=[], region_label=label)],
+                text_blocks=blocks,
                 full_text=text,
                 avg_confidence=0.9,
             )
@@ -205,6 +250,22 @@ class TestLayoutLMExtractor:
         result = ex.extract({})
         assert result.vendor_name is None
         assert result.grand_total is None
+
+    def test_realistic_confidence_calibration(self):
+        from understanding.layoutlm import ExtractedInvoice, ExtractedField, calculate_realistic_confidence
+        inv = ExtractedInvoice()
+        score_empty = calculate_realistic_confidence(inv)
+        assert score_empty == 0.0
+
+        inv.invoice_number = ExtractedField("INV-001", 0.95, "heuristic")
+        inv.invoice_date = ExtractedField("01/01/2026", 0.95, "heuristic")
+        score_header = calculate_realistic_confidence(inv)
+        assert score_header >= 0.18
+
+        # Empty line items should not award points
+        inv.line_items = [{"description": "", "amount": 0}]
+        score_with_empty_items = calculate_realistic_confidence(inv)
+        assert score_with_empty_items == score_header
 
 
 # ------------------------------------------------------------------

@@ -76,15 +76,18 @@ class InvoiceDetector:
 
     def _try_load_model(self):
         candidate_paths = []
-        if self.model_path:
+        if self.model_path is not None:
+            if not self.model_path:
+                logger.info("Empty model_path provided — using heuristic fallback")
+                return
             candidate_paths.append(Path(self.model_path))
-
-        # Check default paths for DocLayout-YOLO or Custom YOLO
-        candidate_paths.extend([
-            Path("data/models/doclayout_yolo_v8s/weights/best.pt"),
-            Path("data/models/doclayout_yolo/doclayout_yolo_doclaynet_imgsz1120_from_scratch.pt"),
-            Path("data/models/invoice_yolo.pt"),
-        ])
+        else:
+            # Check default paths for DocLayout-YOLO or Custom YOLO
+            candidate_paths.extend([
+                Path("data/models/doclayout_yolo_v8s/weights/best.pt"),
+                Path("data/models/doclayout_yolo/doclayout_yolo_doclaynet_imgsz1120_from_scratch.pt"),
+                Path("data/models/invoice_yolo.pt"),
+            ])
 
         chosen_path = None
         for p in candidate_paths:
@@ -149,18 +152,7 @@ class InvoiceDetector:
                 raw_name = str(self.model.names.get(cls_id, f"class_{cls_id}")).lower()
 
                 if self.is_doclaynet:
-                    label = DOCLAYNET_MAP.get(raw_name, "plain_text")
-                    # Disambiguate generic text based on vertical position
-                    if label == "text_block":
-                        y_mid_pct = ((y1 + y2) / 2) / max(1, h)
-                        if y_mid_pct < 0.25:
-                            label = "vendor_block"
-                        elif y_mid_pct < 0.45:
-                            label = "buyer_block"
-                        elif y_mid_pct > 0.80:
-                            label = "payment_terms"
-                        else:
-                            label = "line_items"
+                    label = DOCLAYNET_MAP.get(raw_name, "text_block")
                 else:
                     label = CUSTOM_REGION_LABELS.get(cls_id, f"class_{cls_id}")
 
@@ -173,34 +165,6 @@ class InvoiceDetector:
                         bbox=(x1, y1, x2, y2),
                         crop=crop,
                     ))
-
-        # ── Hybrid Merge / Safety Coverage ──
-        # Ensure essential regions are never completely omitted
-        detected_labels = {r.label for r in raw_regions}
-        essential_zones = [
-            ("header",       0, 0.00, 0.20),
-            ("vendor_block", 1, 0.05, 0.35),
-            ("buyer_block",  2, 0.20, 0.45),
-            ("line_items",   3, 0.35, 0.75),
-            ("totals_block", 4, 0.70, 0.90),
-            ("payment_terms",6, 0.85, 1.00),
-        ]
-
-        # If model missed essential zones or produced fewer than 3 boxes, backfill missing zones
-        if len(raw_regions) < 3 or not ("line_items" in detected_labels or "header" in detected_labels):
-            for label, cls_id, y_start, y_end in essential_zones:
-                if label not in detected_labels:
-                    y1, y2 = int(h * y_start), int(h * y_end)
-                    x1, x2 = 0, w
-                    crop = image[y1:y2, x1:x2]
-                    if crop.size > 0:
-                        raw_regions.append(DetectedRegion(
-                            label=label,
-                            class_id=cls_id,
-                            confidence=0.50,
-                            bbox=(x1, y1, x2, y2),
-                            crop=crop,
-                        ))
 
         raw_regions.sort(key=lambda r: r.bbox[1])  # sort top-to-bottom
         model_tag = "doclayout-yolo" if self.is_doclaynet else "yolo"
