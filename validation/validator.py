@@ -555,20 +555,26 @@ class InvoiceValidator:
     # ------------------------------------------------------------------
 
     def _get_val(self, field: Optional[ExtractedField]) -> Optional[str]:
-        return field.value if field else None
+        if not field or field.value is None:
+            return None
+        return str(field.value).strip()
 
     def _get_float(self, field: Optional[ExtractedField]) -> Optional[float]:
-        if not field or not field.value:
+        if not field or field.value is None:
+            return None
+        if isinstance(field.value, (int, float)):
+            return float(field.value)
+        val_str = str(field.value).strip()
+        if not val_str:
             return None
         try:
-            # Keep leading minus sign for negative detection
-            is_neg = field.value.strip().startswith("-")
-            cleaned = re.sub(r"[^\d.]", "", field.value)
+            is_neg = val_str.startswith("-")
+            cleaned = re.sub(r"[^\d.]", "", val_str)
             if not cleaned:
                 return None
             val = float(cleaned)
             return -val if is_neg else val
-        except ValueError:
+        except (ValueError, TypeError):
             return None
 
     def _to_schema(self, inv: ExtractedInvoice) -> InvoiceSchema:
@@ -704,42 +710,98 @@ class InvoiceValidator:
 
     def _check_math(self, s: InvoiceSchema, r: ValidationReport):
         """
-        Core financial consistency checks.
+        Holistic accounting consistency resolver & GST engine.
+        Evaluates multiple mathematical hypotheses (line-item tax vs global tax,
+        tax inclusive vs exclusive) to prevent false rejections.
         """
         tol = self.TOLERANCE
 
-        # 1. Line items sum = subtotal
+        # 1. Line items sum = subtotal (or grand_total if tax inclusive)
         if s.line_items and s.subtotal:
-            items_sum = sum(item.amount for item in s.line_items)
+            items_sum = sum(item.amount for item in s.line_items if item.amount is not None)
             diff = abs(items_sum - s.subtotal)
-            ok = diff <= max(s.subtotal * tol, 1.0)
-            r.add("line_items_sum",
-                  ok,
-                  f"Line items sum {items_sum:.2f} matches subtotal {s.subtotal:.2f}" if ok
-                  else f"Line items sum {items_sum:.2f} ≠ subtotal {s.subtotal:.2f} (diff={diff:.2f})",
-                  "error" if not ok else "info")
+            ok = diff <= max(s.subtotal * tol, 1.5)
+            if not ok and s.grand_total and abs(items_sum - s.grand_total) <= max(s.grand_total * tol, 1.5):
+                # Tax inclusive line item scheme
+                r.add("line_items_sum", True, f"Line items match gross grand total (Tax Inclusive Pricing): {items_sum:.2f}", "info")
+            else:
+                r.add("line_items_sum",
+                      ok,
+                      f"Line items sum {items_sum:.2f} matches subtotal {s.subtotal:.2f}" if ok
+                      else f"Line items sum {items_sum:.2f} ≠ subtotal {s.subtotal:.2f} (diff={diff:.2f})",
+                      "error" if not ok else "info")
 
-        # 2. CGST + SGST = tax_amount (if using CGST/SGST)
-        if s.cgst is not None and s.sgst is not None and s.tax_amount:
-            computed = s.cgst + s.sgst
-            diff = abs(computed - s.tax_amount)
-            ok = diff <= max(s.tax_amount * tol, 1.0)
+        # 2. GST Intra-State vs Inter-State Consistency Check (Line-Item & Global)
+        global_cgst = s.global_cgst_rate or 0.0
+        global_sgst = s.global_sgst_rate or 0.0
+        global_igst = s.global_igst_rate or 0.0
+        total_global_rate = global_cgst + global_sgst + global_igst
+
+        # Intra-state check
+        if (s.cgst is not None and s.cgst > 0) or (s.sgst is not None and s.sgst > 0) or (global_cgst > 0 or global_sgst > 0):
+            if global_cgst > 0 and global_sgst > 0:
+                rate_match = abs(global_cgst - global_sgst) < 0.01
+                r.add("intra_state_rates", rate_match,
+                      f"Intra-state global GST rates equal: CGST={global_cgst}%, SGST={global_sgst}%" if rate_match
+                      else f"Intra-state GST rate mismatch: CGST={global_cgst}% ≠ SGST={global_sgst}%",
+                      "warning" if not rate_match else "info")
+            if s.cgst is not None and s.sgst is not None and (s.cgst > 0 or s.sgst > 0):
+                amt_match = abs(s.cgst - s.sgst) <= max(s.cgst * tol, 1.5)
+                r.add("intra_state_amounts", amt_match,
+                      f"Intra-state amounts match: CGST={s.cgst:.2f}, SGST={s.sgst:.2f}" if amt_match
+                      else f"Intra-state amount mismatch: CGST={s.cgst:.2f} ≠ SGST={s.sgst:.2f}",
+                      "warning" if not amt_match else "info")
+            if (s.igst and s.igst > 0) or global_igst > 0:
+                r.add("gst_type_conflict", False, "Both Intra-state (CGST/SGST) and Inter-state (IGST) detected simultaneously", "warning")
+
+        # Inter-state check
+        elif (s.igst is not None and s.igst > 0) or global_igst > 0:
+            r.add("inter_state_gst", True, f"Inter-state IGST active (Rate={global_igst}%, Amount={s.igst or 0.0})", "info")
+
+        # 3. CGST + SGST = tax_amount (or Global GST calculation)
+        tax_total = (s.cgst or 0.0) + (s.sgst or 0.0) + (s.igst or 0.0)
+        if tax_total == 0.0 and s.subtotal and total_global_rate > 0:
+            computed_tax = round(s.subtotal * (total_global_rate / 100.0), 2)
+            if s.tax_amount and abs(computed_tax - s.tax_amount) <= max(s.tax_amount * tol, 1.5):
+                r.add("global_gst_math", True, f"Global GST math verified ({s.subtotal} * {total_global_rate}% ≈ {s.tax_amount})", "info")
+                tax_total = s.tax_amount
+            else:
+                tax_total = computed_tax
+
+        if s.tax_amount and tax_total > 0:
+            diff = abs(tax_total - s.tax_amount)
+            ok = diff <= max(s.tax_amount * tol, 1.5)
             r.add("cgst_sgst_sum", ok,
-                  f"CGST+SGST={computed:.2f} matches tax={s.tax_amount:.2f}" if ok
-                  else f"CGST({s.cgst})+SGST({s.sgst})={computed:.2f} ≠ tax={s.tax_amount:.2f}",
+                  f"Tax components ({tax_total:.2f}) match total tax ({s.tax_amount:.2f})" if ok
+                  else f"Tax components ({tax_total:.2f}) ≠ total tax ({s.tax_amount:.2f})",
                   "error" if not ok else "info")
 
-        # 3. subtotal + tax - discount + round_off = grand_total
-        if s.subtotal and s.grand_total and s.tax_amount is not None:
+        # 4. subtotal + tax - discount + round_off = grand_total
+        if s.subtotal and s.grand_total and (s.tax_amount is not None or tax_total > 0):
+            effective_tax = s.tax_amount if s.tax_amount is not None else tax_total
             discount = (s.discount or 0.0) + (s.global_discount or 0.0)
             round_off = s.round_off or 0.0
-            computed_total = s.subtotal + s.tax_amount - discount + round_off
+            computed_total = s.subtotal + effective_tax - discount + round_off
             diff = abs(computed_total - s.grand_total)
-            ok = diff <= max(s.grand_total * tol, 1.0)
+            ok = diff <= max(s.grand_total * tol, 1.5)
             r.add("grand_total_math", ok,
                   f"Grand total math checks out ({computed_total:.2f} ≈ {s.grand_total:.2f})" if ok
-                  else f"Grand total mismatch: {s.subtotal}+{s.tax_amount}-{discount}+{round_off}={computed_total:.2f} ≠ {s.grand_total:.2f}",
+                  else f"Grand total mismatch: {s.subtotal}+{effective_tax}-{discount}+{round_off}={computed_total:.2f} ≠ {s.grand_total:.2f}",
                   "error" if not ok else "info")
+
+        # 5. Amount in words semantic consistency
+        if s.amount_in_words and s.grand_total and s.grand_total > 0:
+            expected_words = number_to_words_inr(s.grand_total)
+            clean_extracted = re.sub(r"[^a-z0-9]", "", s.amount_in_words.lower())
+            clean_computed = re.sub(r"[^a-z0-9]", "", expected_words.lower())
+            # Check ratio
+            import difflib
+            sim = difflib.SequenceMatcher(None, clean_extracted, clean_computed).ratio()
+            word_ok = sim >= 0.70 or clean_computed in clean_extracted or clean_extracted in clean_computed
+            r.add("amount_in_words_match", word_ok,
+                  f"Amount in words aligns with grand total ({s.amount_in_words})" if word_ok
+                  else f"Amount in words mismatch: '{s.amount_in_words}' vs expected '{expected_words}'",
+                  "warning" if not word_ok else "info")
 
     def _check_dates(self, s: InvoiceSchema, r: ValidationReport):
         date_formats = [

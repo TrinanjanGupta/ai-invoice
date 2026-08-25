@@ -29,11 +29,15 @@ class InvoiceRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     job_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     filename: Mapped[str] = mapped_column(String(255))
+    document_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    document_type: Mapped[Optional[str]] = mapped_column(String(32), default="unknown")
+    quality_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="pending")
     storage_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     output_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     ai_output_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     field_confidences: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    model_manifest: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     corrections: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     review_status: Mapped[str] = mapped_column(String(50), default="pending")
     ground_truth_source: Mapped[str] = mapped_column(String(50), default="auto_accepted")
@@ -43,6 +47,8 @@ class InvoiceRecord(Base):
     overall_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     needs_review: Mapped[bool] = mapped_column(Boolean, default=False)
     review_reasons: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    page_count: Mapped[Optional[int]] = mapped_column(default=1)
+    ocr_word_count: Mapped[Optional[int]] = mapped_column(default=0)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -73,6 +79,12 @@ class DatabaseManager:
                 ("ground_truth_source", "VARCHAR(50) DEFAULT 'auto_accepted'"),
                 ("template_id", "VARCHAR(64)"),
                 ("disagreement_score", "FLOAT DEFAULT 0.0"),
+                ("document_hash", "VARCHAR(64)"),
+                ("document_type", "VARCHAR(32) DEFAULT 'unknown'"),
+                ("quality_score", "FLOAT"),
+                ("model_manifest", "JSON"),
+                ("page_count", "INTEGER DEFAULT 1"),
+                ("ocr_word_count", "INTEGER DEFAULT 0"),
             ]
             for col_name, col_type in columns_to_add:
                 try:
@@ -81,18 +93,31 @@ class DatabaseManager:
                     logger.debug(f"Migration notice for {col_name}: {ex}")
         logger.info("Database tables initialised and migrated")
 
-    async def create_job(self, job_id: str, filename: str) -> InvoiceRecord:
+    async def create_job(self, job_id: str, filename: str, document_hash: Optional[str] = None) -> InvoiceRecord:
         async with self.session_factory() as session:
             record = InvoiceRecord(
                 id=str(uuid.uuid4()),
                 job_id=job_id,
                 filename=filename,
+                document_hash=document_hash,
                 status="pending",
             )
             session.add(record)
             await session.commit()
             await session.refresh(record)
             return record
+
+    async def get_job_by_hash(self, document_hash: str) -> Optional[InvoiceRecord]:
+        from sqlalchemy import select
+        async with self.session_factory() as session:
+            stmt = (
+                select(InvoiceRecord)
+                .where(InvoiceRecord.document_hash == document_hash)
+                .order_by(InvoiceRecord.created_at.desc())
+                .limit(1)
+            )
+            result = await session.execute(stmt)
+            return result.scalar_one_or_none()
 
     async def update_job(self, job_id: str, **kwargs) -> Optional[InvoiceRecord]:
         from sqlalchemy import select, update

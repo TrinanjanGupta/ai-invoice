@@ -18,6 +18,10 @@ class OCRWord:
     text: str
     confidence: float
     bbox: list          # [[x1,y1],[x2,y1],[x2,y2],[x1,y2]] or [x1, y1, x2, y2]
+    page: int = 1
+    source: str = "paddleocr"
+    block_id: Optional[int] = None
+    line_id: Optional[int] = None
 
     def to_xyxy(self) -> list[float]:
         """Return [x1, y1, x2, y2] bounding box."""
@@ -348,7 +352,8 @@ class InvoiceOCR:
             if self._easyocr is None:
                 try:
                     import easyocr
-                    self._easyocr = easyocr.Reader(self.languages, gpu=self.use_gpu, verbose=False)
+                    easyocr_langs = ["bn", "en"] if "bn" in self.languages else ["hi", "en"] if "hi" in self.languages else ["en"]
+                    self._easyocr = easyocr.Reader(easyocr_langs, gpu=self.use_gpu, verbose=False)
                     self.engine_name = "EasyOCR"
                 except Exception as ex:
                     logger.error(f"[OCR CRITICAL] EasyOCR init error: {ex}")

@@ -368,14 +368,26 @@ async def export_layoutlm_dataset(
 
         # Fallback if no records have been tagged with ground_truth_source yet
         if not jobs and tier == "human_verified":
-            logger.info("No records tagged with ground_truth_source yet. Falling back to reviewed records (excluding auto-accepted)...")
+            logger.info("No records tagged with ground_truth_source yet. Falling back to reviewed records (strictly verified)...")
             stmt_fallback = select(InvoiceRecord).where(
                 InvoiceRecord.output_json.isnot(None),
-                InvoiceRecord.status.in_(["reviewed", "partially_reviewed"]),
+                InvoiceRecord.status == "reviewed",
                 InvoiceRecord.needs_review == False,
                 InvoiceRecord.ground_truth_source != "auto_accepted",
             )
             jobs = (await session.execute(stmt_fallback)).scalars().all()
+
+    # Deduplicate on document_hash to prevent repeated uploads polluting training
+    seen_hashes = set()
+    deduped_jobs = []
+    for j in jobs:
+        d_hash = getattr(j, "document_hash", None)
+        if d_hash:
+            if d_hash in seen_hashes:
+                continue
+            seen_hashes.add(d_hash)
+        deduped_jobs.append(j)
+    jobs = deduped_jobs
 
     # Exclude locked holdout evaluation set if requested
     if exclude_locked_test:

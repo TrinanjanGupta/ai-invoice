@@ -29,6 +29,8 @@ from PIL import Image
 from config.settings import Settings
 from preprocessing.pipeline import InvoicePreprocessor
 from preprocessing.pdf_converter import PDFConverter, NativePDFPage, PreprocessResult
+from preprocessing.quality_scorer import DocumentQualityScorer, QualityAssessment
+from preprocessing.document_router import DocumentRouter, DocumentRoutingDecision
 from detection.detector import InvoiceDetector
 from ocr.extractor import InvoiceOCR, OCRResult, TextBlock, OCRWord
 from understanding.layoutlm import LayoutLMExtractor, ExtractedInvoice
@@ -48,6 +50,8 @@ class PipelineResult:
     raw_ocr_texts: dict
     page_count: int
     model_used: str   # e.g. "native_pdf+yolo+layoutlm"
+    doc_type: str = "UNKNOWN"
+    quality_score: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +199,8 @@ class InvoicePipeline:
         logger.info("Initialising Invoice Pipeline...")
 
         self.preprocessor = InvoicePreprocessor()
+        self.quality_scorer = DocumentQualityScorer()
+        self.document_router = DocumentRouter()
         self.pdf_converter = PDFConverter()
         self.detector      = InvoiceDetector(model_path=settings.yolo_model_path)
         self.ocr           = InvoiceOCR(languages=settings.ocr_languages, use_gpu=False)
@@ -242,20 +248,31 @@ class InvoicePipeline:
                 except Exception as ex:
                     logger.debug(f"stage_callback error: {ex}")
 
-        # ── Stage 1: Pre-processing ──────────────────────────────────────────
-        _notify("preprocessing", 1, 15, "Pre-processing: Deskew, denoise & auto-orient")
+        # ── Stage 1: Document Routing & Pre-processing ──────────────────────────
+        _notify("preprocessing", 1, 10, "Document Routing: Analyzing type & quality")
+        routing = self.document_router.route(file_bytes, filename=filename)
+        quality_score = 1.0
+
         if suffix in self.SUPPORTED_PDF_FORMATS:
-            logger.info(f"[{job_id}] Stage 2: PDF → dual-path conversion")
+            logger.info(f"[{job_id}] Stage 2: PDF → dual-path conversion (Route: {routing.doc_type})")
             pages = self.pdf_converter.convert_bytes(file_bytes)
+            if pages and hasattr(pages[0], "image"):
+                qa = self.quality_scorer.assess(pages[0].image)
+                quality_score = qa.composite_score
         elif suffix in self.SUPPORTED_IMAGE_FORMATS:
-            logger.info(f"[{job_id}] Stage 2: Image pre-processing")
-            page = self.preprocessor.process(file_bytes)
+            logger.info(f"[{job_id}] Stage 2: Image pre-processing (Route: {routing.doc_type})")
+            qa = self.quality_scorer.assess(file_bytes)
+            quality_score = qa.composite_score
+            if routing.doc_type == DocumentRouter.PHONE_PHOTO:
+                page = self.preprocessor.process_photo(file_bytes)
+            else:
+                page = self.preprocessor.process(file_bytes)
             pages = [page]
         else:
             raise ValueError(f"Unsupported file format: {suffix}")
 
         page_count = len(pages)
-        logger.info(f"[{job_id}] {page_count} page(s) to process")
+        logger.info(f"[{job_id}] {page_count} page(s) to process (Quality: {quality_score:.2f})")
 
         # ── Stage 2: Per-page Detection + Text Extraction ───────────────────
         combined_ocr_results: dict[str, OCRResult] = {}
@@ -263,6 +280,7 @@ class InvoicePipeline:
         detected_models:      list[str]            = []
         extracted_per_page                         = []
         path_summary:         list[str]            = []
+        all_page_regions:     list                 = []
 
         for p_idx, p_obj in enumerate(pages):
             logger.info(f"[{job_id}] Processing Page {p_idx + 1}/{page_count}...")
@@ -271,6 +289,7 @@ class InvoicePipeline:
             _notify("detection", 2, 35, f"Region Detection: YOLOv8 identifying zones (Page {p_idx + 1}/{page_count})")
             det_res = self.detector.detect(p_obj.image)
             detected_models.append(det_res.model_used)
+            all_page_regions.append(det_res.regions)
             logger.info(
                 f"[{job_id}] Page {p_idx+1}: {len(det_res.regions)} regions "
                 f"via {det_res.model_used}"
@@ -374,7 +393,11 @@ class InvoicePipeline:
 
             img_w, img_h = 1200, 1600
             if pages:
-                img_w, img_h = pages[0].image.size
+                img = pages[0].image
+                if hasattr(img, "shape"):
+                    img_h, img_w = img.shape[:2]
+                elif hasattr(img, "size"):
+                    img_w, img_h = img.size
 
             tpl_id = compute_template_fingerprint(
                 img_w, img_h, all_region_dicts, vendor_gstin=invoice_schema.vendor_gstin

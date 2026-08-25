@@ -314,4 +314,124 @@ class InvoicePreprocessor:
 
         return img, 0
 
+    def process_photo(self, image_input) -> PreprocessResult:
+        """
+        Specialized pipeline for smartphone camera captures:
+        1. Auto-orient thumbnail
+        2. Detect document quadrilateral contour and warp perspective
+        3. Remove shadows and normalize lighting gradients
+        4. CLAHE contrast enhancement
+        5. DPI normalization & sharpening
+        """
+        img = self._load(image_input)
+        original_size = (img.shape[1], img.shape[0])
+        logger.info(f"Photo pre-process — Input size: {original_size[0]}x{original_size[1]}")
+
+        img, orient_angle = self._auto_orient(img)
+        img, was_warped = self._warp_perspective(img)
+        img = self._remove_shadows(img)
+        img = self._normalise_dpi(img)
+        img = self._enhance_handwriting_contrast(img)
+        img, angle = self._deskew(img)
+        img = self._sharpen(img)
+
+        processed_size = (img.shape[1], img.shape[0])
+        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+        logger.info(
+            f"Photo pre-processing complete: {original_size} → {processed_size}, "
+            f"warped={was_warped}, orient={orient_angle}°, deskew={angle:.2f}°"
+        )
+
+        return PreprocessResult(
+            image=img,
+            pil_image=pil_img,
+            original_size=original_size,
+            processed_size=processed_size,
+            deskew_angle=angle,
+            was_binarized=False,
+        )
+
+    def _remove_shadows(self, img: np.ndarray) -> np.ndarray:
+        """
+        Removes non-uniform shadows and lighting falloff by dividing
+        the image by its estimated background illumination map.
+        """
+        try:
+            rgb_planes = cv2.split(img)
+            result_planes = []
+            for plane in rgb_planes:
+                dilated = cv2.dilate(plane, np.ones((7, 7), np.uint8))
+                bg_blur = cv2.medianBlur(dilated, 21)
+                diff = 255 - cv2.absdiff(plane, bg_blur)
+                norm = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+                result_planes.append(norm)
+            return cv2.merge(result_planes)
+        except Exception as e:
+            logger.debug(f"Shadow removal fallback: {e}")
+            return img
+
+    def _warp_perspective(self, img: np.ndarray) -> tuple[np.ndarray, bool]:
+        """
+        Finds the 4 largest document corners and applies perspective rectification.
+        """
+        try:
+            h, w = img.shape[:2]
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blur, 50, 200)
+
+            contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+            contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+            doc_contour = None
+            for c in contours:
+                peri = cv2.arcLength(c, True)
+                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                if len(approx) == 4 and cv2.contourArea(c) > (w * h * 0.30):
+                    doc_contour = approx
+                    break
+
+            if doc_contour is None:
+                return img, False
+
+            pts = doc_contour.reshape(4, 2)
+            rect = self._order_points(pts)
+            (tl, tr, br, bl) = rect
+
+            width_a = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+            width_b = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+            max_w = max(int(width_a), int(width_b))
+
+            height_a = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+            height_b = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+            max_h = max(int(height_a), int(height_b))
+
+            dst = np.array([
+                [0, 0],
+                [max_w - 1, 0],
+                [max_w - 1, max_h - 1],
+                [0, max_h - 1]
+            ], dtype="float32")
+
+            M = cv2.getPerspectiveTransform(rect, dst)
+            warped = cv2.warpPerspective(img, M, (max_w, max_h))
+            logger.debug(f"Perspective warped from photo boundary ({max_w}x{max_h})")
+            return warped, True
+        except Exception as e:
+            logger.debug(f"Perspective warp skipped: {e}")
+            return img, False
+
+    def _order_points(self, pts: np.ndarray) -> np.ndarray:
+        """Orders coordinates: [top-left, top-right, bottom-right, bottom-left]."""
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
+
 

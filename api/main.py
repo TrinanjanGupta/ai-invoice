@@ -5,6 +5,8 @@ All routes for invoice upload, job status, review, and output download.
 
 import uuid
 import json
+import hashlib
+from datetime import datetime
 import asyncio
 import tempfile
 from pathlib import Path
@@ -235,10 +237,11 @@ async def upload_invoice(
 
     job_id = str(uuid.uuid4())
     filename = file.filename or f"invoice_{job_id}.{suffix}"
+    doc_hash = hashlib.sha256(file_bytes).hexdigest()
 
     # Store to DB
     db: DatabaseManager = app.state.db
-    await db.create_job(job_id=job_id, filename=filename)
+    await db.create_job(job_id=job_id, filename=filename, document_hash=doc_hash)
 
     # Save local copy to data/raw for instant document viewing
     try:
@@ -1473,18 +1476,33 @@ async def _run_pipeline_task(
             pdf_key = f"output/{job_id}/invoice.pdf"
             minio.upload_pdf(result.pdf_path, pdf_key)
 
+        manifest = {
+            "pipeline_version": "2.0.0",
+            "ocr_engine": "paddleocr-v3",
+            "yolo_model": str(settings.yolo_model_path),
+            "layoutlm_model": str(settings.layoutlm_model_path),
+            "llm_model": str(settings.ollama_model),
+            "timestamp": datetime.now().isoformat(),
+            "model_used": getattr(result, "model_used", "hybrid"),
+        }
+
         await db.update_job(
             job_id,
             status="done",
             output_json=result.invoice.model_dump(),
             ai_output_json=result.invoice.model_dump(),
+            model_manifest=manifest,
+            document_type=getattr(result, "doc_type", "unknown"),
+            quality_score=getattr(result, "quality_score", 1.0),
             field_confidences=result.invoice.field_confidences,
             review_status="auto_accepted" if not result.invoice.needs_review else "pending",
+            ground_truth_source="auto_accepted" if not result.invoice.needs_review else "partial",
             output_pdf_key=pdf_key,
             storage_key=storage_key,
             overall_confidence=result.invoice.overall_confidence,
             needs_review=result.invoice.needs_review,
             review_reasons=result.invoice.review_reasons,
+            page_count=getattr(result, "page_count", 1),
         )
         # Push terminal "done" event so SSE clients close immediately
         _push_progress(job_id, {
@@ -1705,3 +1723,4 @@ else:
         "React UI dist not found — run  cd review_ui && npm run build  "
         "to enable LAN hosting via FastAPI."
     )
+
