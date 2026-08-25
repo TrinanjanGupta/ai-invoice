@@ -360,28 +360,42 @@ class InvoicePipeline:
             if next_p.line_items:
                 extracted.line_items.extend(next_p.line_items)
 
-        # Global heuristic pass over authoritative full-page text (or combined if no full page)
+        # Capture raw layoutlm prediction snapshot before heuristic merge and LLM fallback
+        layoutlm_snapshot = {
+            f: getattr(extracted, f).value
+            for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
+            if getattr(extracted, f, None) and getattr(extracted, f).value
+        }
+
+        # Global heuristic pass over authoritative full-page text
         _notify("understanding", 4, 88, "AI Understanding: Synthesizing line items & taxes")
         full_page_ocrs = {k: v for k, v in combined_ocr_results.items() if "full_page" in k}
         heuristic_input = full_page_ocrs if full_page_ocrs else combined_ocr_results
         global_heuristic = self.extractor._extract_heuristic(heuristic_input)
+        heuristic_snapshot = {
+            f: getattr(global_heuristic, f).value
+            for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
+            if getattr(global_heuristic, f, None) and getattr(global_heuristic, f).value
+        }
         extracted = self.extractor._merge_invoices(extracted, global_heuristic)
 
         # ── Stage 4b: LLM fallback ───────────────────────────────────────────
         _notify("llm", 5, 90, "LLM Fallback: Checking confidence & completeness")
         logger.info(f"[{job_id}] Stage 4b: LLM confidence check")
-        self.llm.enhance_low_confidence_fields(
+        llm_preds = self.llm.enhance_low_confidence_fields(
             extracted,
             all_raw_ocr_texts,
             confidence_threshold=self.settings.llm_fallback_threshold,
-        )
+        ) or {}
 
         # ── Stage 4c: Validation ─────────────────────────────────────────────
         _notify("validation", 6, 95, "Validation: Rules engine & arithmetic reconciliation")
         logger.info(f"[{job_id}] Stage 4c: Validation")
         invoice_schema, validation_report = self.validator.validate(extracted)
 
-        # ── Template Fingerprinting & Disagreement Analysis ────────────────
+        # ── Template Fingerprinting & 3-Model Disagreement Analysis ────────
+        has_contradiction = False
+        is_novel = False
         try:
             from active_learning.template_fingerprint import compute_template_fingerprint, TemplateManager
             from active_learning.disagreement_engine import evaluate_model_disagreement
@@ -403,26 +417,43 @@ class InvoicePipeline:
                 img_w, img_h, all_region_dicts, vendor_gstin=invoice_schema.vendor_gstin
             )
             tpl_info = TemplateManager().register_invoice(tpl_id, vendor_name=invoice_schema.vendor_name)
+            is_novel = tpl_info.get("is_novel", False)
 
             disagreement_res = evaluate_model_disagreement(
-                layoutlm_preds=extracted.model_dump() if hasattr(extracted, "model_dump") else {},
-                heuristic_preds=invoice_schema.model_dump(),
+                layoutlm_preds=layoutlm_snapshot,
+                heuristic_preds=heuristic_snapshot,
+                llm_preds=llm_preds,
             )
 
+            has_contradiction = bool(disagreement_res.get("has_contradiction", False))
             invoice_schema.template_id = tpl_id
-            invoice_schema.is_novel_template = tpl_info.get("is_novel", False)
+            invoice_schema.is_novel_template = is_novel
             invoice_schema.disagreement_score = disagreement_res.get("disagreement_score", 0.0)
-            if invoice_schema.is_novel_template:
+            if is_novel:
                 invoice_schema.review_reasons.append(f"Novel layout template ({tpl_id})")
-            if disagreement_res.get("has_contradiction"):
-                invoice_schema.needs_review = True
+            if has_contradiction:
                 for d in disagreement_res.get("disagreements", []):
                     invoice_schema.review_reasons.append(d["reason"])
         except Exception as tpl_ex:
             logger.debug(f"Template/disagreement error: {tpl_ex}")
 
+        # ── Stage 4d: Centralized Auto-Acceptance Gate ────────────────────────
+        from validation.acceptance_gate import AutoAcceptanceGate
+        is_auto_accepted, rejection_reasons = AutoAcceptanceGate.evaluate(
+            invoice=invoice_schema,
+            validation_report=validation_report,
+            quality_score=quality_score,
+            has_contradiction=has_contradiction,
+            is_novel_template=is_novel,
+            doc_type=routing.doc_type,
+        )
+
+        invoice_schema.needs_review = not is_auto_accepted
+        if not is_auto_accepted:
+            invoice_schema.review_reasons = list(dict.fromkeys(invoice_schema.review_reasons + rejection_reasons))
+
         # ── Stage 5: Render ──────────────────────────────────────────────────
-        logger.info(f"[{job_id}] Stage 5: Rendering output")
+        logger.info(f"[{job_id}] Stage 5: Rendering output (Auto-Accepted: {is_auto_accepted})")
         html_output = self.renderer.to_html(invoice_schema)
 
         pdf_path = None

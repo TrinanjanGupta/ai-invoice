@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     llm_fallback_threshold: float = 0.60
     max_file_size_mb: int = 50
     supported_formats: str = "pdf,jpg,jpeg,png,tiff,webp"
+    cors_origins: str = "*"
 
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"

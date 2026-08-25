@@ -75,9 +75,13 @@ def compute_template_fingerprint(
     return f"tpl_{hash_digest}"
 
 
+REGISTRY_FILE = Path("data/templates_registry.json")
+
+
 class TemplateManager:
     """
-    Maintains active template registry and historical learning stats.
+    Maintains persistent template registry and historical learning stats.
+    Saves state to disk (data/templates_registry.json) so learned templates survive restarts.
     """
     _instance = None
 
@@ -85,7 +89,26 @@ class TemplateManager:
         if not cls._instance:
             cls._instance = super(TemplateManager, cls).__new__(cls)
             cls._instance._registry = {}
+            cls._instance._load_registry()
         return cls._instance
+
+    def _load_registry(self):
+        try:
+            if REGISTRY_FILE.exists():
+                with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
+                    self._registry = json.load(f)
+                logger.info(f"Loaded {len(self._registry)} layout templates from {REGISTRY_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not load templates registry: {e}")
+            self._registry = {}
+
+    def _save_registry(self):
+        try:
+            REGISTRY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._registry, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save templates registry: {e}")
 
     def register_invoice(
         self,
@@ -104,10 +127,12 @@ class TemplateManager:
             is_novel = True
         else:
             self._registry[template_id]["total_invoices"] += 1
-            if vendor_name and not self._registry[template_id]["known_vendor"]:
+            if vendor_name and not self._registry[template_id].get("known_vendor"):
                 self._registry[template_id]["known_vendor"] = vendor_name
             is_novel = self._registry[template_id]["total_invoices"] < 3
             self._registry[template_id]["is_novel"] = is_novel
+
+        self._save_registry()
 
         return {
             "template_id": template_id,
@@ -115,3 +140,4 @@ class TemplateManager:
             "total_seen": self._registry[template_id]["total_invoices"],
             "known_vendor": self._registry[template_id]["known_vendor"],
         }
+

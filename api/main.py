@@ -98,9 +98,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+settings = get_settings()
+_cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins if _cors_origins else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -352,62 +355,7 @@ async def upload_batch_invoices(
     )
 
 
-@app.get("/api/invoices/{job_id}", response_model=JobStatusResponse, tags=["Invoices"])
-async def get_invoice_status(job_id: str):
-    """Poll job status and get extracted invoice data when complete."""
-    db: DatabaseManager = app.state.db
-    record = await db.get_job(job_id)
-    if not record:
-        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
 
-    builder_data = None
-    if record.output_json:
-        try:
-            from validation.validator import InvoiceSchema
-            schema_obj = InvoiceSchema(**record.output_json)
-            builder_data = schema_obj.to_invoice_builder_json()
-        except Exception:
-            pass
-
-    # Real-time pipeline stage calculation
-    prog = _active_job_progress.get(job_id, {})
-    cur_stage = prog.get("stage")
-    cur_idx = prog.get("stage_index", 0)
-    cur_label = prog.get("stage_label")
-    cur_pct = prog.get("progress_pct", 0)
-
-    if record.status in ["done", "reviewed", "partially_reviewed"]:
-        cur_stage = "done"
-        cur_idx = 6
-        cur_label = "Complete"
-        cur_pct = 100
-    elif record.status == "failed":
-        cur_stage = "failed"
-        cur_idx = 0
-        cur_label = record.error_message or "Failed"
-        cur_pct = 0
-    elif record.status == "processing" and not cur_stage:
-        cur_stage = "preprocessing"
-        cur_idx = 1
-        cur_label = "Pre-processing: Analyzing document"
-        cur_pct = 15
-
-    return JobStatusResponse(
-        job_id=record.job_id,
-        status=record.status,
-        filename=record.filename,
-        stage=cur_stage,
-        stage_index=cur_idx,
-        stage_label=cur_label,
-        progress_pct=cur_pct,
-        invoice=record.output_json,
-        invoice_builder_data=builder_data,
-        overall_confidence=record.overall_confidence,
-        needs_review=record.needs_review,
-        review_reasons=record.review_reasons or [],
-        error_message=record.error_message,
-        created_at=str(record.created_at),
-    )
 
 @app.get("/api/invoices/{job_id}/stream", tags=["Invoices"])
 async def stream_job_progress(job_id: str, request: Request):
@@ -529,15 +477,42 @@ async def get_invoice(job_id: str):
         except Exception as e:
             logger.warning(f"Failed to normalize invoice data for {job_id}: {e}")
 
+    # Real-time pipeline stage calculation
+    prog = _active_job_progress.get(job_id, {})
+    cur_stage = prog.get("stage")
+    cur_idx = prog.get("stage_index", 0)
+    cur_label = prog.get("stage_label")
+    cur_pct = prog.get("progress_pct", 0)
+
+    if record.status in ["done", "reviewed", "partially_reviewed"]:
+        cur_stage = "done"
+        cur_idx = 6
+        cur_label = "Complete"
+        cur_pct = 100
+    elif record.status == "failed":
+        cur_stage = "failed"
+        cur_idx = 0
+        cur_label = record.error_message or "Failed"
+        cur_pct = 0
+    elif record.status == "processing" and not cur_stage:
+        cur_stage = "preprocessing"
+        cur_idx = 1
+        cur_label = "Pre-processing: Analyzing document"
+        cur_pct = 15
+
     return JobStatusResponse(
         job_id=record.job_id,
         status=record.status,
         filename=record.filename,
+        stage=cur_stage,
+        stage_index=cur_idx,
+        stage_label=cur_label,
+        progress_pct=cur_pct,
+        invoice=invoice_dict,
+        invoice_builder_data=builder_data,
         overall_confidence=record.overall_confidence,
         needs_review=record.needs_review,
         review_reasons=record.review_reasons or [],
-        invoice=invoice_dict,
-        invoice_builder_data=builder_data,
         error_message=record.error_message,
         created_at=str(record.created_at),
     )

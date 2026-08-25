@@ -470,3 +470,5 @@ class OllamaClient:
             logger.info(f"LLM enhanced {enhanced_count}/{len(missing_fields)} low-confidence fields")
         else:
             logger.warning("LLM batch call returned no usable values")
+
+        return results

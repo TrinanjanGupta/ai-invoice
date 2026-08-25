@@ -112,25 +112,60 @@ class ProcessFileLock:
             pass
 
 
-def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str, float]:
+def _resolve_image_path(raw_path: str, test_dir: Path) -> Optional[Path]:
+    """
+    Robust image path resolver for locked test holdouts.
+    Checks absolute paths, paths relative to test_dir, project root, and data directories.
+    """
+    if not raw_path:
+        return None
+    p = Path(raw_path)
+    if p.is_absolute() and p.exists():
+        return p
+    candidates = [
+        test_dir / p,
+        test_dir / p.name,
+        test_dir / "images" / p.name,
+        Path("data") / p,
+        Path("data") / p.name,
+        Path("data/raw") / p.name,
+        Path(".") / p,
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    return None
+
+
+def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str, Any]:
     """
     Evaluates a LayoutLM model on the permanently locked holdout test set.
     Calculates true Entity-Level Precision, Recall, F1 and critical financial field accuracies.
+    Fails closed (returns status: EVALUATION_FAILED, entity_f1: 0.0) on any missing data or error.
     """
-    if not test_dir.exists() or not list(test_dir.rglob("*.json")):
-        logger.warning(f"Locked test directory empty at {test_dir}. Using validation metrics.")
+    json_files = list(test_dir.rglob("*.json")) if test_dir.exists() else []
+    expected_samples = len(json_files)
+
+    if expected_samples == 0:
+        logger.error(f"Locked test directory empty or missing at {test_dir}. Failing closed.")
         return {
-            "entity_f1": 0.82,
-            "entity_precision": 0.83,
-            "entity_recall": 0.81,
-            "overall_accuracy": 0.85,
-            "grand_total_acc": 0.90,
-            "gstin_acc": 0.85,
+            "status": "EVALUATION_FAILED",
+            "entity_f1": 0.0,
+            "entity_precision": 0.0,
+            "entity_recall": 0.0,
+            "overall_accuracy": 0.0,
+            "grand_total_acc": 0.0,
+            "gstin_acc": 0.0,
+            "expected_samples": 0,
+            "evaluated_samples": 0,
+            "skipped_samples": 0,
+            "error": "Locked test directory empty or missing",
         }
 
     try:
         from transformers import LayoutLMv3ForTokenClassification, LayoutLMv3Processor
         import torch
+        from PIL import Image
 
         processor = LayoutLMv3Processor.from_pretrained(str(model_path), apply_ocr=False)
         model = LayoutLMv3ForTokenClassification.from_pretrained(str(model_path))
@@ -145,97 +180,141 @@ def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str,
         gstin_total = 0
         gstin_correct = 0
 
-        for jf in test_dir.rglob("*.json"):
-            with open(jf, "r", encoding="utf-8") as f:
-                sample = json.load(f)
+        evaluated_samples = 0
+        skipped_samples = 0
+
+        for jf in json_files:
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    sample = json.load(f)
+            except Exception as read_ex:
+                logger.warning(f"Could not read locked sample {jf}: {read_ex}")
+                skipped_samples += 1
+                continue
 
             words = sample.get("words", [])
             boxes = sample.get("boxes", [])
             labels = sample.get("labels", [])
             if not words or not boxes or not labels:
+                skipped_samples += 1
                 continue
 
-            img_path = test_dir / sample.get("image_path", "")
-            if not img_path.exists():
+            img_path = _resolve_image_path(sample.get("image_path", ""), test_dir)
+            if not img_path or not img_path.exists():
+                logger.warning(f"Locked test sample {jf.name} missing image file ({sample.get('image_path')})")
+                skipped_samples += 1
                 continue
 
-            from PIL import Image
-            img = Image.open(img_path).convert("RGB")
+            try:
+                img = Image.open(img_path).convert("RGB")
+                encoding = processor(
+                    img,
+                    words,
+                    boxes=boxes,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                )
 
-            encoding = processor(
-                img,
-                words,
-                boxes=boxes,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-            )
+                with torch.no_grad():
+                    outputs = model(**encoding)
 
-            with torch.no_grad():
-                outputs = model(**encoding)
+                logits = outputs.logits
+                preds = torch.argmax(logits, dim=-1).squeeze().tolist()
+                if isinstance(preds, int):
+                    preds = [preds]
 
-            logits = outputs.logits
-            preds = torch.argmax(logits, dim=-1).squeeze().tolist()
-            if isinstance(preds, int):
-                preds = [preds]
+                word_ids = encoding.word_ids(0)
+                seen_words = set()
 
-            word_ids = encoding.word_ids(0)
-            seen_words = set()
+                for idx, w_id in enumerate(word_ids):
+                    if w_id is None or w_id in seen_words or w_id >= len(labels):
+                        continue
+                    seen_words.add(w_id)
 
-            for idx, w_id in enumerate(word_ids):
-                if w_id is None or w_id in seen_words or w_id >= len(labels):
-                    continue
-                seen_words.add(w_id)
+                    pred_id = preds[idx] if idx < len(preds) else 0
+                    pred_label = model.config.id2label.get(pred_id, "O")
+                    true_label = labels[w_id]
 
-                pred_id = preds[idx] if idx < len(preds) else 0
-                pred_label = model.config.id2label.get(pred_id, "O")
-                true_label = labels[w_id]
+                    # True Entity Evaluation Metrics
+                    if true_label != "O" and pred_label == true_label:
+                        tp += 1
+                    elif true_label == "O" and pred_label != "O":
+                        fp += 1
+                    elif true_label != "O" and pred_label == "O":
+                        fn += 1
+                    elif true_label != "O" and pred_label != "O" and pred_label != true_label:
+                        fp += 1
+                        fn += 1
 
-                # True Entity Evaluation Metrics
-                if true_label != "O" and pred_label == true_label:
-                    tp += 1
-                elif true_label == "O" and pred_label != "O":
-                    fp += 1
-                elif true_label != "O" and pred_label == "O":
-                    fn += 1
-                elif true_label != "O" and pred_label != "O" and pred_label != true_label:
-                    fp += 1
-                    fn += 1
+                    if "GRAND_TOTAL" in true_label:
+                        grand_total_total += 1
+                        if pred_label == true_label:
+                            grand_total_correct += 1
 
-                if "GRAND_TOTAL" in true_label:
-                    grand_total_total += 1
-                    if pred_label == true_label:
-                        grand_total_correct += 1
+                    if "GSTIN" in true_label:
+                        gstin_total += 1
+                        if pred_label == true_label:
+                            gstin_correct += 1
 
-                if "GSTIN" in true_label:
-                    gstin_total += 1
-                    if pred_label == true_label:
-                        gstin_correct += 1
+                evaluated_samples += 1
+            except Exception as sample_ex:
+                logger.warning(f"Failed to evaluate sample {jf.name}: {sample_ex}")
+                skipped_samples += 1
+
+        logger.info(
+            f"Locked Test Evaluation: expected={expected_samples}, evaluated={evaluated_samples}, skipped={skipped_samples}"
+        )
+
+        if evaluated_samples == 0:
+            logger.error("Zero locked test samples could be evaluated. Failing closed.")
+            return {
+                "status": "EVALUATION_FAILED",
+                "entity_f1": 0.0,
+                "entity_precision": 0.0,
+                "entity_recall": 0.0,
+                "overall_accuracy": 0.0,
+                "grand_total_acc": 0.0,
+                "gstin_acc": 0.0,
+                "expected_samples": expected_samples,
+                "evaluated_samples": 0,
+                "skipped_samples": skipped_samples,
+                "error": "No valid samples evaluated",
+            }
 
         prec = tp / max(1, (tp + fp))
         rec = tp / max(1, (tp + fn))
         f1 = (2 * prec * rec) / max(1e-6, (prec + rec))
 
-        gt_acc = (grand_total_correct / max(1, grand_total_total)) if grand_total_total > 0 else 0.90
-        gstin_acc = (gstin_correct / max(1, gstin_total)) if gstin_total > 0 else 0.85
+        gt_acc = (grand_total_correct / max(1, grand_total_total)) if grand_total_total > 0 else 0.0
+        gstin_acc = (gstin_correct / max(1, gstin_total)) if gstin_total > 0 else 0.0
 
         return {
+            "status": "SUCCESS",
             "entity_f1": round(f1, 4),
             "entity_precision": round(prec, 4),
             "entity_recall": round(rec, 4),
             "overall_accuracy": round(f1, 4),
             "grand_total_acc": round(gt_acc, 4),
             "gstin_acc": round(gstin_acc, 4),
+            "expected_samples": expected_samples,
+            "evaluated_samples": evaluated_samples,
+            "skipped_samples": skipped_samples,
         }
     except Exception as e:
         logger.error(f"Error during locked test evaluation: {e}")
         return {
-            "entity_f1": 0.80,
-            "entity_precision": 0.80,
-            "entity_recall": 0.80,
-            "overall_accuracy": 0.82,
-            "grand_total_acc": 0.85,
-            "gstin_acc": 0.80,
+            "status": "EVALUATION_FAILED",
+            "entity_f1": 0.0,
+            "entity_precision": 0.0,
+            "entity_recall": 0.0,
+            "overall_accuracy": 0.0,
+            "grand_total_acc": 0.0,
+            "gstin_acc": 0.0,
+            "expected_samples": expected_samples,
+            "evaluated_samples": 0,
+            "skipped_samples": expected_samples,
+            "error": str(e),
         }
 
 
@@ -287,8 +366,8 @@ async def check_retraining_trigger(min_corrections: int = 20) -> dict[str, Any]:
 
 async def run_champion_challenger_retraining(epochs: int = 10, force: bool = False) -> dict[str, Any]:
     """
-    Executes candidate training run, benchmarks against locked holdout with true Entity F1,
-    and runs the Champion/Challenger promotion gate. Updates last_training_attempt_gold unconditionally.
+    Executes autonomous Champion/Challenger retraining pipeline.
+    Runs training and evaluation off the event loop via asyncio.to_thread.
     """
     file_lock = ProcessFileLock(TRAINING_LOCK_FILE)
     if not file_lock.acquire() and not force:
@@ -302,7 +381,7 @@ async def run_champion_challenger_retraining(epochs: int = 10, force: bool = Fal
 
     async with _TRAINING_LOCK:
         try:
-            logger.info("Starting Champion/Challenger auto-retraining pipeline...")
+            logger.info("🚀 Initiating Champion/Challenger LayoutLM Retraining Cycle...")
             meta = get_champion_metadata()
             champion_f1 = meta.get("entity_f1", 0.75)
             champion_gt_acc = meta.get("grand_total_accuracy", 0.85)
@@ -321,15 +400,16 @@ async def run_champion_challenger_retraining(epochs: int = 10, force: bool = Fal
                 exclude_locked_test=True,
             )
 
-            # 3. Clean and Train candidate model
+            # 3. Clean and Train candidate model off the event loop
             if CANDIDATE_MODEL_DIR.exists():
                 shutil.rmtree(CANDIDATE_MODEL_DIR, ignore_errors=True)
             CANDIDATE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
             from scripts.train_layoutlm import train_layoutlm
 
-            logger.info(f"Training candidate LayoutLMv3 model for {epochs} epochs...")
-            train_res = train_layoutlm(
+            logger.info(f"Training candidate LayoutLMv3 model for {epochs} epochs (off event loop)...")
+            train_res = await asyncio.to_thread(
+                train_layoutlm,
                 data_dir=str(CANDIDATE_DATASET_DIR),
                 output_dir=str(CANDIDATE_MODEL_DIR),
                 epochs=epochs,
@@ -339,13 +419,30 @@ async def run_champion_challenger_retraining(epochs: int = 10, force: bool = Fal
             if train_res.get("status") == "FAILED":
                 return {"status": "FAILED", "error": train_res.get("error")}
 
-            # 4. Evaluate Candidate on Immutable Locked Test Holdout
+            # 4. Evaluate Candidate on Immutable Locked Test Holdout (off event loop)
             logger.info(f"Evaluating candidate model on locked test holdout ({LOCKED_TEST_DIR})...")
-            eval_res = evaluate_model_on_locked_test(CANDIDATE_MODEL_DIR, LOCKED_TEST_DIR)
-            candidate_f1 = eval_res.get("entity_f1", 0.80)
-            candidate_prec = eval_res.get("entity_precision", 0.80)
-            candidate_rec = eval_res.get("entity_recall", 0.80)
-            candidate_gt_acc = eval_res.get("grand_total_acc", 0.85)
+            eval_res = await asyncio.to_thread(
+                evaluate_model_on_locked_test,
+                CANDIDATE_MODEL_DIR,
+                LOCKED_TEST_DIR,
+            )
+
+            # Fail closed check
+            if eval_res.get("status") == "EVALUATION_FAILED":
+                logger.error(f"❌ Candidate evaluation failed closed: {eval_res.get('error')}. Discarding candidate.")
+                shutil.rmtree(CANDIDATE_MODEL_DIR, ignore_errors=True)
+                save_champion_metadata(meta)
+                return {
+                    "status": "REJECTED",
+                    "message": f"Candidate evaluation failed closed: {eval_res.get('error')}",
+                    "champion_f1": champion_f1,
+                    "candidate_f1": 0.0,
+                }
+
+            candidate_f1 = eval_res.get("entity_f1", 0.0)
+            candidate_prec = eval_res.get("entity_precision", 0.0)
+            candidate_rec = eval_res.get("entity_recall", 0.0)
+            candidate_gt_acc = eval_res.get("grand_total_acc", 0.0)
 
             logger.info(f"Locked Test Results: Candidate Entity F1: {candidate_f1:.4f} (Prec: {candidate_prec:.4f}, Rec: {candidate_rec:.4f}) | Champion F1: {champion_f1:.4f}")
             logger.info(f"Financial Totals Accuracy: Candidate: {candidate_gt_acc:.4f} | Champion: {champion_gt_acc:.4f}")
