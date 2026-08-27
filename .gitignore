@@ -68,16 +68,23 @@ labels.cache
 # Invoices, Datasets & Annotations (Sensitive/Large data)
 # ===================================================================
 data/raw/
+data/uploads/
 data/images_to_annotate/
 data/annotations/
 data/layoutlm_dataset/
+data/layoutlm_candidate_dataset/
+data/candidate_models/
+data/archive/
 data/outputs/
 data/temp_raw/
 data/evaluation/
+data/templates_registry.json
+data/models/*.lock
 output/
 output/debug_viz/
 *.zip
 *.tar.gz
+*.lock
 
 # ===================================================================
 # Label Studio Local State & SQLite DBs
@@ -94,6 +101,7 @@ label-studio/
 .cache/
 .easyocr/
 .paddleocr/
+.paddlex/
 .torch/
 .huggingface/
 
@@ -102,6 +110,7 @@ label-studio/
 # ===================================================================
 review_ui/node_modules/
 review_ui/dist/
+review_ui/.vite/
 node_modules/
 
 # ===================================================================

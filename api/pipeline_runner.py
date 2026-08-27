@@ -212,6 +212,13 @@ class InvoicePipeline:
         self.llm      = OllamaClient(
             base_url=settings.ollama_base_url,
             model=settings.ollama_model,
+            vision_model=getattr(settings, "ollama_vision_model", "minicpm-v:latest"),
+            timeout=getattr(settings, "ollama_timeout", 60.0),
+            enabled=getattr(settings, "enable_llm_fallback", True),
+            num_ctx=getattr(settings, "ollama_num_ctx", 2048),
+            keep_alive=getattr(settings, "ollama_keep_alive", "15m"),
+            num_thread=getattr(settings, "ollama_num_thread", None),
+            enable_vision=getattr(settings, "enable_vision_fallback", False),
         )
         self.validator = InvoiceValidator()
         self.renderer  = InvoiceRenderer()
@@ -221,7 +228,8 @@ class InvoicePipeline:
         logger.info(f"   OCR Engine:      {self.ocr.engine_name}")
         logger.info(f"   Detector:        {'DocLayout-YOLO' if self.detector.is_doclaynet else ('Custom-YOLO' if self.detector.model else 'Heuristic')}")
         logger.info(f"   LayoutLM Model:  {settings.layoutlm_model_path if Path(settings.layoutlm_model_path).exists() else 'Heuristic Fallback'}")
-        logger.info(f"   Ollama LLM:      {settings.ollama_model} ({settings.ollama_base_url})")
+        llm_status = f"{settings.ollama_model} ({settings.ollama_base_url}, timeout={getattr(settings, 'ollama_timeout', 60.0)}s)" if getattr(settings, 'enable_llm_fallback', True) else "Disabled"
+        logger.info(f"   Ollama LLM:      {llm_status}")
         logger.info("=" * 65)
 
     def process(
@@ -259,6 +267,11 @@ class InvoicePipeline:
             if pages and hasattr(pages[0], "image"):
                 qa = self.quality_scorer.assess(pages[0].image)
                 quality_score = qa.composite_score
+                # If PDF raster is detected as a phone photo, apply illumination normalization
+                if routing.doc_type == DocumentRouter.PHONE_PHOTO:
+                    for p in pages:
+                        if hasattr(p, "image") and isinstance(p.image, np.ndarray):
+                            p.image = self.preprocessor._remove_shadows(p.image)
         elif suffix in self.SUPPORTED_IMAGE_FORMATS:
             logger.info(f"[{job_id}] Stage 2: Image pre-processing (Route: {routing.doc_type})")
             qa = self.quality_scorer.assess(file_bytes)
@@ -380,13 +393,20 @@ class InvoicePipeline:
         extracted = self.extractor._merge_invoices(extracted, global_heuristic)
 
         # ── Stage 4b: LLM fallback ───────────────────────────────────────────
-        _notify("llm", 5, 90, "LLM Fallback: Checking confidence & completeness")
-        logger.info(f"[{job_id}] Stage 4b: LLM confidence check")
-        llm_preds = self.llm.enhance_low_confidence_fields(
-            extracted,
-            all_raw_ocr_texts,
-            confidence_threshold=self.settings.llm_fallback_threshold,
-        ) or {}
+        if self.settings.enable_llm_fallback and self.llm.is_available():
+            _notify("llm", 5, 90, "LLM Fallback: Checking confidence & completeness")
+            logger.info(f"[{job_id}] Stage 4b: LLM confidence check ({self.settings.ollama_model})")
+            page_imgs = [p.image for p in pages if hasattr(p, "image") and p.image is not None]
+            llm_preds = self.llm.enhance_low_confidence_fields(
+                extracted,
+                all_raw_ocr_texts,
+                confidence_threshold=self.settings.llm_fallback_threshold,
+                page_images=page_imgs,
+            ) or {}
+        else:
+            _notify("llm", 5, 90, "LLM Fallback: Skipped (disabled or offline)")
+            logger.info(f"[{job_id}] Stage 4b: LLM fallback skipped (using LayoutLM/OCR heuristic extractions)")
+            llm_preds = {}
 
         # ── Stage 4c: Validation ─────────────────────────────────────────────
         _notify("validation", 6, 95, "Validation: Rules engine & arithmetic reconciliation")

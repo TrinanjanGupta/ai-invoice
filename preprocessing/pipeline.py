@@ -135,18 +135,17 @@ class InvoicePreprocessor:
 
     def _normalise_dpi(self, img: np.ndarray) -> np.ndarray:
         """
-        Upscale images that are too small for reliable OCR.
-        We target a minimum of 1200px on the long edge, which corresponds
-        to roughly 300 DPI for a typical A4 invoice.
+        Upscale images that are too small for reliable OCR and table extraction.
+        Target 2200px on the long edge (corresponding to ~300 DPI A4) using Lanczos/Cubic interpolation.
         """
         h, w = img.shape[:2]
         long_edge = max(h, w)
-        if long_edge < 1200:
-            scale = 1200 / long_edge
-            new_w = int(w * scale)
-            new_h = int(h * scale)
+        if long_edge < 2200:
+            scale = 2200.0 / long_edge
+            new_w = int(round(w * scale))
+            new_h = int(round(h * scale))
             img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-            logger.debug(f"Upscaled {w}x{h} → {new_w}x{new_h}")
+            logger.debug(f"High-res DPI normalization: {w}x{h} → {new_w}x{new_h} (scale={scale:.2f})")
         return img
 
     def _enhance_handwriting_contrast(self, img: np.ndarray) -> np.ndarray:

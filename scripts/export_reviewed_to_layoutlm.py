@@ -323,7 +323,8 @@ async def export_layoutlm_dataset(
     max_samples: Optional[int] = None,
     include_line_items: bool = False,
     exclude_locked_test: bool = True,
-):
+    include_job_ids: Optional[set[str]] = None,
+) -> list[str]:
     settings = get_settings()
     db = DatabaseManager(settings.database_url)
     await db.init_db()
@@ -390,7 +391,7 @@ async def export_layoutlm_dataset(
     jobs = deduped_jobs
 
     # Exclude locked holdout evaluation set if requested
-    if exclude_locked_test:
+    if exclude_locked_test and not include_job_ids:
         locked_file = Path("data/evaluation/locked_test/locked_job_ids.json")
         if locked_file.exists():
             try:
@@ -402,6 +403,12 @@ async def export_layoutlm_dataset(
                     logger.info(f"Excluded {prev_len - len(jobs)} locked test samples from training dataset.")
             except Exception as e:
                 logger.warning(f"Could not load locked test IDs: {e}")
+
+    # Explicitly filter by include_job_ids if specified (e.g. for locked test set construction)
+    if include_job_ids:
+        prev_len = len(jobs)
+        jobs = [j for j in jobs if j.job_id in include_job_ids]
+        logger.info(f"Filtered for {len(jobs)} explicitly requested job IDs (out of {len(include_job_ids)} target IDs).")
 
     if max_samples and max_samples > 0:
         jobs = jobs[:max_samples]
@@ -574,13 +581,17 @@ async def export_layoutlm_dataset(
     print(f"{'OVERALL ALIGNMENT':<26} | {total_matched:<8} | {total_gt:<8} | {overall_pct:>10.1f}%")
     print("=" * 65 + "\n")
 
-    if len(samples) == 1:
+    if val_ratio <= 0.0 or len(samples) <= 1:
         train_set = samples
-        val_set = samples
+        val_set = []
     else:
-        val_count = max(1, int(len(samples) * val_ratio))
-        val_set = samples[:val_count]
-        train_set = samples[val_count:]
+        import random
+        shuffled = list(samples)
+        random.seed(42)
+        random.shuffle(shuffled)
+        val_count = max(1, int(len(shuffled) * val_ratio))
+        val_set = shuffled[:val_count]
+        train_set = shuffled[val_count:]
 
     for s in train_set:
         with open(train_dir / f"{s['job_id']}.json", "w", encoding="utf-8") as f:
@@ -616,6 +627,29 @@ async def export_layoutlm_dataset(
         print("=" * 65 + "\n")
     else:
         logger.error("Dataset QA validation failed. Please check the reported defects.")
+
+    return [s["job_id"] for s in samples]
+
+
+def export_dataset(
+    output_dir: Path | str = "data/layoutlm_dataset",
+    val_ratio: float = 0.2,
+    tier: str = "human_verified",
+    max_samples: Optional[int] = None,
+    include_line_items: bool = False,
+    exclude_locked_test: bool = True,
+    include_job_ids: Optional[set[str]] = None,
+) -> list[str]:
+    """Synchronous helper wrapper around export_layoutlm_dataset."""
+    return asyncio.run(export_layoutlm_dataset(
+        output_dir=str(output_dir),
+        val_ratio=val_ratio,
+        tier=tier,
+        max_samples=max_samples,
+        include_line_items=include_line_items,
+        exclude_locked_test=exclude_locked_test,
+        include_job_ids=include_job_ids,
+    ))
 
 
 if __name__ == "__main__":

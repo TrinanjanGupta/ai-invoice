@@ -222,10 +222,12 @@ export default function InvoiceListPage() {
     try {
       toast.loading('Champion/Challenger auto-retraining started...', { id: 'retrain' })
       const { data } = await axios.post('/api/active-learning/auto-train?epochs=10')
+      const f1 = data.champion_f1 ?? data.champion_accuracy ?? data.candidate_f1 ?? 0
       if (data.status === 'PROMOTED') {
-        toast.success(`🏆 Candidate promoted! New accuracy: ${(data.champion_accuracy * 100).toFixed(1)}%`, { id: 'retrain' })
+        toast.success(`🏆 Candidate promoted! Entity F1: ${(f1 * 100).toFixed(1)}%`, { id: 'retrain' })
       } else {
-        toast.error(`❌ Model rejected: Candidate accuracy was ${(data.candidate_accuracy * 100).toFixed(1)}%`, { id: 'retrain' })
+        const candF1 = data.candidate_f1 ?? data.candidate_accuracy ?? 0
+        toast.error(`❌ Model kept champion: Candidate F1 was ${(candF1 * 100).toFixed(1)}%`, { id: 'retrain' })
       }
       fetchTrainingStatus()
       fetchJobs({}, true)

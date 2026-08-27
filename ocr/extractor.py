@@ -1,8 +1,33 @@
 import os
+import warnings
+
+# Suppress noisy library logs & dependency warnings
+warnings.filterwarnings("ignore")
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["FLAGS_enable_onednn"] = "0"
 os.environ["PADDLE_DISABLE_PIR"] = "1"
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["PADDLE_PDX_LOG_LEVEL"] = "ERROR"
+os.environ["ORT_LOG_LEVEL"] = "3"
+
+try:
+    import onnxruntime as ort
+    ort.set_default_logger_severity(3)
+except Exception:
+    pass
+
+import logging as py_logging
+try:
+    from paddlex.utils import logging as pdx_logging
+    py_logging.getLogger(pdx_logging.LOGGER_NAME).setLevel(py_logging.ERROR)
+except Exception:
+    pass
+
+try:
+    import torch  # Preload PyTorch OpenMP runtime to prevent DLL collisions on Windows
+except Exception:
+    pass
 
 import numpy as np
 from PIL import Image
@@ -243,7 +268,12 @@ class InvoiceOCR:
         self._init_ocr()
 
     def _init_ocr(self):
-        easyocr_langs = ["bn", "en"] if "bn" in self.languages else ["hi", "en"] if "hi" in self.languages else ["en"]
+        # Support combined Latin + Indic scripts in EasyOCR
+        available_easyocr = {"en", "hi", "bn", "ta", "te", "mr", "gu", "kn", "ur"}
+        configured_langs = [l for l in self.languages if l in available_easyocr]
+        if "en" not in configured_langs:
+            configured_langs.append("en")
+        easyocr_langs = configured_langs or ["en"]
         if self.preferred_engine == "easyocr":
             try:
                 import easyocr
@@ -257,11 +287,25 @@ class InvoiceOCR:
         try:
             from paddleocr import PaddleOCR
             try:
-                self._ocr = PaddleOCR(use_angle_cls=False, lang=self.primary_lang, use_gpu=self.use_gpu, enable_mkldnn=False)
+                self._ocr = PaddleOCR(
+                    lang=self.primary_lang,
+                    engine="onnxruntime",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
             except Exception:
-                self._ocr = PaddleOCR(lang=self.primary_lang)
+                try:
+                    self._ocr = PaddleOCR(
+                        lang=self.primary_lang,
+                        use_doc_orientation_classify=False,
+                        use_doc_unwarping=False,
+                        use_textline_orientation=False,
+                    )
+                except Exception:
+                    self._ocr = PaddleOCR(lang=self.primary_lang)
             self.engine_name = "PaddleOCR"
-            logger.info(f"[OCR] Initialised ENGINE: PaddleOCR (lang={self.primary_lang}, gpu={self.use_gpu})")
+            logger.info(f"[OCR] Initialised ENGINE: PaddleOCR PP-OCRv6 (lang={self.primary_lang})")
         except (ImportError, Exception) as e:
             logger.warning(f"[OCR WARNING] PaddleOCR initialization failed ({e}). Engaging EasyOCR fallback...")
             try:
@@ -307,48 +351,85 @@ class InvoiceOCR:
             try:
                 results = self._ocr.ocr(crop)
                 if results and results[0]:
-                    for line in results[0]:
-                        if line is None:
-                            continue
-                        if isinstance(line, (list, tuple)) and len(line) >= 2:
-                            bbox = line[0]
-                            if isinstance(line[1], (list, tuple)) and len(line[1]) >= 2:
-                                text, conf = line[1][0], line[1][1]
-                            else:
-                                text, conf = str(line[1]), 0.9
+                    res0 = results[0]
+                    # PaddleX 3.7 dict output format
+                    if isinstance(res0, dict) and "rec_texts" in res0:
+                        rec_texts = res0.get("rec_texts", [])
+                        rec_scores = res0.get("rec_scores", [])
+                        rec_polys = res0.get("rec_polys", [])
+                        for i, text in enumerate(rec_texts):
                             text = str(text).strip()
-                            if text:
-                                # Extract line crop slice for pixel-grounded projection
-                                line_slice = None
-                                try:
-                                    xs = [p[0] for p in bbox]
-                                    ys = [p[1] for p in bbox]
-                                    x1, y1, x2, y2 = int(max(0, min(xs))), int(max(0, min(ys))), int(min(crop.shape[1], max(xs))), int(min(crop.shape[0], max(ys)))
-                                    if x2 > x1 and y2 > y1:
-                                        line_slice = crop[y1:y2, x1:x2]
-                                except Exception:
-                                    pass
+                            if not text:
+                                continue
+                            conf = float(rec_scores[i]) if i < len(rec_scores) else 0.90
+                            raw_poly = rec_polys[i] if i < len(rec_polys) else [[0, 0], [0, 0], [0, 0], [0, 0]]
+                            bbox = raw_poly.tolist() if hasattr(raw_poly, "tolist") else list(raw_poly)
 
-                                words = decompose_line_into_words(text, bbox, float(conf), line_image=line_slice)
-                                # Translate words to global page coordinates
-                                if offset_x != 0.0 or offset_y != 0.0:
-                                    for w in words:
-                                        w.bbox = _apply_offset_poly(w.bbox)
+                            line_slice = None
+                            try:
+                                xs = [p[0] for p in bbox]
+                                ys = [p[1] for p in bbox]
+                                x1, y1, x2, y2 = int(max(0, min(xs))), int(max(0, min(ys))), int(min(crop.shape[1], max(xs))), int(min(crop.shape[0], max(ys)))
+                                if x2 > x1 and y2 > y1:
+                                    line_slice = crop[y1:y2, x1:x2]
+                            except Exception:
+                                pass
 
-                                global_bbox = _apply_offset_poly(bbox) if (offset_x != 0.0 or offset_y != 0.0) else bbox
-                                text_blocks.append(TextBlock(
-                                    text=text,
-                                    confidence=float(conf),
-                                    bbox=global_bbox,
-                                    region_label=region_label,
-                                    words=words,
-                                ))
+                            words = decompose_line_into_words(text, bbox, float(conf), line_image=line_slice)
+                            if offset_x != 0.0 or offset_y != 0.0:
+                                for w in words:
+                                    w.bbox = _apply_offset_poly(w.bbox)
+
+                            global_bbox = _apply_offset_poly(bbox) if (offset_x != 0.0 or offset_y != 0.0) else bbox
+                            text_blocks.append(TextBlock(
+                                text=text,
+                                confidence=float(conf),
+                                bbox=global_bbox,
+                                region_label=region_label,
+                                words=words,
+                            ))
+
+                    # Legacy list-of-lines output format
+                    elif isinstance(res0, (list, tuple)):
+                        for line in res0:
+                            if line is None:
+                                continue
+                            if isinstance(line, (list, tuple)) and len(line) >= 2:
+                                bbox = line[0]
+                                if isinstance(line[1], (list, tuple)) and len(line[1]) >= 2:
+                                    text, conf = line[1][0], line[1][1]
+                                else:
+                                    text, conf = str(line[1]), 0.9
+                                text = str(text).strip()
+                                if text:
+                                    line_slice = None
+                                    try:
+                                        xs = [p[0] for p in bbox]
+                                        ys = [p[1] for p in bbox]
+                                        x1, y1, x2, y2 = int(max(0, min(xs))), int(max(0, min(ys))), int(min(crop.shape[1], max(xs))), int(min(crop.shape[0], max(ys)))
+                                        if x2 > x1 and y2 > y1:
+                                            line_slice = crop[y1:y2, x1:x2]
+                                    except Exception:
+                                        pass
+
+                                    words = decompose_line_into_words(text, bbox, float(conf), line_image=line_slice)
+                                    if offset_x != 0.0 or offset_y != 0.0:
+                                        for w in words:
+                                            w.bbox = _apply_offset_poly(w.bbox)
+
+                                    global_bbox = _apply_offset_poly(bbox) if (offset_x != 0.0 or offset_y != 0.0) else bbox
+                                    text_blocks.append(TextBlock(
+                                        text=text,
+                                        confidence=float(conf),
+                                        bbox=global_bbox,
+                                        region_label=region_label,
+                                        words=words,
+                                    ))
             except Exception as e:
-                logger.warning(f"[OCR WARNING] PaddleOCR runtime extraction error: {e}. Falling back to EasyOCR...")
-                self._ocr = None
-                self.engine_name = "EasyOCR"
+                logger.warning(f"[OCR WARNING] PaddleOCR runtime extraction on crop: {e}")
 
-        if not text_blocks:
+        # Only use EasyOCR fallback if PaddleOCR is not available at all
+        if self._ocr is None and not text_blocks:
             if self._easyocr is None:
                 try:
                     import easyocr
@@ -369,7 +450,7 @@ class InvoiceOCR:
                     else:
                         proc_crop = crop
 
-                    results = self._easyocr.readtext(proc_crop, batch_size=8, detail=1, paragraph=False)
+                    results = self._easyocr.readtext(proc_crop, batch_size=8, detail=1, paragraph=False, workers=0)
                     for line in results:
                         if line is None:
                             continue

@@ -112,28 +112,111 @@ class OllamaClient:
     """
     Ollama local LLM client for low-confidence field extraction.
     Connects to Ollama running at localhost:11434 by default.
+    Optimized for low-resource / CPU hardware with configurable context, keep-alive, and timeouts.
     """
 
     def __init__(
         self,
         base_url: str = "http://localhost:11434",
         model: str = "invoice-expert",
-        timeout: float = 3000.0,
+        vision_model: str = "minicpm-v:latest",
+        timeout: float = 60.0,
+        enabled: bool = True,
+        num_ctx: int = 2048,
+        keep_alive: str = "15m",
+        num_thread: Optional[int] = None,
+        enable_vision: bool = True,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.vision_model = vision_model
         self.timeout = timeout
+        self.enabled = enabled
+        self.num_ctx = num_ctx
+        self.keep_alive = keep_alive
+        self.num_thread = num_thread
+        self.enable_vision = enable_vision
+        self._last_check_time = 0.0
+        self._is_available_cached = False
+        self._last_vision_check_time = 0.0
+        self._is_vision_available_cached = False
+        self._resolved_vision_model: Optional[str] = None
+
+    def _build_options(self, num_predict: int = 150, temperature: float = 0.1) -> dict:
+        """Constructs lightweight runtime options for Ollama inference."""
+        opts = {
+            "temperature": temperature,
+            "num_predict": num_predict,
+            "num_ctx": self.num_ctx,
+        }
+        if self.num_thread:
+            opts["num_thread"] = self.num_thread
+        return opts
 
     def is_available(self) -> bool:
-        """Check if Ollama is running and the model is pulled."""
-        try:
-            resp = httpx.get(f"{self.base_url}/api/tags", timeout=5)
-            if resp.status_code != 200:
-                return False
-            models = [m["name"].split(":")[0] for m in resp.json().get("models", [])]
-            return self.model.split(":")[0] in models
-        except Exception:
+        """Check if Ollama is enabled, running, and the model is pulled (cached for 30s)."""
+        if not self.enabled:
             return False
+        import time
+        now = time.time()
+        if now - self._last_check_time < 30.0:
+            return self._is_available_cached
+
+        try:
+            resp = httpx.get(f"{self.base_url}/api/tags", timeout=2.0)
+            if resp.status_code != 200:
+                self._is_available_cached = False
+            else:
+                models = [m["name"].split(":")[0] for m in resp.json().get("models", [])]
+                self._is_available_cached = self.model.split(":")[0] in models
+        except Exception:
+            self._is_available_cached = False
+
+        self._last_check_time = now
+        return self._is_available_cached
+
+    def is_vision_available(self) -> bool:
+        """Check if a multimodal Vision model is installed in local Ollama (cached for 30s)."""
+        if not self.enabled or not self.enable_vision:
+            return False
+        import time
+        now = time.time()
+        if now - self._last_vision_check_time < 30.0:
+            return self._is_vision_available_cached
+
+        try:
+            resp = httpx.get(f"{self.base_url}/api/tags", timeout=2.0)
+            if resp.status_code != 200:
+                self._is_vision_available_cached = False
+            else:
+                installed = [m.get("name", "") for m in resp.json().get("models", [])]
+                # Prioritize minicpm-v / qwen2-vl which run across all Ollama engines
+                vision_prefixes = ["minicpm-v", "qwen2-vl", "qwen2.5-vl", "llava", "bakllava", "llama3.2-vision", "vision"]
+                found_model = None
+                # First check exact vision_model
+                for m in installed:
+                    if self.vision_model.split(":")[0].lower() in m.lower():
+                        found_model = m
+                        break
+                # If not found, check supported vision prefixes
+                if not found_model:
+                    for prefix in vision_prefixes:
+                        for m in installed:
+                            if prefix in m.lower():
+                                found_model = m
+                                break
+                        if found_model:
+                            break
+                if found_model:
+                    self._resolved_vision_model = found_model
+                    self._is_vision_available_cached = True
+                else:
+                    self._is_vision_available_cached = False
+        except Exception:
+            self._is_vision_available_cached = False
+
+        self._last_vision_check_time = now
+        return self._is_vision_available_cached
 
     def extract_field(
         self,
@@ -161,10 +244,8 @@ class OllamaClient:
                     "model": self.model,
                     "prompt": user_message,
                     "stream": False,
-                    "options": {
-                        "temperature": 0.0,   # deterministic — we want facts not creativity
-                        "num_predict": 200,
-                    },
+                    "keep_alive": self.keep_alive,
+                    "options": self._build_options(num_predict=100, temperature=0.0),
                 },
                 timeout=self.timeout,
             )
@@ -197,7 +278,7 @@ class OllamaClient:
             return ExtractedField(value="", confidence=0.0, source="llm_error")
 
     def _get_dynamic_few_shot_context(self) -> str:
-        """Fetches 1-2 verified invoices from the database as few-shot in-context learning demonstrations."""
+        """Fetches 1 verified invoice from the database as a compact few-shot demonstration."""
         try:
             import asyncio
             import concurrent.futures
@@ -216,7 +297,7 @@ class OllamaClient:
                             InvoiceRecord.needs_review == False,
                             InvoiceRecord.output_json.isnot(None)
                         )
-                        .limit(2)
+                        .limit(1)
                     )
                     return res.scalars().all()
 
@@ -233,22 +314,15 @@ class OllamaClient:
             if not records:
                 return ""
 
-            examples = []
-            for i, rec in enumerate(records):
-                clean_out = {
-                    k: v for k, v in rec.output_json.items()
-                    if k in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "buyer_name", "buyer_gstin", "subtotal", "tax_amount", "grand_total"]
-                    and v is not None
-                }
+            rec = records[0]
+            clean_out = {
+                k: v for k, v in rec.output_json.items()
+                if k in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "buyer_name", "grand_total"]
+                and v is not None
+            }
 
-                if clean_out:
-                    examples.append(
-                        f"### Example {i+1} (Verified Ground Truth from your database):\n"
-                        f"Extracted JSON:\n{json.dumps(clean_out, indent=2)}"
-                    )
-
-            if examples:
-                return "\n\n" + "\n\n".join(examples) + "\n\n"
+            if clean_out:
+                return f"\n\n### Example (Verified Ground Truth):\n{json.dumps(clean_out)}\n\n"
         except Exception as e:
             logger.debug(f"Dynamic few-shot loading skipped: {e}")
         return ""
@@ -276,11 +350,11 @@ class OllamaClient:
             lines = [l.strip() for l in full_page_text.split("\n") if l.strip()]
             if has_meta or has_parties:
                 # Top slice (Header / Parties)
-                top_slice = "\n".join(lines[:40])
+                top_slice = "\n".join(lines[:30])
                 context_parts.append(f"[DOCUMENT_HEADER_AND_PARTIES]\n{top_slice}")
             if has_totals or has_bank:
                 # Bottom slice (Totals / Bank / Payment)
-                bot_slice = "\n".join(lines[-40:])
+                bot_slice = "\n".join(lines[-30:])
                 context_parts.append(f"[DOCUMENT_TOTALS_AND_PAYMENT]\n{bot_slice}")
 
         return "\n\n".join(context_parts)
@@ -329,10 +403,8 @@ class OllamaClient:
                     "prompt": prompt,
                     "format": "json",
                     "stream": False,
-                    "options": {
-                        "temperature": 0.1,
-                        "num_predict": 500,
-                    },
+                    "keep_alive": self.keep_alive,
+                    "options": self._build_options(num_predict=150, temperature=0.1),
                 },
                 timeout=self.timeout,
             )
@@ -351,6 +423,13 @@ class OllamaClient:
                 return {k: str(v) for k, v in parsed.items() if v is not None and str(v).strip()}
             return {}
 
+        except (httpx.TimeoutException, TimeoutError):
+            logger.warning(
+                f"Ollama inference timed out after {self.timeout}s on model '{self.model}'. "
+                f"Gracefully falling back to LayoutLM/OCR extractions. "
+                f"(Tip: Set ENABLE_LLM_FALLBACK=false in .env or switch to a lightweight model like 'llama3.2:3b' or 'qwen2.5:1.5b')"
+            )
+            return {}
         except json.JSONDecodeError:
             logger.warning(f"LLM batch response was not valid JSON: {raw[:200]}")
             return {}
@@ -358,7 +437,92 @@ class OllamaClient:
             logger.warning("Ollama not reachable — batch LLM fallback skipped")
             return {}
         except Exception as e:
-            logger.error(f"Ollama batch extraction error: {e}")
+            logger.warning(f"Ollama batch extraction skipped: {e}")
+            return {}
+
+    def extract_with_vision(
+        self,
+        image_input,
+        field_names: list,
+    ) -> dict:
+        """
+        Multimodal Vision Fallback: Directly passes the document image or crop to
+        Ollama Vision models (e.g. llama3.2-vision, minicpm-v, qwen2-vl) for
+        decoding handwritten amounts, rubber stamps, or heavily skewed/degraded receipts.
+        """
+        if not self.is_vision_available():
+            logger.debug("Vision LLM model not available in Ollama — skipping vision extraction")
+            return {}
+
+        import base64
+        import io
+        from PIL import Image
+
+        model_to_use = self._resolved_vision_model or self.vision_model
+
+        try:
+            # Convert image to compressed RGB JPEG
+            if isinstance(image_input, Image.Image):
+                pil_img = image_input.convert("RGB")
+            elif hasattr(image_input, "shape"):  # numpy array
+                import cv2
+                pil_img = Image.fromarray(cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB))
+            else:
+                return {}
+
+            # Resize if large to speed up vision token encoding on CPU
+            max_dim = 800
+            w, h = pil_img.size
+            if max(w, h) > max_dim:
+                scale = max_dim / max(w, h)
+                pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.Resampling.BILINEAR)
+
+            buffered = io.BytesIO()
+            pil_img.save(buffered, format="JPEG", quality=75)
+            img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+            fields_desc = "\n".join(f"- {name}" for name in field_names)
+            prompt = (
+                "You are an expert AI Invoice Vision Extractor specialized in Indian commercial bills, handwritten receipts, and certified stamp remarks.\n"
+                "Look directly at the attached document image. Carefully inspect handwritten fields, rubber stamp annotations, and totals.\n"
+                "Extract the following fields accurately as JSON with field names as keys and extracted values as strings. Set null if not found:\n\n"
+                f"{fields_desc}\n\n"
+                "Return ONLY the JSON object, no other text."
+            )
+
+            logger.info(f"Triggering Multimodal Vision Fallback ({model_to_use}) for {len(field_names)} fields: {', '.join(field_names)}")
+            resp = httpx.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": model_to_use,
+                    "prompt": prompt,
+                    "images": [img_b64],
+                    "format": "json",
+                    "stream": False,
+                    "keep_alive": self.keep_alive,
+                    "options": self._build_options(num_predict=150, temperature=0.1),
+                },
+                timeout=self.timeout,
+            )
+
+            resp.raise_for_status()
+            raw = resp.json().get("response", "").strip()
+            if "```" in raw:
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return {k: str(v) for k, v in parsed.items() if v is not None and str(v).strip()}
+            return {}
+
+        except (httpx.TimeoutException, TimeoutError):
+            logger.warning(f"Vision LLM inference timed out after {self.timeout}s")
+            return {}
+        except Exception as e:
+            logger.warning(f"Vision LLM extraction skipped: {e}")
             return {}
 
     def enhance_low_confidence_fields(
@@ -366,6 +530,7 @@ class OllamaClient:
         invoice,   # ExtractedInvoice
         ocr_texts: dict,
         confidence_threshold: float = 0.65,
+        page_images: Optional[list] = None,
     ):
         """
         Scan all fields in an ExtractedInvoice.
@@ -465,6 +630,27 @@ class OllamaClient:
                     invoice.grand_total.confidence = min(0.85, round(invoice.grand_total.confidence + 0.10, 2))
         except Exception:
             pass
+
+        # Secondary Vision Fallback for unresolved critical fields (handwritten/stamped/noisy)
+        critical_fields = ["grand_total", "vendor_name", "invoice_number", "invoice_date", "subtotal"]
+        unresolved_critical = [
+            f for f in critical_fields
+            if getattr(invoice, f, None) is None or getattr(invoice, f).confidence < 0.50
+        ]
+
+        if unresolved_critical and page_images and self.is_vision_available():
+            logger.info(f"Engaging Multimodal Vision-LLM on raw pixels for {len(unresolved_critical)} unresolved critical fields: {unresolved_critical}")
+            vis_results = self.extract_with_vision(page_images[0], unresolved_critical)
+            for f_name, v_val in vis_results.items():
+                if f_name in unresolved_critical and v_val:
+                    v_str = str(v_val).strip()
+                    calibrated_conf = 0.78
+                    setattr(invoice, f_name, ExtractedField(
+                        value=v_str, confidence=calibrated_conf, source="vision_llm"
+                    ))
+                    results[f_name] = v_str
+                    enhanced_count += 1
+                    logger.info(f"  Vision-LLM extracted {f_name} from raw pixels (conf={calibrated_conf}): {v_str[:60]}")
 
         if enhanced_count:
             logger.info(f"LLM enhanced {enhanced_count}/{len(missing_fields)} low-confidence fields")

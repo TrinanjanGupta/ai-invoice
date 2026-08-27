@@ -139,3 +139,65 @@ def test_critical_gatekeeper_blocks_auto_accept_on_corrupt_gstin():
 def test_amount_in_words_conversion():
     words = number_to_words_inr(15600.0)
     assert "Fifteen Thousand Six Hundred" in words
+
+
+# ---------------------------------------------------------------------------
+# 5. Evaluation Fail-Closed & AutoAcceptanceGate Tests
+# ---------------------------------------------------------------------------
+
+def test_locked_evaluation_fails_closed_on_missing_or_corrupt_files(tmp_path):
+    from active_learning.auto_trainer import evaluate_model_on_locked_test
+    # 1. Empty directory
+    res = evaluate_model_on_locked_test(tmp_path, tmp_path / "empty_locked_test")
+    assert res["status"] == "EVALUATION_FAILED"
+    assert res["entity_f1"] == 0.0
+
+    # 2. Directory with corrupt sample JSON
+    corrupt_dir = tmp_path / "corrupt_locked_test"
+    (corrupt_dir / "train").mkdir(parents=True, exist_ok=True)
+    with open(corrupt_dir / "locked_job_ids.json", "w") as f:
+        import json
+        json.dump(["job_1", "job_2"], f)
+    with open(corrupt_dir / "train" / "job_1.json", "w") as f:
+        f.write("{invalid_json:")
+
+    res_corrupt = evaluate_model_on_locked_test(tmp_path, corrupt_dir)
+    assert res_corrupt["status"] == "EVALUATION_FAILED"
+    assert res_corrupt["entity_f1"] == 0.0
+
+
+def test_auto_acceptance_gate_blocks_handwritten_and_novel_templates():
+    from validation.acceptance_gate import AutoAcceptanceGate
+    from validation.validator import InvoiceSchema, ValidationReport
+
+    inv = InvoiceSchema(
+        invoice_number="INV-100",
+        invoice_date="25/08/2026",
+        vendor_gstin="27AABCU9603R1ZN",
+        grand_total=5000.0,
+        subtotal=5000.0,
+        overall_confidence=0.95,
+        field_confidences={
+            "grand_total": 0.98,
+            "invoice_number": 0.95,
+            "invoice_date": 0.95,
+            "vendor_gstin": 0.98,
+        }
+    )
+    report = ValidationReport()
+
+    # 1. Standard scan -> Auto-accepted
+    ok, reasons = AutoAcceptanceGate.evaluate(inv, report, quality_score=0.90, doc_type="PRINTED_SCAN")
+    assert ok
+    assert len(reasons) == 0
+
+    # 2. Novel layout template -> Rejected for initial verification
+    ok_novel, reasons_novel = AutoAcceptanceGate.evaluate(inv, report, quality_score=0.90, is_novel_template=True, doc_type="PRINTED_SCAN")
+    assert not ok_novel
+    assert any("layout template" in r for r in reasons_novel)
+
+    # 3. Handwritten route -> Rejected for human review
+    ok_hand, reasons_hand = AutoAcceptanceGate.evaluate(inv, report, quality_score=0.90, doc_type="HANDWRITTEN")
+    assert not ok_hand
+    assert any("HANDWRITTEN" in r for r in reasons_hand)
+

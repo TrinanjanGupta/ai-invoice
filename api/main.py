@@ -25,7 +25,7 @@ from api.models import (
     JobListResponse, HealthResponse
 )
 from api.dependencies import get_pipeline, get_db, get_minio
-from storage.db import DatabaseManager, MinIOManager
+from storage.db import DatabaseManager, MinIOManager, InvoiceRecord
 
 
 # ------------------------------------------------------------------
@@ -100,6 +100,9 @@ app = FastAPI(
 
 settings = get_settings()
 _cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
+if getattr(settings, "app_env", "development").lower() == "production":
+    if not _cors_origins or _cors_origins == ["*"]:
+        logger.warning("SECURITY WARNING: Wildcard CORS ('*') configured in production environment! Restrict to frontend origin.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -153,7 +156,7 @@ async def health_check(request: Request):
     ollama_ok = False
     if pipeline:
         try:
-            ollama_ok = pipeline.llm.is_available()
+            ollama_ok = await asyncio.to_thread(pipeline.llm.is_available)
         except Exception:
             pass
 
@@ -1227,7 +1230,8 @@ async def cancel_all_processing():
     """
     db: DatabaseManager = app.state.db
     from sqlalchemy import update
-    async with db.session_factory() as session:
+    from storage.db import InvoiceRecord
+    async with db.session() as session:
         stmt = (
             update(InvoiceRecord)
             .where(InvoiceRecord.status == "processing")
@@ -1649,6 +1653,11 @@ async def trigger_champion_retraining(epochs: int = 10):
     from active_learning.auto_trainer import run_champion_challenger_retraining
     try:
         res = await run_champion_challenger_retraining(epochs=epochs)
+        if res.get("status") == "PROMOTED":
+            pipeline = getattr(app.state, "pipeline", None)
+            if pipeline and hasattr(pipeline, "extractor"):
+                pipeline.extractor._try_load_model()
+                logger.info("Pipeline reloaded newly promoted champion LayoutLM model weights into memory.")
         return res
     except Exception as e:
         logger.exception(f"Auto-training failed: {e}")
@@ -1698,4 +1707,5 @@ else:
         "React UI dist not found — run  cd review_ui && npm run build  "
         "to enable LAN hosting via FastAPI."
     )
+
 

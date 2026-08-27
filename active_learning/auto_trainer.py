@@ -141,13 +141,11 @@ def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str,
     """
     Evaluates a LayoutLM model on the permanently locked holdout test set.
     Calculates true Entity-Level Precision, Recall, F1 and critical financial field accuracies.
-    Fails closed (returns status: EVALUATION_FAILED, entity_f1: 0.0) on any missing data or error.
+    Strictly excludes metadata.json and locked_job_ids.json from sample counts.
+    Fails closed (returns status: EVALUATION_FAILED, entity_f1: 0.0) if ANY sample is skipped or missing.
     """
-    json_files = list(test_dir.rglob("*.json")) if test_dir.exists() else []
-    expected_samples = len(json_files)
-
-    if expected_samples == 0:
-        logger.error(f"Locked test directory empty or missing at {test_dir}. Failing closed.")
+    if not test_dir.exists():
+        logger.error(f"Locked test directory missing at {test_dir}. Failing closed.")
         return {
             "status": "EVALUATION_FAILED",
             "entity_f1": 0.0,
@@ -159,7 +157,49 @@ def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str,
             "expected_samples": 0,
             "evaluated_samples": 0,
             "skipped_samples": 0,
-            "error": "Locked test directory empty or missing",
+            "error": "Locked test directory missing",
+        }
+
+    # Load ground truth locked job IDs
+    locked_ids_file = test_dir / "locked_job_ids.json"
+    expected_ids: set[str] = set()
+    if locked_ids_file.exists():
+        try:
+            with open(locked_ids_file, "r", encoding="utf-8") as lf:
+                expected_ids = set(json.load(lf))
+        except Exception as e:
+            logger.warning(f"Could not read locked_job_ids.json: {e}")
+
+    # Gather sample JSON files strictly from train/ and val/ subdirectories
+    sample_files: list[Path] = []
+    for sub in [test_dir / "train", test_dir / "val"]:
+        if sub.exists():
+            for f in sub.glob("*.json"):
+                if f.name not in ("locked_job_ids.json", "metadata.json"):
+                    sample_files.append(f)
+
+    # Fallback to root only if no train/val subdirs exist
+    if not sample_files:
+        for f in test_dir.glob("*.json"):
+            if f.name not in ("locked_job_ids.json", "metadata.json"):
+                sample_files.append(f)
+
+    expected_samples = len(expected_ids) if expected_ids else len(sample_files)
+
+    if expected_samples == 0 or len(sample_files) == 0:
+        logger.error(f"Locked test directory contains zero test sample JSONs at {test_dir}. Failing closed.")
+        return {
+            "status": "EVALUATION_FAILED",
+            "entity_f1": 0.0,
+            "entity_precision": 0.0,
+            "entity_recall": 0.0,
+            "overall_accuracy": 0.0,
+            "grand_total_acc": 0.0,
+            "gstin_acc": 0.0,
+            "expected_samples": expected_samples,
+            "evaluated_samples": 0,
+            "skipped_samples": 0,
+            "error": "Zero locked test sample files found",
         }
 
     try:
@@ -183,7 +223,7 @@ def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str,
         evaluated_samples = 0
         skipped_samples = 0
 
-        for jf in json_files:
+        for jf in sample_files:
             try:
                 with open(jf, "r", encoding="utf-8") as f:
                     sample = json.load(f)
@@ -192,10 +232,16 @@ def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str,
                 skipped_samples += 1
                 continue
 
+            if not isinstance(sample, dict):
+                logger.warning(f"Locked test sample {jf.name} is not a dictionary ({type(sample)}). Skipping.")
+                skipped_samples += 1
+                continue
+
             words = sample.get("words", [])
             boxes = sample.get("boxes", [])
             labels = sample.get("labels", [])
             if not words or not boxes or not labels:
+                logger.warning(f"Locked test sample {jf.name} missing words/boxes/labels")
                 skipped_samples += 1
                 continue
 
@@ -266,8 +312,11 @@ def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str,
             f"Locked Test Evaluation: expected={expected_samples}, evaluated={evaluated_samples}, skipped={skipped_samples}"
         )
 
-        if evaluated_samples == 0:
-            logger.error("Zero locked test samples could be evaluated. Failing closed.")
+        # Zero-Tolerance Evaluation Integrity Rule: ALL expected samples must evaluate successfully
+        if evaluated_samples != expected_samples or skipped_samples > 0 or evaluated_samples == 0:
+            logger.error(
+                f"Evaluation integrity failure! Expected={expected_samples}, Evaluated={evaluated_samples}, Skipped={skipped_samples}. Failing closed."
+            )
             return {
                 "status": "EVALUATION_FAILED",
                 "entity_f1": 0.0,
@@ -277,9 +326,9 @@ def evaluate_model_on_locked_test(model_path: Path, test_dir: Path) -> dict[str,
                 "grand_total_acc": 0.0,
                 "gstin_acc": 0.0,
                 "expected_samples": expected_samples,
-                "evaluated_samples": 0,
+                "evaluated_samples": evaluated_samples,
                 "skipped_samples": skipped_samples,
-                "error": "No valid samples evaluated",
+                "error": f"Evaluation integrity failure: expected {expected_samples}, evaluated {evaluated_samples}, skipped {skipped_samples}",
             }
 
         prec = tp / max(1, (tp + fp))
@@ -385,6 +434,12 @@ async def run_champion_challenger_retraining(epochs: int = 10, force: bool = Fal
             meta = get_champion_metadata()
             champion_f1 = meta.get("entity_f1", 0.75)
             champion_gt_acc = meta.get("grand_total_accuracy", 0.85)
+
+            # Advance last_training_attempt_gold immediately at start of run to prevent infinite retry loops
+            trigger_info = await check_retraining_trigger(min_corrections=1)
+            current_gold = trigger_info.get("current_gold_corrections", 0)
+            meta["last_training_attempt_gold"] = current_gold
+            save_champion_metadata(meta)
 
             # 1. Ensure Locked Test Set exists
             if not (LOCKED_TEST_DIR / "locked_job_ids.json").exists():

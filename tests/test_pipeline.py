@@ -457,6 +457,34 @@ class TestOllamaClient:
         assert "[TOTALS_BLOCK]" in ctx_totals
         assert "Grand Total: 5000.00" in ctx_totals
 
+    @patch("llm_fallback.ollama_client.httpx.get")
+    @patch("llm_fallback.ollama_client.httpx.post")
+    def test_vision_fallback_with_mock_model(self, mock_post, mock_get):
+        from llm_fallback.ollama_client import OllamaClient
+        import numpy as np
+        from PIL import Image
+
+        # Mock Ollama listing vision model
+        mock_get_resp = MagicMock()
+        mock_get_resp.status_code = 200
+        mock_get_resp.json.return_value = {"models": [{"name": "llama3.2-vision:latest"}]}
+        mock_get.return_value = mock_get_resp
+
+        # Mock Ollama Vision response
+        mock_post_resp = MagicMock()
+        mock_post_resp.status_code = 200
+        mock_post_resp.json.return_value = {"response": '{"grand_total": "12500.00", "vendor_name": "Vision Vendor Ltd"}'}
+        mock_post_resp.raise_for_status = MagicMock()
+        mock_post.return_value = mock_post_resp
+
+        client = OllamaClient()
+        assert client.is_vision_available()
+
+        test_img = Image.fromarray(np.zeros((200, 200, 3), dtype=np.uint8))
+        res = client.extract_with_vision(test_img, ["grand_total", "vendor_name"])
+        assert res.get("grand_total") == "12500.00"
+        assert res.get("vendor_name") == "Vision Vendor Ltd"
+
 
 # ------------------------------------------------------------------
 # Advanced Spatial & Checksum Verification Tests
