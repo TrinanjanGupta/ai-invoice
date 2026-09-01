@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     ollama_vision_model: str = "minicpm-v:latest"
     enable_llm_fallback: bool = True
     enable_vision_fallback: bool = False
-    ollama_timeout: float = 60.0
+    ollama_timeout: float = 90.0
     ollama_num_ctx: int = 2048
     ollama_keep_alive: str = "15m"
     ollama_num_thread: Optional[int] = None

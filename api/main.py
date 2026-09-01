@@ -260,17 +260,12 @@ async def upload_invoice(
 
     db: DatabaseManager = app.state.db
 
-    # ── Upfront Document Deduplication & Idempotency Gating ─────────────────
+    # ── Check Duplicate Hash for Audit Traceability ─────────────────────────
     existing_job = await db.get_job_by_hash(doc_hash)
     if existing_job:
-        if existing_job.status in ("done", "reviewed") or (existing_job.output_json and not existing_job.needs_review):
-            logger.info(f"Document deduplication: exact hash {doc_hash[:8]} already processed as job {existing_job.job_id}")
-            return JobResponse(job_id=existing_job.job_id, status=existing_job.status, filename=existing_job.filename)
-        elif existing_job.status in ("processing", "queued"):
-            logger.info(f"Document deduplication: exact hash {doc_hash[:8]} already in progress as job {existing_job.job_id}")
-            return JobResponse(job_id=existing_job.job_id, status="processing", filename=existing_job.filename)
+        logger.info(f"Document upload: hash {doc_hash[:8]} previously processed in job {existing_job.job_id}")
 
-    # Store to DB
+    # Store fresh job to DB
     await db.create_job(job_id=job_id, filename=filename, document_hash=doc_hash)
 
     # Save local copy to data/raw for instant document viewing

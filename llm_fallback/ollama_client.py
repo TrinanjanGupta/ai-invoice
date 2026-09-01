@@ -541,25 +541,27 @@ class OllamaClient:
             logger.warning("Ollama not available — skipping LLM enhancement")
             return
 
-        fields_to_check = [
-            "invoice_number", "invoice_date", "due_date", "place_of_supply",
-            "vendor_name", "vendor_gstin",
-            "buyer_name", "buyer_gstin",
-            "grand_total", "subtotal", "tax_amount",
-            "cgst", "sgst", "igst", "round_off",
-            "bank_name", "branch_name", "account_name", "account_number", "ifsc_code",
-            "amount_in_words",
+        CRITICAL_FIELDS = [
+            "invoice_number", "invoice_date", "grand_total", "vendor_name", "vendor_gstin",
+            "buyer_name", "buyer_gstin", "subtotal", "tax_amount"
         ]
+        SECONDARY_FIELDS = [
+            "due_date", "place_of_supply", "cgst", "sgst", "igst", "round_off",
+            "bank_name", "branch_name", "account_name", "account_number", "ifsc_code",
+            "amount_in_words"
+        ]
+
+        full_ocr_combined = " ".join(ocr_texts.values()).lower() if isinstance(ocr_texts, dict) else ""
 
         missing_fields = []
         candidate_hints = []
         spatial_cands = getattr(invoice, "spatial_candidates", [])
 
-        for field_name in fields_to_check:
+        # Check critical fields first
+        for field_name in CRITICAL_FIELDS:
             current = getattr(invoice, field_name, None)
             if current is None or current.confidence < confidence_threshold:
                 missing_fields.append(field_name)
-                # Find matching spatial candidate evidence if available
                 field_cands = [c for c in spatial_cands if c.field_name == field_name]
                 if field_cands:
                     for fc in field_cands[:2]:
@@ -573,16 +575,42 @@ class OllamaClient:
                         f"Field: {field_name} | Candidate: '{current.value}' | Source: {current.source} | Conf: {current.confidence:.2f}"
                     )
 
+        # Check secondary fields only if relevant evidence or keywords exist in OCR
+        for field_name in SECONDARY_FIELDS:
+            current = getattr(invoice, field_name, None)
+            if current is None or current.confidence < confidence_threshold:
+                field_cands = [c for c in spatial_cands if c.field_name == field_name]
+                has_keywords = False
+                if "bank" in field_name or "account" in field_name or "ifsc" in field_name or "branch" in field_name:
+                    has_keywords = any(kw in full_ocr_combined for kw in ["bank", "a/c", "account", "ifsc", "branch", "neft", "rtgs"])
+                elif "gst" in field_name or "tax" in field_name:
+                    has_keywords = any(kw in full_ocr_combined for kw in ["cgst", "sgst", "igst", "tax"])
+                elif "round" in field_name:
+                    has_keywords = "round" in full_ocr_combined
+                elif "words" in field_name:
+                    has_keywords = any(kw in full_ocr_combined for kw in ["rupees", "only", "words"])
+                else:
+                    has_keywords = True
+
+                if field_cands or has_keywords:
+                    missing_fields.append(field_name)
+                    if field_cands:
+                        for fc in field_cands[:2]:
+                            candidate_hints.append(
+                                f"Field: {field_name} | Candidate: '{fc.value}' | Bbox: {fc.bbox} | "
+                                f"Nearby Label: '{fc.nearby_label}' | Label Bbox: {fc.label_bbox} | "
+                                f"Distance: {fc.distance_px:.0f}px | Conf: {fc.confidence:.2f} | Region: {fc.region}"
+                            )
+
         if not missing_fields:
-            logger.info("All fields above confidence threshold — no LLM fallback needed")
+            logger.info("All relevant fields above confidence threshold — no LLM fallback needed")
             return
 
-        logger.info(
-            f"LLM batch fallback for {len(missing_fields)} low-confidence fields: "
-            f"{', '.join(missing_fields)}"
-        )
+        # Cap batch size to top 6 most important fields to guarantee fast inference
+        fields_to_query = missing_fields[:6]
+        logger.info(f"LLM targeted fallback for {len(fields_to_query)} fields: {', '.join(fields_to_query)}")
 
-        results = self._extract_multiple_fields_batch(missing_fields, ocr_texts, candidate_hints=candidate_hints)
+        results = self._extract_multiple_fields_batch(fields_to_query, ocr_texts, candidate_hints=candidate_hints)
 
         enhanced_count = 0
         gstin_pattern = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z\d]{1}[Z]{1}[A-Z\d]{1}$")

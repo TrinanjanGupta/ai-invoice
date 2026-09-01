@@ -253,15 +253,16 @@ class LayoutLMExtractor:
     IFSC_PATTERN = re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b")
     DATE_PATTERNS = [
         re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b"),
+        re.compile(r"\b(\d{1,2})[\.](\d{1,2})[\.](\d{2,4})\b"),
         re.compile(r"\b(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+(\d{2,4})\b", re.IGNORECASE),
-        re.compile(r"\b(\d{1,2})[-](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-](\d{2,4})\b", re.IGNORECASE),
+        re.compile(r"\b(\d{1,2})[-.](Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*[-.](\d{2,4})\b", re.IGNORECASE),
         re.compile(r"\b(\d{2})(\d{2})/(\d{4})\b"),  # e.g. 0307/2026 -> 03/07/2026
     ]
     AMOUNT_PATTERN = re.compile(r"(?:\u20b9|Rs\.?|INR|USD|\$)?\s*(\d[\d,]*\.\d{1,2}|\d{2,}[\d,]*)")
     EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}\b")
     PHONE_PATTERN = re.compile(r"\b(?:\+91[-\s]?)?[6-9]\d{9}\b")
     INVOICE_NUM_PATTERN = re.compile(
-        r"(?:invoice\s*(?:no|number|#)|inv\.?\s*(?:no\.?|#)|bill\s*no\.?\s*(?:&|and)?\s*bd\s*date|bill\s*(?:no|number|#)|reference\s*no|ref\s*no\.?|sanction\s*no|memo\s*no|voucher\s*no|token\s*no|challan\s*no)[\s:=]*([A-Z0-9/_-]{2,30})",
+        r"(?:tax\s*invoice\s*(?:no|number|#|id)|invoice\s*(?:no|number|#|id)|inv\.?\s*(?:no\.?|#|id)|bill\s*no\.?\s*(?:&|and)?\s*bd\s*date|bill\s*(?:no|number|#)|reference\s*no|ref\s*no\.?|sanction\s*no|memo\s*no|voucher\s*no|token\s*no|challan\s*no)[\s:=]*([A-Z0-9/_-]{2,30})",
         re.IGNORECASE
     )
 

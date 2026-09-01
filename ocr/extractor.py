@@ -236,10 +236,10 @@ def decompose_line_into_words(
 
 @dataclass
 class OCRResult:
-    region_label: str
-    text_blocks: list[TextBlock]
-    full_text: str      # concatenated text of the region with preserved newlines
-    avg_confidence: float
+    region_label: str = "full_page"
+    text_blocks: list[TextBlock] = field(default_factory=list)
+    full_text: str = ""      # concatenated text of the region with preserved newlines
+    avg_confidence: float = 0.0
     engine: str = "paddleocr"  # "paddleocr" or "easyocr" or "native_pdf"
 
 

@@ -12,6 +12,7 @@ DocumentProfile object.
 from __future__ import annotations
 import hashlib
 import re
+import difflib
 from dataclasses import dataclass, field
 from typing import Optional, Any, Union, Sequence
 
@@ -287,6 +288,17 @@ class DocumentProfile:
         if not target_tokens:
             return []
 
+        def _token_match(w_clean: str, t: str) -> bool:
+            if not w_clean or not t:
+                return False
+            if w_clean == t:
+                return True
+            if w_clean.startswith(t) and len(w_clean) <= len(t) + 2:
+                return True
+            if len(t) >= 4 and abs(len(w_clean) - len(t)) <= 1:
+                return difflib.SequenceMatcher(None, w_clean, t).ratio() >= 0.85
+            return False
+
         target_words = self.words if page is None else [w for w in self.words if w.page == page]
         matches: list[list[WordToken]] = []
 
@@ -294,7 +306,7 @@ class DocumentProfile:
             t = target_tokens[0]
             for w in target_words:
                 w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
-                if w_clean == t or t in w_clean:
+                if _token_match(w_clean, t):
                     matches.append([w])
             return matches
 
@@ -307,7 +319,7 @@ class DocumentProfile:
             matched_all = True
             for w, t in zip(window, target_tokens):
                 w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
-                if w_clean != t and t not in w_clean:
+                if not _token_match(w_clean, t):
                     matched_all = False
                     break
             if matched_all:

@@ -67,13 +67,41 @@ PageResult = Union[NativePDFPage, PreprocessResult]
 # Helpers
 # ---------------------------------------------------------------------------
 
-_DIGITAL_CHAR_THRESHOLD = 50    # pages with ≥ this many chars are considered digital
+_DIGITAL_CHAR_THRESHOLD = 50    # pages with ≥ this many chars are considered candidates for digital
 
 
 def _is_digital_page(page: pymupdf.Page) -> bool:
-    """Return True if the page has an embedded text layer (not a scanned image)."""
+    """
+    Return True if the page has a true digital native vector text layer (e.g. from Tally, ERP, Zoho, QuickBooks).
+    Returns False for scanned document PDFs with embedded raster scans (e.g. Adobe Scan, CamScanner, phone photos).
+    """
     text = page.get_text("text")
-    return len(text.strip()) >= _DIGITAL_CHAR_THRESHOLD
+    if len(text.strip()) < _DIGITAL_CHAR_THRESHOLD:
+        return False
+
+    # Check for embedded raster images (e.g. scanned page with invisible OCR overlay)
+    images = page.get_images()
+    if images:
+        doc = page.parent
+        meta = doc.metadata or {}
+        creator = (meta.get("creator") or "").lower()
+        producer = (meta.get("producer") or "").lower()
+        title = (meta.get("title") or "").lower()
+
+        is_scanner_app = any(s in creator or s in producer or s in title for s in ("adobe scan", "camscanner", "scanner", "scan", "genius scan", "clear scanner"))
+        if is_scanner_app:
+            return False
+
+        for img_info in images:
+            try:
+                base_img = doc.extract_image(img_info[0])
+                if base_img and base_img.get("width", 0) > 400 and base_img.get("height", 0) > 400:
+                    if len(text.strip()) < 500:
+                        return False
+            except Exception:
+                pass
+
+    return True
 
 
 def _extract_native_words(page: pymupdf.Page) -> list[NativeWord]:

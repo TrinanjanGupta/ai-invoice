@@ -198,18 +198,6 @@ class InvoicePipeline:
     SUPPORTED_IMAGE_FORMATS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp", ".bmp"}
     SUPPORTED_PDF_FORMATS   = {".pdf"}
 
-    def __init__(
-        self,
-        settings: Settings,
-        db: Optional[Any] = None,
-        db_manager: Optional[Any] = None,
-        minio_manager: Optional[Any] = None,
-    ):
-        self.settings = settings
-        self.db = db_manager or db
-        self.minio = minio_manager
-        logger.info("Initialising Invoice Pipeline...")
-
     @staticmethod
     def _assign_tokens_to_regions(full_page_ocr: OCRResult, regions: list) -> dict[str, OCRResult]:
         """Spatially intersects full-page OCR tokens into YOLO regions, eliminating duplicate OCR passes."""
@@ -218,7 +206,7 @@ class InvoicePipeline:
             rx1, ry1, rx2, ry2 = getattr(r, "bbox", [0, 0, 0, 0])
             matching_blocks = []
             for b in full_page_ocr.text_blocks:
-                bx1, by1, bx2, by2 = b.bbox
+                bx1, by1, bx2, by2 = b.to_xyxy() if hasattr(b, "to_xyxy") else b.bbox
                 if bx1 >= rx1 - 10 and by1 >= ry1 - 10 and bx2 <= rx2 + 10 and by2 <= ry2 + 10:
                     matching_blocks.append(b)
                 elif not (bx2 < rx1 or bx1 > rx2 or by2 < ry1 or by1 > ry2):
@@ -236,6 +224,18 @@ class InvoicePipeline:
                 )
         return results
 
+    def __init__(
+        self,
+        settings: Settings,
+        db: Optional[Any] = None,
+        db_manager: Optional[Any] = None,
+        minio_manager: Optional[Any] = None,
+    ):
+        self.settings = settings
+        self.db = db_manager or db
+        self.minio = minio_manager
+        logger.info("Initialising Invoice Pipeline...")
+
         self.preprocessor = InvoicePreprocessor()
         self.quality_scorer = DocumentQualityScorer()
         self.document_router = DocumentRouter()
@@ -247,7 +247,7 @@ class InvoicePipeline:
             base_model=settings.layoutlm_base_model,
         )
         self.table_extractor = TableExtractor()
-        self.template_retriever = TemplateRetriever(db_manager=db)
+        self.template_retriever = TemplateRetriever(db_manager=self.db)
         self.template_extractor = TemplateExtractor()
         self.llm      = OllamaClient(
             base_url=settings.ollama_base_url,
@@ -401,7 +401,16 @@ class InvoicePipeline:
         # ── Stage 2b: Multi-Invoice Document Segmentation ────────────────────
         from preprocessing.document_segmenter import DocumentSegmenter
         segmenter = DocumentSegmenter()
-        page_texts = {p_idx + 1: combined_ocr_results.get(f"full_page_p{p_idx+1}", OCRResult()).full_text for p_idx in range(page_count)}
+        page_texts = {}
+        for p_idx in range(page_count):
+            p_num = p_idx + 1
+            if f"full_page_p{p_num}" in combined_ocr_results:
+                page_texts[p_num] = combined_ocr_results[f"full_page_p{p_num}"].full_text
+            else:
+                page_texts[p_num] = "\n".join(
+                    ocr_res.full_text for k, ocr_res in combined_ocr_results.items()
+                    if f"_p{p_num}" in k and hasattr(ocr_res, "full_text")
+                )
         segments = segmenter.segment(page_texts)
         if len(segments) > 1:
             logger.info(f"[{job_id}] Merged multi-invoice upload detected ({len(segments)} sub-invoices).")

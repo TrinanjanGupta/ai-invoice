@@ -54,16 +54,50 @@ class DocumentRouter:
     ) -> DocumentRoutingDecision:
         suffix = Path(filename).suffix.lower()
 
-        # 1. Check for Digital Vector PDF (Native text stream)
+        # 1. Check for Digital Vector PDF (Native text stream) vs Scanned PDF (Adobe Scan / CamScanner)
         if suffix == ".pdf" or file_bytes.startswith(b"%PDF"):
             try:
                 doc = pymupdf.open(stream=file_bytes, filetype="pdf")
                 if len(doc) > 0:
                     page = doc[0]
                     words = page.get_text("words")
+                    meta = doc.metadata or {}
+                    creator = (meta.get("creator") or "").lower()
+                    producer = (meta.get("producer") or "").lower()
+                    title = (meta.get("title") or "").lower()
+                    fn_lower = filename.lower()
+
+                    is_scanner_app = any(s in creator or s in producer or s in title or s in fn_lower for s in ("adobe scan", "camscanner", "scanner", "scan ", "scan_", "genius scan", "clear scanner"))
+
+                    images = page.get_images()
+                    has_full_page_raster = False
+                    if images:
+                        for img_info in images:
+                            try:
+                                base_img = doc.extract_image(img_info[0])
+                                if base_img and base_img.get("width", 0) > 400 and base_img.get("height", 0) > 400:
+                                    has_full_page_raster = True
+                                    break
+                            except Exception:
+                                pass
+
                     doc.close()
-                    # If page has substantial selectable words (> 15 words)
-                    if len(words) >= 15:
+
+                    # Scanned PDF (e.g. Adobe Scan / phone capture) -> Route to PRINTED_SCAN so PaddleOCR performs high-precision OCR
+                    if is_scanner_app or (has_full_page_raster and len(words) < 250):
+                        logger.info(f"[Router] Detected Scanned PDF (scanner_app={is_scanner_app}, full_raster={has_full_page_raster}) -> Routing to PRINTED_SCAN")
+                        return DocumentRoutingDecision(
+                            doc_type=self.PRINTED_SCAN,
+                            confidence=0.95,
+                            is_digital_native=False,
+                            requires_perspective_warp=False,
+                            requires_shadow_removal=True,
+                            requires_stroke_enhancement=False,
+                            reason=f"Scanned document PDF with background raster image detected ({len(words)} vector words)",
+                        )
+
+                    # True Digital Vector PDF (e.g. Tally, SAP, Zoho, QuickBooks)
+                    if len(words) >= 15 and not has_full_page_raster:
                         logger.info(f"[Router] Detected DIGITAL_PDF ({len(words)} vector words on page 1)")
                         return DocumentRoutingDecision(
                             doc_type=self.DIGITAL_PDF,

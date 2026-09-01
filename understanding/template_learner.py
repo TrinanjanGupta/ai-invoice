@@ -25,25 +25,109 @@ from understanding.template_retriever import TemplateRetriever, CachedTemplateVe
 
 
 FIELD_ANCHOR_CANDIDATES = {
-    "invoice_number": ["invoice no", "inv no", "bill no", "invoice #", "voucher no", "bill number", "sl no"],
-    "invoice_date": ["invoice date", "dated", "bill date", "date of issue", "date:"],
-    "due_date": ["due date", "payment due", "pay by"],
-    "po_number": ["po no", "order no", "purchase order"],
-    "place_of_supply": ["place of supply", "state/ut code", "supply state"],
-    "buyer_name": ["bill to", "billed to", "consignee", "buyer", "customer"],
-    "vendor_name": ["tax invoice", "invoice", "vendor"],
-    "vendor_gstin": ["gstin", "gst no", "vendor gstin"],
-    "buyer_gstin": ["buyer gstin", "gstin"],
-    "subtotal": ["sub total", "subtotal", "taxable value", "taxable amount", "total before tax"],
-    "cgst": ["+cgst :", "+cgst", "cgst amt", "cgst amount", "central tax", "cgst"],
-    "sgst": ["+sgst :", "+sgst", "sgst amt", "sgst amount", "state tax", "sgst", "utgst"],
-    "igst": ["+igst :", "+igst", "igst amt", "igst amount", "integrated tax", "igst"],
-    "tax_amount": ["gst total", "total tax", "tax amount", "gst amount", "tax total"],
-    "discount": ["discount", "less discount", "trade discount", "global discount"],
-    "round_off": ["round off", "roundoff", "rounding"],
-    "grand_total": ["grand total", "total payable", "net amount", "total amount", "total:", "net payable"],
-    "account_number": ["account no", "ac no", "a/c no", "bank a/c"],
-    "ifsc_code": ["ifsc", "ifsc code"],
+    "invoice_number": [
+        "invoice no", "inv no", "bill no", "invoice #", "inv #", "bill #", "invoice id", "bill id",
+        "voucher no", "bill number", "sl no", "serial no", "ref no", "reference no", "memo no", "challan no"
+    ],
+    "invoice_date": [
+        "invoice date", "dated", "bill date", "date of issue", "date:", "date", "inv date", "bill dt", "inv dt", "dt:"
+    ],
+    "due_date": [
+        "due date", "payment due", "pay by", "due dt"
+    ],
+    "po_number": [
+        "po no", "order no", "purchase order", "po number", "wo no", "work order"
+    ],
+    "place_of_supply": [
+        "place of supply", "state/ut code", "supply state", "pos", "state code"
+    ],
+    "buyer_name": [
+        "bill to", "billed to", "consignee", "buyer", "customer", "party name", "client", "m/s", "to:"
+    ],
+    "buyer_address": [
+        "bill to", "billed to", "consignee address", "buyer address", "customer address", "address:"
+    ],
+    "buyer_address_line1": [
+        "bill to", "billed to", "consignee", "buyer", "customer"
+    ],
+    "buyer_address_line2": [
+        "bill to", "billed to", "consignee", "buyer"
+    ],
+    "buyer_phone": [
+        "phone", "mobile", "ph:", "mob:", "tel:"
+    ],
+    "buyer_gstin": [
+        "buyer gstin", "buyer gst", "party gstin", "gstin/uin", "gstin", "gst no"
+    ],
+    "vendor_name": [
+        "tax invoice", "retail invoice", "bill of supply", "cash memo", "invoice", "vendor", "from:", "m/s"
+    ],
+    "vendor_address": [
+        "tax invoice", "retail invoice", "invoice", "address"
+    ],
+    "vendor_address_line1": [
+        "tax invoice", "retail invoice", "invoice"
+    ],
+    "vendor_address_line2": [
+        "tax invoice", "retail invoice", "invoice"
+    ],
+    "vendor_gstin": [
+        "vendor gstin", "gstin/uin", "gstin", "gst no", "gstn"
+    ],
+    "vendor_pan": [
+        "pan", "pan no", "vendor pan"
+    ],
+    "vendor_phone": [
+        "phone", "mobile", "tel:", "ph:"
+    ],
+    "vendor_email": [
+        "email", "e-mail", "mail"
+    ],
+    "subtotal": [
+        "sub total", "sub-total", "subtotal", "taxable value", "taxable amount", "basic amount", "total before tax"
+    ],
+    "cgst": [
+        "+cgst :", "+cgst", "cgst amt", "cgst amount", "central tax", "cgst", "cgst @", "cgst rate"
+    ],
+    "sgst": [
+        "+sgst :", "+sgst", "sgst amt", "sgst amount", "state tax", "sgst", "utgst", "sgst @", "sgst rate"
+    ],
+    "igst": [
+        "+igst :", "+igst", "igst amt", "igst amount", "integrated tax", "igst", "igst @", "igst rate"
+    ],
+    "tax_amount": [
+        "gst total", "total tax", "tax amount", "gst amount", "tax total", "total gst"
+    ],
+    "discount": [
+        "discount", "less discount", "trade discount", "global discount", "disc.", "disc"
+    ],
+    "round_off": [
+        "round off", "roundoff", "rounding", "round-off"
+    ],
+    "grand_total": [
+        "grand total", "total payable", "net amount", "total amount", "total:", "net payable", "total", "invoice total", "bill total", "total (inr)", "total rs", "final amount", "amount payable", "balance due"
+    ],
+    "amount_in_words": [
+        "amount in words", "in words", "rupees in words", "total in words"
+    ],
+    "bank_name": [
+        "bank name", "bank:", "bank details", "bank"
+    ],
+    "branch_name": [
+        "branch", "branch name", "branch:"
+    ],
+    "account_name": [
+        "account name", "a/c name", "beneficiary name", "account holder"
+    ],
+    "account_number": [
+        "account no", "ac no", "a/c no", "account number", "bank a/c", "bank account"
+    ],
+    "ifsc_code": [
+        "ifsc", "ifsc code", "ifsc:"
+    ],
+    "payment_terms": [
+        "payment terms", "terms:", "terms and conditions", "terms & conditions", "payment mode"
+    ],
 }
 
 
@@ -154,9 +238,15 @@ class TemplateLearner:
         """
         rules: list[dict[str, Any]] = []
 
-        for field_name, candidate_anchors in FIELD_ANCHOR_CANDIDATES.items():
+        all_field_keys = list(FIELD_ANCHOR_CANDIDATES.keys())
+        for k in verified_data.keys():
+            if k not in all_field_keys and not k.startswith("_") and k not in ("line_items", "field_confidences", "spatial_candidates", "review_reasons"):
+                all_field_keys.append(k)
+
+        for field_name in all_field_keys:
+            candidate_anchors = FIELD_ANCHOR_CANDIDATES.get(field_name, [])
             gt_val = verified_data.get(field_name)
-            if gt_val is None or str(gt_val).strip() == "":
+            if gt_val is None or str(gt_val).strip() == "" or str(gt_val).lower() in ("null", "none", "unknown"):
                 continue
 
             clean_gt = str(gt_val).strip().lower().replace(",", "").replace(" ", "").replace("-", "").replace("/", "")
@@ -193,6 +283,13 @@ class TemplateLearner:
             target_clean_tokens = [p for p in target_clean_tokens if p]
 
             candidate_sequences: list[list[WordToken]] = []
+
+            # Check if gt_val is a float/number
+            num_val = None
+            try:
+                num_val = float(str(gt_val).replace(",", "").replace("₹", "").replace("Rs.", "").strip())
+            except (ValueError, TypeError):
+                pass
             
             # A. Multi-word contiguous sequence match
             if len(target_clean_tokens) > 1:
@@ -208,7 +305,7 @@ class TemplateLearner:
                     if window_clean == target_clean_tokens:
                         candidate_sequences.append(window)
 
-            # B. Single token exact match or clean substring match
+            # B. Single token exact match, clean substring match, or numeric float match
             if not candidate_sequences:
                 for i, w in enumerate(profile.words):
                     w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
@@ -216,6 +313,13 @@ class TemplateLearner:
                         candidate_sequences.append([w])
                     elif clean_gt in w_clean and len(clean_gt) >= 3:
                         candidate_sequences.append([w])
+                    elif num_val is not None:
+                        try:
+                            w_num = float(re.sub(r"[^\d.]", "", w.text))
+                            if abs(w_num - num_val) <= 0.05:
+                                candidate_sequences.append([w])
+                        except Exception:
+                            pass
 
             # ── 3. Score all (anchor, ground_truth) candidate pairs ──
             scored_pairs: list[tuple[float, list[WordToken], list[WordToken]]] = []
