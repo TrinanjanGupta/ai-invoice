@@ -78,8 +78,14 @@ class TemplateLearner:
         v_name = vendor_name or verified_data.get("vendor_name")
         v_gstin = vendor_gstin or verified_data.get("vendor_gstin") or profile.vendor_gstin
 
-        fam_fp = profile.text_signature[:12] if profile.text_signature else profile.layout_signature[:12]
-        ver_fp = profile.layout_signature
+        fam_fp = profile.family_fingerprint if profile.family_fingerprint else profile.layout_signature[:12]
+        ver_fp = profile.exact_fingerprint if profile.exact_fingerprint else profile.layout_signature
+
+        topology_spec = {
+            "anchor_set": list(profile.anchor_set),
+            "anchor_positions": profile.anchor_positions,
+            "region_topology": profile.region_topology,
+        }
 
         # 2. Persist to PostgreSQL if DB manager is available
         version_id = f"ver_{ver_fp[:10]}"
@@ -101,6 +107,7 @@ class TemplateLearner:
                     page_count=profile.page_count,
                     anchor_signature=profile.anchor_signature,
                     layout_signature=profile.layout_signature,
+                    topology_spec=topology_spec,
                 )
                 version_id = ver.id
 
@@ -115,16 +122,22 @@ class TemplateLearner:
                 version_id=version_id,
                 family_id=family_id,
                 version_num=1,
-                version_fingerprint=ver_fp,
+                exact_fingerprint=ver_fp,
+                family_fingerprint=fam_fp,
+                aspect_bucket=profile.aspect_bucket,
                 aspect_ratio=profile.aspect_ratio,
                 page_count=profile.page_count,
-                anchor_signature=profile.anchor_signature,
-                layout_signature=profile.layout_signature,
                 vendor_gstin=v_gstin,
                 vendor_name=str(v_name) if v_name else None,
+                anchor_set=set(profile.anchor_set),
+                anchor_positions=dict(profile.anchor_positions),
+                region_topology=list(profile.region_topology),
                 field_rules=rules,
                 sample_count=1,
                 success_rate=1.0,
+                version_fingerprint=ver_fp,
+                anchor_signature=profile.anchor_signature,
+                layout_signature=profile.layout_signature,
             )
             self.retriever.register_in_memory_template(cached_ver)
             logger.info(f"Registered learned template version '{version_id}' into live TIE retriever index ✓")

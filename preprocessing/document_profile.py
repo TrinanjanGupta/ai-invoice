@@ -108,6 +108,8 @@ class RegionBlock:
 class DocumentProfile:
     """
     Unified, normalized document representation for invoice processing.
+    Stores both exact identity hashes (for O(1) lookup) and rich structured
+    features (for mathematical similarity: Jaccard, spatial graph, region topology).
     """
     page_count: int
     width: int
@@ -119,7 +121,15 @@ class DocumentProfile:
     words: list[WordToken] = field(default_factory=list)
     regions: list[RegionBlock] = field(default_factory=list)
 
-    # Fingerprints & Signatures
+    # ── Structured Mathematical Features (For Real Similarity) ────────────────
+    anchor_set: set[str] = field(default_factory=set)
+    anchor_positions: dict[str, tuple[float, float]] = field(default_factory=dict)
+    region_topology: list[dict[str, Any]] = field(default_factory=list)
+    aspect_bucket: int = 14
+
+    # ── Identity & Invariant Fingerprints (For O(1) Exact/Family Indexing) ────
+    exact_fingerprint: str = ""
+    family_fingerprint: str = ""
     text_signature: str = ""
     layout_signature: str = ""
     anchor_signature: str = ""
@@ -134,11 +144,55 @@ class DocumentProfile:
     text_density: float = 0.0
 
     def __post_init__(self):
+        self.aspect_bucket = int(round(float(self.aspect_ratio) * 10))
+
+        if self.regions and not self.region_topology:
+            for r in self.regions:
+                self.region_topology.append({
+                    "label": r.label,
+                    "bbox_norm": list(r.bbox_norm),
+                    "center": list(r.center_norm),
+                    "page": r.page,
+                })
+
         if not self.words:
+            if not self.layout_signature:
+                self.layout_signature = f"ar:{self.aspect_bucket}|pg:{self.page_count}"
+            if not self.family_fingerprint:
+                self.family_fingerprint = hashlib.sha256(self.layout_signature.encode("utf-8")).hexdigest()[:16]
+            if not self.exact_fingerprint:
+                self.exact_fingerprint = self.family_fingerprint
             return
 
         full_text = " ".join(w.text for w in self.words if w.text)
+        lower_full_text = full_text.lower()
 
+        # Extract structured anchor set & spatial centroids
+        if not self.anchor_set:
+            for anc in CANONICAL_ANCHORS:
+                if anc in lower_full_text:
+                    clean_anc = anc.replace(" ", "_").replace(":", "").strip("_")
+                    matched_seqs = self.find_anchor_tokens(anc)
+                    if matched_seqs:
+                        self.anchor_set.add(clean_anc)
+                        # Compute centroid across all occurrences
+                        first_seq = matched_seqs[0]
+                        cx = sum(w.center_norm[0] for w in first_seq) / len(first_seq)
+                        cy = sum(w.center_norm[1] for w in first_seq) / len(first_seq)
+                        self.anchor_positions[clean_anc] = (round(cx, 1), round(cy, 1))
+
+        # Build Invariant Structural Family Fingerprint (Layout + Anchors + Regions, NO variable text)
+        sorted_anchors = sorted(list(self.anchor_set))
+        reg_labels = [r.get("label", "") for r in self.region_topology]
+        family_seed = f"ar:{self.aspect_bucket}|pg:{self.page_count}|anc:{'|'.join(sorted_anchors[:20])}|reg:{'|'.join(reg_labels[:10])}"
+        self.family_fingerprint = hashlib.sha256(family_seed.encode("utf-8")).hexdigest()[:16]
+
+        # Build Exact Geometric Fingerprint
+        geom_parts = [f"{anc}:{pos[0]},{pos[1]}" for anc, pos in sorted(self.anchor_positions.items())]
+        exact_seed = f"{self.family_fingerprint}|geom:{'|'.join(geom_parts)}"
+        self.exact_fingerprint = hashlib.sha256(exact_seed.encode("utf-8")).hexdigest()[:16]
+
+        # Backward-compatible signatures
         if not self.text_signature:
             clean_words = [re.sub(r"[^a-zA-Z0-9]", "", w.text.lower()) for w in self.words if w.text]
             clean_words = [w for w in clean_words if len(w) > 2][:30]
@@ -146,12 +200,7 @@ class DocumentProfile:
             self.text_signature = hashlib.sha256(text_sig_raw.encode("utf-8")).hexdigest()[:16] if text_sig_raw else "empty"
 
         if not self.anchor_signature:
-            present_anchors = []
-            lower_full_text = full_text.lower()
-            for anc in CANONICAL_ANCHORS:
-                if anc in lower_full_text:
-                    present_anchors.append(anc.replace(" ", "_"))
-            anchor_sig_raw = "|".join(sorted(present_anchors))
+            anchor_sig_raw = "|".join(sorted_anchors)
             self.anchor_signature = hashlib.sha256(anchor_sig_raw.encode("utf-8")).hexdigest()[:16] if anchor_sig_raw else "none"
 
         if not self.region_signature:
@@ -165,8 +214,7 @@ class DocumentProfile:
             self.region_signature = hashlib.sha256(reg_sig_raw.encode("utf-8")).hexdigest()[:16] if reg_sig_raw else "no_regions"
 
         if not self.layout_signature:
-            layout_sig_raw = f"ar:{self.aspect_ratio}|pg:{self.page_count}|reg:{self.region_signature}|anc:{self.anchor_signature}"
-            self.layout_signature = hashlib.sha256(layout_sig_raw.encode("utf-8")).hexdigest()[:16]
+            self.layout_signature = self.exact_fingerprint
 
         if not self.vendor_gstin:
             gstin_matches = GSTIN_PATTERN.findall(full_text)

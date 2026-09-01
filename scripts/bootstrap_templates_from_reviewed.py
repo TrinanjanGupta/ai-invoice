@@ -17,6 +17,7 @@ Usage:
 import sys
 import json
 import asyncio
+from typing import Optional, Any
 from pathlib import Path
 from loguru import logger
 
@@ -29,6 +30,18 @@ from preprocessing.document_profile import DocumentProfile, WordToken
 from understanding.template_learner import TemplateLearner
 from understanding.template_retriever import TemplateRetriever
 from scripts.replay_tie_benchmark import load_dataset_samples, build_profile_from_sample, extract_ground_truth_from_sample
+
+
+def _find_invoice_file(job_id: str, filename: str) -> Optional[Path]:
+    for candidate in (
+        Path("data/raw") / job_id / filename,
+        Path("data/raw") / filename,
+        Path("data") / filename,
+        Path("data/test_samples") / filename,
+    ):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 async def bootstrap_all_verified_templates():
@@ -58,27 +71,39 @@ async def bootstrap_all_verified_templates():
 
             logger.info(f"Found {len(records)} reviewed records in PostgreSQL")
             for r in records:
-                # If output_json contains verified field data
                 out_data = r.output_json or {}
-                # Create profile from words if available
-                # or synthesized
-                raw_ocr = r.ai_output_json or out_data
-                prof = DocumentProfile(
-                    page_count=r.page_count or 1,
-                    width=1000,
-                    height=1414,
-                    aspect_ratio=1.41,
-                    vendor_gstin=out_data.get("vendor_gstin"),
-                )
-                ver_id = await learner.learn_from_verified_invoice(
-                    profile=prof,
-                    verified_data=out_data,
-                    vendor_name=out_data.get("vendor_name"),
-                    vendor_gstin=out_data.get("vendor_gstin"),
-                )
-                if ver_id:
-                    await db.update_job(r.job_id, template_version_id=ver_id)
-                    learned_count += 1
+                # Resolve real invoice document to extract OCR words
+                doc_path = _find_invoice_file(r.job_id, r.filename) if r.filename else None
+                prof = None
+                if doc_path and doc_path.exists():
+                    try:
+                        raw_bytes = doc_path.read_bytes()
+                        from api.pipeline_runner import InvoicePipeline
+                        pipeline = InvoicePipeline(settings, db=db)
+                        pages = pipeline.pdf_converter.convert_bytes(raw_bytes) if doc_path.suffix.lower() == ".pdf" else [pipeline.preprocessor.process(raw_bytes)]
+                        p_ocr = {}
+                        for p_idx, p in enumerate(pages):
+                            p_ocr[f"full_page_p{p_idx+1}"] = pipeline.ocr.extract_full_page(p.image)
+                        prof = DocumentProfile.from_ocr_and_regions(
+                            ocr_results=p_ocr,
+                            regions=[],
+                            width=pages[0].image.shape[1] if hasattr(pages[0].image, "shape") else 1000,
+                            height=pages[0].image.shape[0] if hasattr(pages[0].image, "shape") else 1414,
+                            page_count=len(pages),
+                        )
+                    except Exception as e:
+                        logger.debug(f"Could not OCR raw file for {r.job_id}: {e}")
+
+                if prof and prof.words:
+                    ver_id = await learner.learn_from_verified_invoice(
+                        profile=prof,
+                        verified_data=out_data,
+                        vendor_name=out_data.get("vendor_name"),
+                        vendor_gstin=out_data.get("vendor_gstin"),
+                    )
+                    if ver_id:
+                        await db.update_job(r.job_id, template_version_id=ver_id)
+                        learned_count += 1
     except Exception as db_ex:
         logger.debug(f"DB scan error: {db_ex}")
 

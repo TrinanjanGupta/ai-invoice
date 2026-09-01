@@ -123,21 +123,48 @@ class TestTemplateExtractor:
 
 
 class TestTemplateRetriever:
-    def test_multi_stage_retrieval(self):
+    def test_anchor_jaccard_and_spatial_metrics(self):
+        # 1. Jaccard metric
+        set_a = {"invoice_no", "invoice_date", "subtotal", "grand_total"}
+        set_b = {"invoice_no", "invoice_date", "gstin", "grand_total"}
+        jaccard = TemplateRetriever.compute_anchor_jaccard(set_a, set_b)
+        assert abs(jaccard - (3.0 / 5.0)) < 1e-4
+
+        assert TemplateRetriever.compute_anchor_jaccard(set(), set()) == 1.0
+        assert TemplateRetriever.compute_anchor_jaccard(set_a, set()) == 0.0
+
+        # 2. Spatial alignment metric
+        doc_pos = {"invoice_no": (100.0, 100.0), "grand_total": (800.0, 900.0)}
+        tpl_pos_exact = {"invoice_no": (100.0, 100.0), "grand_total": (800.0, 900.0)}
+        tpl_pos_offset = {"invoice_no": (110.0, 100.0), "grand_total": (800.0, 910.0)}
+
+        score_exact = TemplateRetriever.compute_spatial_alignment(doc_pos, tpl_pos_exact, {"invoice_no", "grand_total"})
+        score_offset = TemplateRetriever.compute_spatial_alignment(doc_pos, tpl_pos_offset, {"invoice_no", "grand_total"})
+        assert score_exact == 1.0
+        assert score_offset > 0.95
+
+    def test_multi_stage_indexed_retrieval(self):
         retriever = TemplateRetriever()
         tpl = CachedTemplateVersion(
             version_id="ver_abc_1",
             family_id="fam_abc",
             version_num=1,
-            version_fingerprint="fp_exact_123",
+            exact_fingerprint="fp_exact_123",
+            family_fingerprint="fam_fp_123",
+            aspect_bucket=14,
             aspect_ratio=1.41,
             page_count=1,
-            anchor_signature="invoice_no|date|grand_total",
-            layout_signature="fp_exact_123",
             vendor_gstin="27AAAAA0000A1Z5",
+            anchor_set={"invoice_no", "invoice_date", "grand_total", "subtotal"},
+            anchor_positions={"invoice_no": (150.0, 100.0), "grand_total": (700.0, 800.0)},
             field_rules=[{"field_name": "invoice_number", "strategy": "anchor_relative", "anchors": ["invoice no"]}],
         )
         retriever.register_in_memory_template(tpl)
+
+        # Verify inverted index has indexed the anchors
+        assert "invoice_no" in retriever._anchor_inverted_index
+        assert "ver_abc_1" in retriever._anchor_inverted_index["invoice_no"]
+        assert "27AAAAA0000A1Z5" in retriever._gstin_index
 
         # 1. Exact hash match
         prof_exact = DocumentProfile(
@@ -145,8 +172,8 @@ class TestTemplateRetriever:
             width=1000,
             height=1414,
             aspect_ratio=1.41,
+            exact_fingerprint="fp_exact_123",
             layout_signature="fp_exact_123",
-            anchor_signature="invoice_no|date|grand_total",
             vendor_gstin="27AAAAA0000A1Z5",
             words=[WordToken(text="invoice", bbox_norm=[100, 100, 150, 120], bbox_raw=[100, 100, 150, 120])],
         )
@@ -155,13 +182,30 @@ class TestTemplateRetriever:
         assert res.matched_version_id == "ver_abc_1"
         assert res.match_confidence >= 0.90
 
-        # 2. Unknown layout
+        # 2. Similarity match (Jaccard + Spatial Alignment)
+        prof_sim = DocumentProfile(
+            page_count=1,
+            width=1000,
+            height=1414,
+            aspect_ratio=1.41,
+            exact_fingerprint="fp_diff_999",
+            vendor_gstin="27AAAAA0000A1Z5",
+            anchor_set={"invoice_no", "invoice_date", "grand_total", "subtotal"},
+            anchor_positions={"invoice_no": (152.0, 102.0), "grand_total": (698.0, 802.0)},
+            words=[WordToken(text="invoice", bbox_norm=[100, 100, 150, 120], bbox_raw=[100, 100, 150, 120])],
+        )
+        res_sim = retriever.retrieve(prof_sim)
+        assert res_sim.match_type == "exact_version"
+        assert res_sim.matched_version_id == "ver_abc_1"
+        assert res_sim.match_confidence >= 0.90
+
+        # 3. Unknown layout
         prof_unknown = DocumentProfile(
-            page_count=2,  # Different page count
+            page_count=2,
             width=1000,
             height=1000,
             aspect_ratio=1.0,
-            layout_signature="completely_different",
+            exact_fingerprint="completely_different",
             words=[],
         )
         res2 = retriever.retrieve(prof_unknown)
@@ -176,4 +220,5 @@ class TestGoldenSuite:
         assert res["passed_cases"] == res["total_cases"]
         assert res["overall_accuracy"] == 1.0
         assert res["field_accuracies"]["grand_total"] == 1.0
+
 

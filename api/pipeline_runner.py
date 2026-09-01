@@ -55,6 +55,7 @@ class PipelineResult:
     model_used: str   # e.g. "native_pdf+yolo+layoutlm"
     doc_type: str = "UNKNOWN"
     quality_score: float = 1.0
+    doc_profile: Optional[Any] = None
 
 
 # ---------------------------------------------------------------------------
@@ -568,4 +569,5 @@ class InvoicePipeline:
             raw_ocr_texts=all_raw_ocr_texts,
             page_count=page_count,
             model_used=model_used,
+            doc_profile=doc_profile,
         )

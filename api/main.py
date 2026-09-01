@@ -119,6 +119,9 @@ app.add_middleware(
 # ------------------------------------------------------------------
 _active_job_progress: dict[str, dict] = {}
 
+# In-memory DocumentProfile cache to eliminate redundant OCR during human review
+_job_profiles: dict[str, Any] = {}
+
 # Per-job asyncio queues for SSE push — key: job_id, value: list of Queue listeners
 _job_sse_queues: dict[str, list] = {}
 
@@ -975,33 +978,48 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
                 from understanding.template_learner import TemplateLearner
                 from preprocessing.document_profile import DocumentProfile
 
-                # Reconstruct profile if raw file exists
-                minio = getattr(app.state, "minio", None)
-                raw_bytes = _get_raw_file_bytes(job_id, record.filename, record.storage_key, minio)
-                if raw_bytes and pipeline:
-                    pages = pipeline.pdf_converter.convert_bytes(raw_bytes) if Path(record.filename).suffix.lower() == ".pdf" else [pipeline.preprocessor.process(raw_bytes)]
-                    if pages:
-                        p_ocr = {}
-                        for p_idx, p in enumerate(pages):
-                            p_ocr[f"full_page_p{p_idx+1}"] = pipeline.ocr.extract_full_page(p.image)
-                        doc_prof = DocumentProfile.from_ocr_and_regions(
-                            ocr_results=p_ocr,
-                            regions=[],
-                            width=pages[0].image.shape[1] if hasattr(pages[0].image, "shape") else 1000,
-                            height=pages[0].image.shape[0] if hasattr(pages[0].image, "shape") else 1414,
-                            page_count=len(pages),
-                        )
-                        learner = TemplateLearner(db_manager=db, retriever=retriever)
-                        tpl_ver_id = await learner.learn_from_verified_invoice(
-                            profile=doc_prof,
-                            verified_data=schema.model_dump(),
-                            vendor_name=schema.vendor_name,
-                            vendor_gstin=schema.vendor_gstin,
-                        )
-                        if tpl_ver_id:
-                            schema.template_version_id = tpl_ver_id
+                # Re-use existing in-memory profile if cached to avoid expensive re-OCR
+                doc_prof = _job_profiles.get(job_id)
+                if not doc_prof:
+                    minio = getattr(app.state, "minio", None)
+                    raw_bytes = _get_raw_file_bytes(job_id, record.filename, record.storage_key, minio)
+                    if raw_bytes and pipeline:
+                        pages = pipeline.pdf_converter.convert_bytes(raw_bytes) if Path(record.filename).suffix.lower() == ".pdf" else [pipeline.preprocessor.process(raw_bytes)]
+                        if pages:
+                            p_ocr = {}
+                            for p_idx, p in enumerate(pages):
+                                p_ocr[f"full_page_p{p_idx+1}"] = pipeline.ocr.extract_full_page(p.image)
+                            doc_prof = DocumentProfile.from_ocr_and_regions(
+                                ocr_results=p_ocr,
+                                regions=[],
+                                width=pages[0].image.shape[1] if hasattr(pages[0].image, "shape") else 1000,
+                                height=pages[0].image.shape[0] if hasattr(pages[0].image, "shape") else 1414,
+                                page_count=len(pages),
+                            )
+                            _job_profiles[job_id] = doc_prof
+
+                if doc_prof and pipeline:
+                    learner = TemplateLearner(db_manager=db, retriever=retriever)
+                    tpl_ver_id = await learner.learn_from_verified_invoice(
+                        profile=doc_prof,
+                        verified_data=schema.model_dump(),
+                        vendor_name=schema.vendor_name,
+                        vendor_gstin=schema.vendor_gstin,
+                    )
+                    if tpl_ver_id:
+                        schema.template_version_id = tpl_ver_id
+
+                # Closed Feedback Loop: Record human feedback against template version in PostgreSQL
+                target_ver_id = tpl_ver_id or record.template_version_id
+                if target_ver_id:
+                    was_correct = (len(corrections_list) == 0)
+                    await db.record_template_feedback(
+                        version_id=target_ver_id,
+                        was_correct=was_correct,
+                        field_corrections=corrections_list,
+                    )
             except Exception as tpl_learn_ex:
-                logger.debug(f"Template learning notice for {job_id}: {tpl_learn_ex}")
+                logger.debug(f"Template learning / feedback notice for {job_id}: {tpl_learn_ex}")
 
         updated_rec = await db.update_job(
             job_id,
@@ -1557,6 +1575,9 @@ async def _run_pipeline_task(
                     output_dir=tmpdir,
                     stage_callback=_stage_cb,
                 )
+
+            if result and getattr(result, "doc_profile", None):
+                _job_profiles[job_id] = result.doc_profile
 
         # Upload PDF to MinIO
         pdf_key = None

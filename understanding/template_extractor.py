@@ -469,58 +469,96 @@ class TemplateExtractor:
         search_region: Optional[list[int]],
         base_confidence: float,
     ) -> Optional[FieldExtractionResult]:
-        """Extracts financial amounts near total anchors with validation."""
-        # Find anchor
+        """
+        Extracts financial amounts using candidate generation and multi-factor ranking.
+        Scores distance, horizontal baseline alignment, currency prefix, format, and semantic type.
+        """
+        candidates: list[tuple[float, float, WordToken]] = []  # (rank_score, float_val, token)
+
+        # 1. Search near each anchor
         for anc in anchors:
             matches = profile.find_anchor_tokens(anc)
-            if matches:
-                anchor_seq = matches[0]
+            if not matches:
+                continue
+
+            for anchor_seq in matches:
+                anc_x1 = min(w.bbox_norm[0] for w in anchor_seq)
                 anc_y1 = min(w.bbox_norm[1] for w in anchor_seq)
-                anc_y2 = max(w.bbox_norm[3] for w in anchor_seq)
                 anc_x2 = max(w.bbox_norm[2] for w in anchor_seq)
+                anc_y2 = max(w.bbox_norm[3] for w in anchor_seq)
+                anc_cy = sum(w.center_norm[1] for w in anchor_seq) / len(anchor_seq)
 
-                # Search horizontal strip to the right
-                strip_box = [anc_x2, max(0, anc_y1 - 10), 1000, min(1000, anc_y2 + 15)]
-                words = profile.find_words_in_box(strip_box)
-                num_cands = []
-                for w in sorted(words, key=lambda token: token.bbox_norm[0]):
+                # Search horizontal strip to the right (inline)
+                strip_box = [anc_x2, max(0, anc_y1 - 12), 1000, min(1000, anc_y2 + 15)]
+                inline_words = profile.find_words_in_box(strip_box)
+
+                # Also search below anchor (for vertical key-value pairs)
+                below_box = [max(0, anc_x1 - 20), anc_y2, min(1000, anc_x2 + 250), min(1000, anc_y2 + 35)]
+                below_words = profile.find_words_in_box(below_box)
+
+                for w, is_inline in [(w, True) for w in inline_words] + [(w, False) for w in below_words]:
+                    # Exclude anchor tokens
+                    if any(id(w) == id(aw) for aw in anchor_seq):
+                        continue
+
                     clean_f = clean_currency_str(w.text)
-                    if clean_f is not None and clean_f >= 0:
-                        # Tax and discount components should never match 6-8 digit HSN codes
-                        if field_name in ("cgst", "sgst", "igst", "tax_amount", "discount", "round_off") and clean_f >= 100000.0:
-                            continue
-                        has_decimal = "." in w.text
-                        num_cands.append((clean_f, has_decimal, w))
+                    if clean_f is None or clean_f < 0:
+                        continue
 
-                if num_cands:
-                    # Prefer amounts with explicit decimal places or reasonable total size over single-digit counts
-                    decimal_cands = [c for c in num_cands if c[1]]
-                    chosen = decimal_cands[0] if decimal_cands else num_cands[0]
-                    val_str = f"{chosen[0]:.2f}"
-                    return FieldExtractionResult(
-                        field_name=field_name,
-                        value=val_str,
-                        confidence=base_confidence * chosen[2].confidence,
-                        strategy_used="semantic_numeric",
-                        bbox=chosen[2].bbox_norm,
-                        raw_tokens=[chosen[2]],
-                    )
+                    # Filter out HSN/SAC numbers (>= 100,000) for tax/discount components
+                    if field_name in ("cgst", "sgst", "igst", "tax_amount", "discount", "round_off") and clean_f >= 100000.0:
+                        continue
 
-        # Fallback to search region
-        if search_region:
-            words = profile.find_words_in_box(search_region)
-            for w in words:
+                    # Multi-Factor Score Calculation
+                    score = 1.0
+
+                    # A. Distance factor (closer is better)
+                    dist = (w.bbox_norm[0] - anc_x2) if is_inline else (w.bbox_norm[1] - anc_y2)
+                    dist_score = max(0.0, 1.0 - (max(0, dist) / 500.0))
+                    score += dist_score * 0.40
+
+                    # B. Baseline alignment factor
+                    if is_inline:
+                        y_diff = abs(w.center_norm[1] - anc_cy)
+                        if y_diff <= 10:
+                            score += 0.35
+                    else:
+                        score += 0.20
+
+                    # C. Formatting factor (explicit decimal places .00, commas)
+                    if "." in w.text:
+                        score += 0.25
+                    if "," in w.text or "rs" in w.text.lower() or "₹" in w.text:
+                        score += 0.20
+
+                    # D. Confidence of OCR token
+                    score *= w.confidence
+
+                    candidates.append((score, clean_f, w))
+
+        # 2. Search fallback region
+        if not candidates and search_region:
+            reg_words = profile.find_words_in_box(search_region)
+            for w in reg_words:
                 clean_f = clean_currency_str(w.text)
                 if clean_f is not None and clean_f > 0:
-                    return FieldExtractionResult(
-                        field_name=field_name,
-                        value=f"{clean_f:.2f}",
-                        confidence=base_confidence * 0.80,
-                        strategy_used="semantic_numeric_region",
-                        bbox=w.bbox_norm,
-                        raw_tokens=[w],
-                    )
-        return None
+                    candidates.append((0.50 * w.confidence, clean_f, w))
+
+        if not candidates:
+            return None
+
+        # Sort by multi-factor rank score descending
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        best_score, best_val, best_token = candidates[0]
+
+        return FieldExtractionResult(
+            field_name=field_name,
+            value=f"{best_val:.2f}",
+            confidence=min(0.99, round(base_confidence * best_token.confidence, 3)),
+            strategy_used="semantic_numeric_ranked",
+            bbox=best_token.bbox_norm,
+            raw_tokens=[best_token],
+        )
 
     def _extract_text_region(
         self,

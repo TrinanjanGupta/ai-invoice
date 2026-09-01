@@ -11,8 +11,15 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import DeclarativeBase, mapped_column, Mapped
 from sqlalchemy import String, Float, Boolean, DateTime, Text, JSON, func
 from typing import Optional, Any
-from minio import Minio
-from minio.error import S3Error
+
+try:
+    from minio import Minio
+    from minio.error import S3Error
+    HAS_MINIO = True
+except ImportError:
+    Minio = None
+    S3Error = Exception
+    HAS_MINIO = False
 
 
 # ------------------------------------------------------------------
@@ -476,24 +483,33 @@ class MinIOManager:
         bucket: str,
         secure: bool = False,
     ):
+        self.bucket = bucket
+        if not HAS_MINIO:
+            logger.warning("MinIO package not available. MinIOManager running in disabled mode.")
+            self.client = None
+            return
+
         self.client = Minio(
             endpoint,
             access_key=access_key,
             secret_key=secret_key,
             secure=secure,
         )
-        self.bucket = bucket
         self._ensure_bucket()
 
     def _ensure_bucket(self):
+        if not self.client:
+            return
         try:
             if not self.client.bucket_exists(self.bucket):
                 self.client.make_bucket(self.bucket)
                 logger.info(f"MinIO bucket created: {self.bucket}")
-        except S3Error as e:
+        except Exception as e:
             logger.error(f"MinIO bucket error: {e}")
 
     def upload_file(self, file_bytes: bytes, object_name: str, content_type: str = "application/octet-stream") -> str:
+        if not self.client:
+            return object_name
         self.client.put_object(
             self.bucket,
             object_name,
@@ -505,6 +521,8 @@ class MinIOManager:
         return object_name
 
     def upload_pdf(self, pdf_path: str | Path, object_name: str) -> str:
+        if not self.client:
+            return object_name
         self.client.fput_object(
             self.bucket,
             object_name,
@@ -514,6 +532,8 @@ class MinIOManager:
         return object_name
 
     def get_presigned_url(self, object_name: str, expires_hours: int = 24) -> str:
+        if not self.client:
+            return ""
         from datetime import timedelta
         return self.client.presigned_get_object(
             self.bucket,
@@ -522,5 +542,7 @@ class MinIOManager:
         )
 
     def download_file(self, object_name: str) -> bytes:
+        if not self.client:
+            return b""
         response = self.client.get_object(self.bucket, object_name)
         return response.read()
