@@ -61,13 +61,18 @@ def validate_ifsc(ifsc: Optional[str]) -> bool:
 def validate_date(date_str: Optional[str]) -> bool:
     if not date_str:
         return False
-    clean = date_str.strip().replace(".", "/").replace("-", "/")
-    for fmt in ("%d/%m/%Y", "%Y/%m/%d", "%d/%m/%y", "%d %b %Y", "%d %B %Y"):
-        try:
-            datetime.strptime(clean, fmt)
-            return True
-        except ValueError:
-            pass
+    clean = date_str.strip()
+    clean_slash = clean.replace(".", "/").replace("-", "/")
+    for fmt in (
+        "%d/%m/%Y", "%Y/%m/%d", "%d/%m/%y", "%d %b %Y", "%d %B %Y",
+        "%d/%b/%Y", "%d/%B/%Y", "%d-%b-%Y", "%d-%B-%Y", "%b %d, %Y", "%B %d, %Y"
+    ):
+        for candidate in (clean, clean_slash):
+            try:
+                datetime.strptime(candidate, fmt)
+                return True
+            except ValueError:
+                pass
     return False
 
 

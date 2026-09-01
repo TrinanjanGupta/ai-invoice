@@ -64,9 +64,10 @@ async def lifespan(app: FastAPI):
         try:
             from api.pipeline_runner import InvoicePipeline
             loop = asyncio.get_running_loop()
-            pipeline = await loop.run_in_executor(None, lambda: InvoicePipeline(settings))
+            pipeline = await loop.run_in_executor(None, lambda: InvoicePipeline(settings, db=db))
+            await pipeline.template_retriever.load_templates_from_db()
             app.state.pipeline = pipeline
-            logger.info("Pipeline warmed up in background")
+            logger.info("Pipeline and TIE Template Retriever warmed up with DB templates")
         except Exception as ex:
             logger.warning(f"Background pipeline warmup: {ex}")
 
@@ -965,6 +966,43 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
 
         schema.ground_truth_source = ground_truth_source
 
+        # Automated TIE Template Learning: synthesize rules from verified ground truth
+        tpl_ver_id = None
+        if is_verified:
+            try:
+                pipeline = getattr(app.state, "pipeline", None)
+                retriever = pipeline.template_retriever if pipeline else None
+                from understanding.template_learner import TemplateLearner
+                from preprocessing.document_profile import DocumentProfile
+
+                # Reconstruct profile if raw file exists
+                minio = getattr(app.state, "minio", None)
+                raw_bytes = _get_raw_file_bytes(job_id, record.filename, record.storage_key, minio)
+                if raw_bytes and pipeline:
+                    pages = pipeline.pdf_converter.convert_bytes(raw_bytes) if Path(record.filename).suffix.lower() == ".pdf" else [pipeline.preprocessor.process(raw_bytes)]
+                    if pages:
+                        p_ocr = {}
+                        for p_idx, p in enumerate(pages):
+                            p_ocr[f"full_page_p{p_idx+1}"] = pipeline.ocr.extract_full_page(p.image)
+                        doc_prof = DocumentProfile.from_ocr_and_regions(
+                            ocr_results=p_ocr,
+                            regions=[],
+                            width=pages[0].image.shape[1] if hasattr(pages[0].image, "shape") else 1000,
+                            height=pages[0].image.shape[0] if hasattr(pages[0].image, "shape") else 1414,
+                            page_count=len(pages),
+                        )
+                        learner = TemplateLearner(db_manager=db, retriever=retriever)
+                        tpl_ver_id = await learner.learn_from_verified_invoice(
+                            profile=doc_prof,
+                            verified_data=schema.model_dump(),
+                            vendor_name=schema.vendor_name,
+                            vendor_gstin=schema.vendor_gstin,
+                        )
+                        if tpl_ver_id:
+                            schema.template_version_id = tpl_ver_id
+            except Exception as tpl_learn_ex:
+                logger.debug(f"Template learning notice for {job_id}: {tpl_learn_ex}")
+
         updated_rec = await db.update_job(
             job_id,
             output_json=schema.model_dump(),
@@ -972,13 +1010,14 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
             corrections=corrections_list,
             review_status=review_status,
             ground_truth_source=ground_truth_source,
+            template_version_id=tpl_ver_id or record.template_version_id,
             needs_review=not is_verified,
             review_reasons=schema.review_reasons,
             status=target_status,
         )
         logger.info(
             f"[{job_id}] Saved to DB: status='{updated_rec.status}', review_status='{review_status}', "
-            f"corrections={len(corrections_list)}, needs_review={updated_rec.needs_review}"
+            f"corrections={len(corrections_list)}, needs_review={updated_rec.needs_review}, template={tpl_ver_id}"
         )
         return {
             "status": target_status,
@@ -986,7 +1025,8 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
             "is_verified": is_verified,
             "review_status": review_status,
             "corrections_recorded": len(corrections_list),
-            "message": "Invoice marked as verified ground truth" if is_verified else "Invoice progress saved as partial draft"
+            "template_version_id": tpl_ver_id,
+            "message": "Invoice marked as verified ground truth and learned into TIE index" if is_verified else "Invoice progress saved as partial draft"
         }
     except Exception as e:
         logger.exception(f"Error saving invoice corrections: {e}")
@@ -1261,6 +1301,70 @@ async def cancel_all_processing():
     }
 
 
+@app.get("/api/templates", tags=["Templates"])
+async def list_templates():
+    """
+    List all learned deterministic TIE templates from PostgreSQL and the live retrieval index.
+    """
+    db: DatabaseManager = app.state.db
+    pipeline = getattr(app.state, "pipeline", None)
+    retriever_count = len(pipeline.template_retriever._in_memory_index) if (pipeline and hasattr(pipeline, "template_retriever")) else 0
+    
+    versions = await db.get_all_active_template_versions()
+    results = []
+    for v in versions:
+        fam = await db.get_template_family(v.family_id)
+        rules = await db.get_field_rules_for_version(v.id)
+        results.append({
+            "version_id": v.id,
+            "family_id": v.family_id,
+            "family_code": fam.family_code if fam else None,
+            "vendor_name": fam.vendor_name if fam else None,
+            "vendor_gstin": fam.vendor_gstin if fam else None,
+            "aspect_ratio": v.aspect_ratio,
+            "page_count": v.page_count,
+            "sample_count": v.sample_count,
+            "success_rate": v.success_rate,
+            "status": v.status,
+            "field_rules_count": len(rules),
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        })
+    
+    return {
+        "total_templates": len(results),
+        "live_index_size": retriever_count,
+        "templates": results,
+    }
+
+
+@app.get("/api/templates/{version_id}", tags=["Templates"])
+async def get_template_details(version_id: str):
+    """
+    Get full field rules and geometry specs for a specific template version.
+    """
+    db: DatabaseManager = app.state.db
+    rules = await db.get_field_rules_for_version(version_id)
+    if not rules:
+        raise HTTPException(status_code=404, detail="Template version not found")
+    
+    rules_data = [
+        {
+            "field_name": r.field_name,
+            "strategy": r.strategy,
+            "anchors": r.anchors,
+            "relative_box": r.relative_box,
+            "search_region": r.search_region,
+            "parser_spec": r.parser_spec,
+            "confidence_score": r.confidence_score,
+        }
+        for r in rules
+    ]
+    return {
+        "version_id": version_id,
+        "field_rules": rules_data,
+    }
+
+
 @app.post("/api/invoices/{job_id}/retry", tags=["Invoices"])
 async def retry_invoice(
     job_id: str,
@@ -1438,6 +1542,11 @@ async def _run_pipeline_task(
                 "progress_pct": 10,
                 "stage_label": "Pre-processing: Initializing document...",
             })
+
+            # Ensure TIE retriever index is loaded with active DB templates
+            if pipeline and hasattr(pipeline, "template_retriever") and db:
+                if not pipeline.template_retriever._in_memory_index:
+                    await pipeline.template_retriever.load_templates_from_db()
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 result = await asyncio.to_thread(

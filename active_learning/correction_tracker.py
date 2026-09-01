@@ -76,3 +76,48 @@ def classify_review_status(corrections: list[dict], needs_review: bool, overall_
         return "auto_accepted"
     else:
         return "human_confirmed"
+
+
+def classify_correction_cause(
+    field_name: str,
+    ai_val: Any,
+    human_val: Any,
+    template_id: Optional[str] = None,
+    raw_ocr_tokens: Optional[list[str]] = None,
+) -> dict[str, Any]:
+    """
+    Intelligently attributes the root cause of a field correction to:
+    - 'tie_spatial_drift': Template matched, but search box offset was inaccurate.
+    - 'layout_change': Anchor positions shifted, requires new TemplateVersion.
+    - 'ocr_error': Word was not present or misread in OCR output.
+    - 'novel_model_sample': Unknown layout requiring LayoutLM/VLM training.
+    """
+    clean_h = str(human_val).strip().lower() if human_val is not None else ""
+    clean_tokens = [t.lower() for t in (raw_ocr_tokens or [])]
+
+    # Check if correct value exists in OCR tokens
+    val_in_ocr = any(clean_h in t or t in clean_h for t in clean_tokens) if clean_tokens and clean_h else True
+
+    if not val_in_ocr:
+        return {
+            "field": field_name,
+            "cause": "ocr_error",
+            "action": "tune_ocr_preprocessing",
+            "reason": f"Correct value '{human_val}' was not found in raw OCR tokens.",
+        }
+
+    if template_id and not template_id.startswith("novel_"):
+        return {
+            "field": field_name,
+            "cause": "tie_spatial_drift",
+            "action": "update_template_field_rule",
+            "reason": f"Value existed in OCR tokens on known template {template_id}. Update rule offset.",
+        }
+
+    return {
+        "field": field_name,
+        "cause": "novel_model_sample",
+        "action": "add_to_layoutlm_training_queue",
+        "reason": f"Novel invoice layout pattern.",
+    }
+

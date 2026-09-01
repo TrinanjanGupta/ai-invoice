@@ -31,10 +31,13 @@ from preprocessing.pipeline import InvoicePreprocessor
 from preprocessing.pdf_converter import PDFConverter, NativePDFPage, PreprocessResult
 from preprocessing.quality_scorer import DocumentQualityScorer, QualityAssessment
 from preprocessing.document_router import DocumentRouter, DocumentRoutingDecision
+from preprocessing.document_profile import DocumentProfile
 from detection.detector import InvoiceDetector
 from ocr.extractor import InvoiceOCR, OCRResult, TextBlock, OCRWord
 from understanding.layoutlm import LayoutLMExtractor, ExtractedInvoice
 from understanding.table_extractor import TableExtractor
+from understanding.template_extractor import TemplateExtractor
+from understanding.template_retriever import TemplateRetriever, TemplateMatchResult
 from llm_fallback.ollama_client import OllamaClient
 from validation.validator import InvoiceValidator, InvoiceSchema, ValidationReport
 from output.renderer import InvoiceRenderer
@@ -194,8 +197,9 @@ class InvoicePipeline:
     SUPPORTED_IMAGE_FORMATS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp", ".bmp"}
     SUPPORTED_PDF_FORMATS   = {".pdf"}
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, db: Optional[Any] = None):
         self.settings = settings
+        self.db = db
         logger.info("Initialising Invoice Pipeline...")
 
         self.preprocessor = InvoicePreprocessor()
@@ -209,6 +213,8 @@ class InvoicePipeline:
             base_model=settings.layoutlm_base_model,
         )
         self.table_extractor = TableExtractor()
+        self.template_retriever = TemplateRetriever(db_manager=db)
+        self.template_extractor = TemplateExtractor()
         self.llm      = OllamaClient(
             base_url=settings.ollama_base_url,
             model=settings.ollama_model,
@@ -226,6 +232,7 @@ class InvoicePipeline:
         logger.info("=" * 65)
         logger.info("   INVOICE DIGITIZATION PIPELINE INITIALIZED")
         logger.info(f"   OCR Engine:      {self.ocr.engine_name}")
+        logger.info(f"   TIE Engine:      Fast-Path Template Retriever & Anchor Extractor")
         logger.info(f"   Detector:        {'DocLayout-YOLO' if self.detector.is_doclaynet else ('Custom-YOLO' if self.detector.model else 'Heuristic')}")
         logger.info(f"   LayoutLM Model:  {settings.layoutlm_model_path if Path(settings.layoutlm_model_path).exists() else 'Heuristic Fallback'}")
         llm_status = f"{settings.ollama_model} ({settings.ollama_base_url}, timeout={getattr(settings, 'ollama_timeout', 60.0)}s)" if getattr(settings, 'enable_llm_fallback', True) else "Disabled"
@@ -343,59 +350,119 @@ class InvoicePipeline:
                 combined_ocr_results[unique_key] = v
                 all_raw_ocr_texts[unique_key] = v.full_text
 
-            # ── Extraction (LayoutLM / heuristic) ─────────────────────────
-            _notify("understanding", 4, 78, f"AI Understanding: Mapping fields (Page {p_idx + 1}/{page_count})")
-            p_extracted = self.extractor.extract(p_ocr, image=pil_image)
-            if isinstance(p_obj, NativePDFPage) and p_obj.line_items:
-                p_extracted.line_items = p_obj.line_items
-            else:
-                # Scanned image / OCR spatial table reconstruction
-                table_ocr_res = (
-                    p_ocr.get("line_items")
-                    or p_ocr.get(f"line_items_p{p_idx+1}")
-                    or p_ocr.get(f"full_page_p{p_idx+1}")
-                    or p_ocr.get("full_page")
-                )
-                if table_ocr_res:
-                    spatial_items = self.table_extractor.extract_tables_from_spatial_ocr(table_ocr_res)
-                    if spatial_items:
-                        p_extracted.line_items = spatial_items
-                        logger.info(f"[{job_id}] Page {p_idx+1}: Extracted {len(spatial_items)} line items via spatial OCR table reconstruction")
+        # ── Stage 3: Build DocumentProfile & Multi-Stage TIE Retrieval ──────
+        _notify("retrieval", 4, 70, "TIE Retrieval: Checking known layout templates")
+        img_w, img_h = 1200, 1600
+        if pages:
+            img = pages[0].image
+            if hasattr(img, "shape"):
+                img_h, img_w = img.shape[:2]
+            elif hasattr(img, "size"):
+                img_w, img_h = img.size
 
-            extracted_per_page.append(p_extracted)
+        all_regions_flat = []
+        for r_list in all_page_regions:
+            all_regions_flat.extend(r_list)
 
-        # ── Stage 4a: Merge across pages ────────────────────────────────────
-        _notify("understanding", 4, 84, "AI Understanding: Reconciling document layout & tables")
-        logger.info(f"[{job_id}] Stage 4a: Multi-page merge")
-        extracted = extracted_per_page[0]
-        for next_p in extracted_per_page[1:]:
-            extracted = self.extractor._merge_invoices(extracted, next_p)
-            if next_p.line_items:
-                extracted.line_items.extend(next_p.line_items)
+        doc_profile = DocumentProfile.from_ocr_and_regions(
+            ocr_results=combined_ocr_results,
+            regions=all_regions_flat,
+            width=img_w,
+            height=img_h,
+            page_count=page_count,
+            is_digital_native=("native_pdf" in path_summary),
+            quality_score=quality_score,
+        )
 
-        # Capture raw layoutlm prediction snapshot before heuristic merge and LLM fallback
-        layoutlm_snapshot = {
-            f: getattr(extracted, f).value
-            for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
-            if getattr(extracted, f, None) and getattr(extracted, f).value
-        }
+        tpl_match = self.template_retriever.retrieve(doc_profile)
+        used_tie_fast_path = False
+        primary_engine_label = "heuristic"
 
-        # Global heuristic pass over authoritative full-page text
-        _notify("understanding", 4, 88, "AI Understanding: Synthesizing line items & taxes")
-        full_page_ocrs = {k: v for k, v in combined_ocr_results.items() if "full_page" in k}
-        heuristic_input = full_page_ocrs if full_page_ocrs else combined_ocr_results
-        global_heuristic = self.extractor._extract_heuristic(heuristic_input)
-        heuristic_snapshot = {
-            f: getattr(global_heuristic, f).value
-            for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
-            if getattr(global_heuristic, f, None) and getattr(global_heuristic, f).value
-        }
-        extracted = self.extractor._merge_invoices(extracted, global_heuristic)
+        # ── Stage 4a: Extraction (TIE Fast Path vs AI Fallback) ─────────────
+        if tpl_match.match_type in ("exact_version", "family_anchor"):
+            _notify("understanding", 4, 78, f"TIE Extraction: Running deterministic rules ({tpl_match.match_type})")
+            logger.info(f"[{job_id}] TIE Match: {tpl_match.match_type} (conf={tpl_match.match_confidence:.2f}, ver={tpl_match.matched_version_id})")
+            extracted = self.template_extractor.extract(
+                profile=doc_profile,
+                field_rules=tpl_match.field_rules,
+                template_version_id=tpl_match.matched_version_id,
+            )
+            # Use high-fidelity native digital PDF table items if available
+            if pages and isinstance(pages[0], NativePDFPage) and pages[0].line_items:
+                extracted.line_items = pages[0].line_items
 
-        # ── Stage 4b: LLM fallback ───────────────────────────────────────────
-        if self.settings.enable_llm_fallback and self.llm.is_available():
+            used_tie_fast_path = True
+            primary_engine_label = "tie_fast_path" if tpl_match.match_type == "exact_version" else "tie_anchor_family"
+
+            # Reconcile any unextracted optional fields with global heuristic
+            full_page_ocrs = {k: v for k, v in combined_ocr_results.items() if "full_page" in k}
+            heuristic_input = full_page_ocrs if full_page_ocrs else combined_ocr_results
+            global_heuristic = self.extractor._extract_heuristic(heuristic_input)
+            extracted = self.extractor._merge_invoices(extracted, global_heuristic)
+            layoutlm_snapshot = {}
+            heuristic_snapshot = {
+                f: getattr(global_heuristic, f).value
+                for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
+                if getattr(global_heuristic, f, None) and getattr(global_heuristic, f).value
+            }
+        else:
+            # Unknown / Novel layout -> AI Pipeline (LayoutLM / Heuristic)
+            _notify("understanding", 4, 78, "AI Understanding: Mapping fields via LayoutLM/Heuristics")
+            extracted_per_page = []
+            for p_idx, p_obj in enumerate(pages):
+                pil_image = p_obj.pil_image
+                p_ocr = {k: v for k, v in combined_ocr_results.items() if f"p{p_idx+1}" in k or page_count == 1}
+                p_extracted = self.extractor.extract(p_ocr, image=pil_image)
+                if isinstance(p_obj, NativePDFPage) and p_obj.line_items:
+                    p_extracted.line_items = p_obj.line_items
+                else:
+                    table_ocr_res = (
+                        p_ocr.get("line_items")
+                        or p_ocr.get(f"line_items_p{p_idx+1}")
+                        or p_ocr.get(f"full_page_p{p_idx+1}")
+                        or p_ocr.get("full_page")
+                    )
+                    if table_ocr_res:
+                        spatial_items = self.table_extractor.extract_tables_from_spatial_ocr(table_ocr_res)
+                        if spatial_items:
+                            p_extracted.line_items = spatial_items
+                extracted_per_page.append(p_extracted)
+
+            extracted = extracted_per_page[0]
+            for next_p in extracted_per_page[1:]:
+                extracted = self.extractor._merge_invoices(extracted, next_p)
+                if next_p.line_items:
+                    extracted.line_items.extend(next_p.line_items)
+
+            layoutlm_snapshot = {
+                f: getattr(extracted, f).value
+                for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
+                if getattr(extracted, f, None) and getattr(extracted, f).value
+            }
+
+            full_page_ocrs = {k: v for k, v in combined_ocr_results.items() if "full_page" in k}
+            heuristic_input = full_page_ocrs if full_page_ocrs else combined_ocr_results
+            global_heuristic = self.extractor._extract_heuristic(heuristic_input)
+            heuristic_snapshot = {
+                f: getattr(global_heuristic, f).value
+                for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
+                if getattr(global_heuristic, f, None) and getattr(global_heuristic, f).value
+            }
+            extracted = self.extractor._merge_invoices(extracted, global_heuristic)
+            primary_engine_label = "layoutlm" if self.extractor.model else "heuristic"
+
+        # ── Stage 4b: Field-Level Routing & Selective LLM fallback ───────────
+        critical_fields = ["grand_total", "invoice_number", "invoice_date", "vendor_gstin"]
+        needs_ai_enhancement = False
+        for cf in critical_fields:
+            cf_obj = getattr(extracted, cf, None)
+            if not cf_obj or not cf_obj.value or cf_obj.confidence < self.settings.llm_fallback_threshold:
+                needs_ai_enhancement = True
+                break
+
+        if self.settings.enable_llm_fallback and self.llm.is_available() and (needs_ai_enhancement or not used_tie_fast_path):
             _notify("llm", 5, 90, "LLM Fallback: Checking confidence & completeness")
-            logger.info(f"[{job_id}] Stage 4b: LLM confidence check ({self.settings.ollama_model})")
+            logger.info(f"[{job_id}] Stage 4b: Selective LLM field enhancement ({self.settings.ollama_model})")
             page_imgs = [p.image for p in pages if hasattr(p, "image") and p.image is not None]
             llm_preds = self.llm.enhance_low_confidence_fields(
                 extracted,
@@ -404,8 +471,7 @@ class InvoicePipeline:
                 page_images=page_imgs,
             ) or {}
         else:
-            _notify("llm", 5, 90, "LLM Fallback: Skipped (disabled or offline)")
-            logger.info(f"[{job_id}] Stage 4b: LLM fallback skipped (using LayoutLM/OCR heuristic extractions)")
+            _notify("llm", 5, 90, "LLM Fallback: Skipped (TIE high-confidence or offline)")
             llm_preds = {}
 
         # ── Stage 4c: Validation ─────────────────────────────────────────────
@@ -413,9 +479,9 @@ class InvoicePipeline:
         logger.info(f"[{job_id}] Stage 4c: Validation")
         invoice_schema, validation_report = self.validator.validate(extracted)
 
-        # ── Template Fingerprinting & 3-Model Disagreement Analysis ────────
+        # ── Template Registration & Disagreement Analysis ────────────────────
         has_contradiction = False
-        is_novel = False
+        is_novel = (tpl_match.match_type == "none")
         try:
             from active_learning.template_fingerprint import compute_template_fingerprint, TemplateManager
             from active_learning.disagreement_engine import evaluate_model_disagreement
@@ -425,19 +491,12 @@ class InvoicePipeline:
                 for r_obj in all_page_regions[0]:
                     all_region_dicts.append({"label": getattr(r_obj, "label", "region"), "bbox": getattr(r_obj, "bbox", [0, 0, 0, 0])})
 
-            img_w, img_h = 1200, 1600
-            if pages:
-                img = pages[0].image
-                if hasattr(img, "shape"):
-                    img_h, img_w = img.shape[:2]
-                elif hasattr(img, "size"):
-                    img_w, img_h = img.size
-
             tpl_id = compute_template_fingerprint(
                 img_w, img_h, all_region_dicts, vendor_gstin=invoice_schema.vendor_gstin
             )
             tpl_info = TemplateManager().register_invoice(tpl_id, vendor_name=invoice_schema.vendor_name)
-            is_novel = tpl_info.get("is_novel", False)
+            if not tpl_match.matched_version_id:
+                is_novel = tpl_info.get("is_novel", True)
 
             disagreement_res = evaluate_model_disagreement(
                 layoutlm_preds=layoutlm_snapshot,
@@ -446,7 +505,9 @@ class InvoicePipeline:
             )
 
             has_contradiction = bool(disagreement_res.get("has_contradiction", False))
-            invoice_schema.template_id = tpl_id
+            invoice_schema.template_id = tpl_match.matched_version_id or tpl_id
+            invoice_schema.template_family_id = tpl_match.matched_family_id
+            invoice_schema.template_version_id = tpl_match.matched_version_id
             invoice_schema.is_novel_template = is_novel
             invoice_schema.disagreement_score = disagreement_res.get("disagreement_score", 0.0)
             if is_novel:
@@ -485,9 +546,8 @@ class InvoicePipeline:
         # Build model_used label
         primary_model = detected_models[0] if detected_models else "yolo"
         text_path     = "native_pdf" if "native_pdf" in path_summary else "ocr"
-        model_parts   = [text_path, primary_model]
-        model_parts.append("layoutlm" if self.extractor.model else "heuristic")
-        if self.llm.is_available():
+        model_parts   = [text_path, primary_model, primary_engine_label]
+        if self.llm.is_available() and needs_ai_enhancement:
             model_parts.append("ollama")
         model_used = "+".join(model_parts)
 

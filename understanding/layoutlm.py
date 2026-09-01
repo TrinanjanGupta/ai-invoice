@@ -29,12 +29,15 @@ class ExtractedField:
 # Quality multiplier per source — used by _merge_invoices to pick the
 # best value when multiple sources disagree.
 SOURCE_WEIGHTS: dict[str, float] = {
-    "native_pdf":       1.00,   # perfect — direct from PDF text layer
-    "layoutlm":         0.90,   # model inference — good but can mispredict
-    "heuristic":        0.80,   # regex — reliable for patterns
+    "tie_template":     1.10,   # deterministic template extraction — highest priority
+    "tie_fast_path":    1.10,
+    "native_pdf":       1.00,   # direct from PDF text layer
+    "layoutlm":         0.85,   # model inference
+    "heuristic":        0.65,   # regex fallback
+    "heuristic_reconciled": 0.70,
     "paddleocr":        0.75,   # OCR on clean image
     "easyocr":          0.65,   # fallback OCR
-    "llm":              0.60,   # LLM guess — creative but less reliable
+    "llm":              0.60,   # LLM guess
     "llm_unavailable":  0.00,
     "llm_error":        0.00,
 }
@@ -941,34 +944,26 @@ class LayoutLMExtractor:
         if round_off:
             inv.round_off = ExtractedField(round_off, 0.70, "heuristic")
 
-        words_match = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:=]*([A-Za-z\s/-]+(?:only)?)", totals_text, re.IGNORECASE)
+        num_words_kw = ["rupees", "only", "thousand", "hundred", "lakh", "crore", "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "twenty", "thirty", "forty", "fifty"]
+        words_match = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees\s*in\s*words)[\s:=]*([A-Za-z\s/-]+(?:only)?)", clean_text, re.IGNORECASE)
         if words_match:
-            words_val = words_match.group(1).split("\n")[0].strip()
-            if len(words_val) > 5 and len(words_val) < 150:
-                inv.amount_in_words = ExtractedField(words_val, 0.85, "heuristic")
-        elif not inv.amount_in_words:
-            words_match_global = re.search(r"(?:amount\s*in\s*words|in\s*words|rupees)[\s:=]*([A-Za-z\s/-]+(?:only)?)", clean_text, re.IGNORECASE)
-            if words_match_global:
-                words_val = words_match_global.group(1).split("\n")[0].strip()
-                if len(words_val) > 5 and len(words_val) < 150:
-                    inv.amount_in_words = ExtractedField(words_val, 0.85, "heuristic")
+            candidate_words = words_match.group(1).split("\n")[0].strip()
+            candidate_words = re.sub(r"^(?:amount\s*in\s*words|in\s*words)\s*[:.\-]?\s*", "", candidate_words, flags=re.I).strip()
+            if len(candidate_words) > 5 and any(kw in candidate_words.lower() for kw in num_words_kw):
+                inv.amount_in_words = ExtractedField(candidate_words, 0.88, "heuristic")
 
         # Tax
         tax_text = region_texts.get("tax_block", totals_text)
-        cgst = self._find_amount_near_keyword(tax_text, ["cgst"])
+        cgst = self._find_amount_near_keyword(tax_text, ["+cgst :", "+cgst", "cgst amt", "cgst amount", "central tax", "cgst"])
         if cgst:
             inv.cgst = ExtractedField(cgst, 0.78, "heuristic")
 
-        sgst = self._find_amount_near_keyword(tax_text, ["sgst"])
-        if sgst:
-            inv.sgst = ExtractedField(sgst, 0.78, "heuristic")
-
-        igst = self._find_amount_near_keyword(tax_text, ["igst"])
+        igst = self._find_amount_near_keyword(tax_text, ["+igst :", "+igst", "igst amt", "igst amount", "integrated tax", "igst"])
         if igst:
             inv.igst = ExtractedField(igst, 0.78, "heuristic")
 
         tax_amount = self._find_amount_near_keyword(
-            tax_text, ["total tax", "tax total", "total gst", "gst total", "vat total"]
+            tax_text, ["gst total", "total tax", "tax total", "total gst", "gst amount", "vat total"]
         )
         def safe_float(v) -> float:
             if v is None:
@@ -990,6 +985,14 @@ class LayoutLMExtractor:
             calc_tax = cgst_v + sgst_v + igst_v
             if calc_tax > 0:
                 inv.tax_amount = ExtractedField(round(calc_tax, 2), 0.85, "heuristic_calculated")
+
+        # Intra-state dual GST reconciliation: CGST == SGST when total tax == 2 * CGST
+        if inv.cgst and inv.cgst.value and inv.tax_amount and inv.tax_amount.value:
+            cgst_v = safe_float(inv.cgst.value)
+            tax_v = safe_float(inv.tax_amount.value)
+            if cgst_v > 0 and abs((cgst_v * 2) - tax_v) <= 0.05:
+                if not inv.sgst or safe_float(inv.sgst.value) != cgst_v:
+                    inv.sgst = ExtractedField(cgst_v, 0.95, "heuristic_reconciled")
 
         # --- Math Auto-Reconciliation & Inversion Guard ---
         total_tax_val = safe_float(inv.tax_amount.value if inv.tax_amount else 0.0)
@@ -1163,14 +1166,20 @@ class LayoutLMExtractor:
         """Search for a currency amount near a keyword."""
         text_lower = text.lower()
         for kw in keywords:
-            idx = text_lower.find(kw)
+            idx = text_lower.find(kw.lower())
             if idx == -1:
                 continue
             snippet = text[idx:idx + 80]
-            match = self.AMOUNT_PATTERN.search(snippet)
-            if match:
+            for match in self.AMOUNT_PATTERN.finditer(snippet):
                 raw = match.group(1).replace(",", "")
-                return raw
+                try:
+                    val = float(raw)
+                    # For tax components or general amounts, filter out HSN/PIN codes >= 100,000
+                    if val >= 100000.0 and any(t in kw.lower() for t in ["cgst", "sgst", "igst", "tax", "disc", "round"]):
+                        continue
+                    return raw
+                except ValueError:
+                    continue
         return None
 
     def _extract_line_items(self, line_items_text: str) -> list[dict]:

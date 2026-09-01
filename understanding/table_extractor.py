@@ -65,6 +65,8 @@ class TableExtractor:
             if not cell:
                 continue
             cell_clean = str(cell).lower().replace("\n", " ").strip()
+            if "taxable" in cell_clean:
+                mapping["amount"] = idx
             for field_name, kws in self.COLUMN_KEYWORDS.items():
                 if field_name not in mapping:
                     if any(kw in cell_clean for kw in kws):
@@ -107,9 +109,16 @@ class TableExtractor:
             if not row or all(c is None or str(c).strip() == "" for c in row):
                 continue
 
-            # Check if this row is a summary / total row
-            first_cell = str(row[0] or "").lower()
-            if any(term in first_cell for term in ["total", "subtotal", "taxable amount", "grand total", "gross"]):
+            # Check if this row is a summary / total / payment / tender / remark row
+            row_text = " ".join(str(c or "").lower() for c in row)
+            if any(term in row_text for term in [
+                "sub total", "subtotal", "net total", "net bill", "total bill", "grand total",
+                "+cgst", "+sgst", "+igst", "gst total", "tender", "tax summary",
+                "coupon discount", "loyalty discount", "change due", "refund amt",
+                "gift wrap", "delivery charges", "cod charges", "remarks"
+            ]):
+                continue
+            if row[0] and any(term in str(row[0]).lower() for term in ["total", "subtotal", "taxable amount", "grand total", "gross"]):
                 continue
 
             desc_idx = mapping.get("description")
@@ -124,6 +133,12 @@ class TableExtractor:
                         break
 
             if not desc or len(desc) < 2:
+                continue
+
+            desc_clean = desc.lower().strip()
+            if any(term == desc_clean or term in desc_clean for term in [
+                "total", "sub total", "subtotal", "hsn code", "grand total", "tax summary", "gst total", "net total", "net bill"
+            ]):
                 continue
 
             # Parse numeric fields
