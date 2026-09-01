@@ -212,6 +212,70 @@ class TestTemplateRetriever:
         assert res2.match_type == "none"
 
 
+class TestMultiPageAndCandidateRanking:
+    def test_multi_page_token_assignment(self):
+        from ocr.extractor import OCRResult, TextBlock, OCRWord
+        
+        block_p1 = TextBlock(
+            text="Invoice No: 123",
+            bbox=[100, 100, 300, 130],
+            confidence=0.99,
+            region_label="full_page",
+            words=[OCRWord(text="Invoice", bbox=[100, 100, 180, 130], confidence=0.99, page=1), OCRWord(text="123", bbox=[200, 100, 300, 130], confidence=0.99, page=1)],
+        )
+        block_p2 = TextBlock(
+            text="Grand Total: 5000",
+            bbox=[100, 800, 400, 830],
+            confidence=0.99,
+            region_label="full_page",
+            words=[OCRWord(text="Grand", bbox=[100, 800, 180, 830], confidence=0.99, page=2), OCRWord(text="5000", bbox=[200, 800, 400, 830], confidence=0.99, page=2)],
+        )
+
+        ocr_map = {
+            "full_page_p1": OCRResult(region_label="full_page", text_blocks=[block_p1], full_text="Invoice No: 123", avg_confidence=0.99),
+            "full_page_p2": OCRResult(region_label="full_page", text_blocks=[block_p2], full_text="Grand Total: 5000", avg_confidence=0.99),
+        }
+
+        prof = DocumentProfile.from_ocr_and_regions(
+            ocr_results=ocr_map,
+            regions=[],
+            width=1000,
+            height=1414,
+            page_count=2,
+            page_dimensions={1: (1000, 1414), 2: (1200, 1600)},
+        )
+
+        p1_tokens = [w for w in prof.words if w.page == 1]
+        p2_tokens = [w for w in prof.words if w.page == 2]
+        assert len(p1_tokens) == 2
+        assert len(p2_tokens) == 2
+        assert prof.find_words_in_box([0, 0, 1000, 500], page=1)[0].text == "Invoice"
+        assert len(prof.find_words_in_box([0, 0, 1000, 500], page=2)) == 0
+
+    def test_vendor_and_buyer_gstin_candidate_ranking(self):
+        words = [
+            WordToken(text="Supplier", bbox_norm=[50, 100, 120, 120], bbox_raw=[50, 100, 120, 120], page=1),
+            WordToken(text="GSTIN:", bbox_norm=[130, 100, 180, 120], bbox_raw=[130, 100, 180, 120], page=1),
+            WordToken(text="19AAAAA0000A1Z5", bbox_norm=[190, 100, 350, 120], bbox_raw=[190, 100, 350, 120], page=1),
+            WordToken(text="Bill", bbox_norm=[50, 400, 80, 420], bbox_raw=[50, 400, 80, 420], page=1),
+            WordToken(text="To", bbox_norm=[85, 400, 110, 420], bbox_raw=[85, 400, 110, 420], page=1),
+            WordToken(text="GSTIN:", bbox_norm=[120, 400, 170, 420], bbox_raw=[120, 400, 170, 420], page=1),
+            WordToken(text="27BBBBB1111B1Z2", bbox_norm=[180, 400, 340, 420], bbox_raw=[180, 400, 340, 420], page=1),
+        ]
+        profile = DocumentProfile(page_count=1, width=1000, height=1414, aspect_ratio=1.41, words=words)
+        extractor = TemplateExtractor()
+        
+        rules = [
+            {"field_name": "vendor_gstin", "strategy": "regex_pattern", "parser_spec": {}},
+            {"field_name": "buyer_gstin", "strategy": "regex_pattern", "parser_spec": {}},
+        ]
+        res = extractor.extract(profile, rules, match_type="exact_version")
+        assert res.vendor_gstin is not None
+        assert res.vendor_gstin.value == "19AAAAA0000A1Z5"
+        assert res.buyer_gstin is not None
+        assert res.buyer_gstin.value == "27BBBBB1111B1Z2"
+
+
 class TestGoldenSuite:
     def test_golden_suite_execution(self):
         suite = GoldenInvoiceSuite()

@@ -185,12 +185,14 @@ class DocumentProfile:
         sorted_anchors = sorted(list(self.anchor_set))
         reg_labels = [r.get("label", "") for r in self.region_topology]
         family_seed = f"ar:{self.aspect_bucket}|pg:{self.page_count}|anc:{'|'.join(sorted_anchors[:20])}|reg:{'|'.join(reg_labels[:10])}"
-        self.family_fingerprint = hashlib.sha256(family_seed.encode("utf-8")).hexdigest()[:16]
+        if not self.family_fingerprint:
+            self.family_fingerprint = hashlib.sha256(family_seed.encode("utf-8")).hexdigest()[:16]
 
         # Build Exact Geometric Fingerprint
         geom_parts = [f"{anc}:{pos[0]},{pos[1]}" for anc, pos in sorted(self.anchor_positions.items())]
         exact_seed = f"{self.family_fingerprint}|geom:{'|'.join(geom_parts)}"
-        self.exact_fingerprint = hashlib.sha256(exact_seed.encode("utf-8")).hexdigest()[:16]
+        if not self.exact_fingerprint:
+            self.exact_fingerprint = hashlib.sha256(exact_seed.encode("utf-8")).hexdigest()[:16]
 
         # Backward-compatible signatures
         if not self.text_signature:
@@ -258,9 +260,10 @@ class DocumentProfile:
                 matched.append(w)
         return sorted(matched, key=lambda w: (w.bbox_norm[1], w.bbox_norm[0]))
 
-    def find_anchor_tokens(self, anchor_phrase: str, page: int = 1) -> list[list[WordToken]]:
+    def find_anchor_tokens(self, anchor_phrase: str, page: Optional[int] = None) -> list[list[WordToken]]:
         """
         Finds sequences of word tokens matching the given anchor phrase (case-insensitive).
+        If page is specified, searches on that page; otherwise searches across all pages.
         Returns matching token sequences.
         """
         clean_target = anchor_phrase.strip().lower()
@@ -269,20 +272,23 @@ class DocumentProfile:
         if not target_tokens:
             return []
 
-        page_words = [w for w in self.words if w.page == page]
+        target_words = self.words if page is None else [w for w in self.words if w.page == page]
         matches: list[list[WordToken]] = []
 
         if len(target_tokens) == 1:
             t = target_tokens[0]
-            for w in page_words:
+            for w in target_words:
                 w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
                 if w_clean == t or t in w_clean:
                     matches.append([w])
             return matches
 
         # Multi-word sequence match
-        for i in range(len(page_words) - len(target_tokens) + 1):
-            window = page_words[i : i + len(target_tokens)]
+        for i in range(len(target_words) - len(target_tokens) + 1):
+            window = target_words[i : i + len(target_tokens)]
+            # Ensure sequence is on the same page
+            if len(set(w.page for w in window)) > 1:
+                continue
             matched_all = True
             for w, t in zip(window, target_tokens):
                 w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
@@ -327,13 +333,16 @@ class DocumentProfile:
         is_digital_native: bool = False,
         quality_score: float = 1.0,
         page_num: int = 1,
+        page_dimensions: Optional[dict[int, tuple[int, int]]] = None,
     ) -> DocumentProfile:
         """
         Builds a DocumentProfile from OCR results and YOLO detected regions.
+        Preserves true multi-page token and region page numbers and supports per-page normalization.
         """
         w_safe = max(1, width)
         h_safe = max(1, height)
         aspect_ratio = round(float(h_safe) / float(w_safe), 2)
+        page_dims = page_dimensions or {}
 
         # 1. Convert words to normalized WordTokens
         word_tokens: list[WordToken] = []
@@ -349,7 +358,18 @@ class DocumentProfile:
             if not res or not hasattr(res, "text_blocks"):
                 continue
 
+            # Infer page from key (e.g. "full_page_p2" -> 2) or block/res attribute
+            curr_page = page_num
+            p_match = re.search(r"_p(\d+)\b", k)
+            if p_match:
+                curr_page = int(p_match.group(1))
+            elif hasattr(res, "page") and res.page:
+                curr_page = int(res.page)
+
+            p_w, p_h = page_dims.get(curr_page, (w_safe, h_safe))
+
             for b_idx, block in enumerate(res.text_blocks):
+                block_page = getattr(block, "page", curr_page)
                 # Extract words from TextBlock
                 words_list = getattr(block, "words", None) or []
                 if not words_list:
@@ -362,6 +382,9 @@ class DocumentProfile:
                     if not w_text or not str(w_text).strip():
                         continue
 
+                    w_page = getattr(w, "page", block_page)
+                    w_p_w, w_p_h = page_dims.get(w_page, (p_w, p_h))
+
                     raw_box = getattr(w, "bbox", [0, 0, 0, 0])
                     if hasattr(w, "to_xyxy"):
                         xyxy_box = w.to_xyxy()
@@ -372,8 +395,8 @@ class DocumentProfile:
                         ys = [p[1] for p in raw_box]
                         xyxy_box = [float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))]
 
-                    norm_box = normalize_box(xyxy_box, w_safe, h_safe)
-                    dedup_key = (norm_box[0] // 5, norm_box[1] // 5, w_text.strip().lower())
+                    norm_box = normalize_box(xyxy_box, w_p_w, w_p_h)
+                    dedup_key = (w_page, norm_box[0] // 5, norm_box[1] // 5, str(w_text).strip().lower())
                     if dedup_key in seen_word_keys:
                         continue
                     seen_word_keys.add(dedup_key)
@@ -387,7 +410,7 @@ class DocumentProfile:
                             bbox_norm=norm_box,
                             bbox_raw=xyxy_box,
                             confidence=conf,
-                            page=page_num,
+                            page=w_page,
                             block_no=b_idx,
                             line_no=w_idx // 8,
                             word_no=w_idx,
@@ -401,14 +424,16 @@ class DocumentProfile:
             r_label = getattr(r, "label", "region") if not isinstance(r, dict) else r.get("label", "region")
             r_bbox = getattr(r, "bbox", [0, 0, 0, 0]) if not isinstance(r, dict) else r.get("bbox", [0, 0, 0, 0])
             r_conf = getattr(r, "confidence", 0.85) if not isinstance(r, dict) else r.get("confidence", 0.85)
-            norm_rbox = normalize_box(r_bbox, w_safe, h_safe)
+            r_page = getattr(r, "page", page_num) if not isinstance(r, dict) else r.get("page", page_num)
+            r_w, r_h = page_dims.get(r_page, (w_safe, h_safe))
+            norm_rbox = normalize_box(r_bbox, r_w, r_h)
             region_blocks.append(
                 RegionBlock(
                     label=str(r_label),
                     bbox_norm=norm_rbox,
                     bbox_raw=[float(b) for b in r_bbox],
                     confidence=float(r_conf),
-                    page=page_num,
+                    page=r_page,
                 )
             )
 

@@ -390,6 +390,42 @@ class DatabaseManager:
             result = await session.execute(stmt)
             return list(result.scalars().all())
 
+    async def get_all_active_templates_joined(
+        self,
+    ) -> list[tuple[TemplateVersionRecord, Optional[TemplateFamilyRecord], list[TemplateFieldRuleRecord]]]:
+        """
+        Loads all active template versions with their families and field rules in exactly 3 batched queries.
+        Completely eliminates N+1 query overhead.
+        """
+        from sqlalchemy import select
+        async with self.session_factory() as session:
+            v_stmt = select(TemplateVersionRecord).where(TemplateVersionRecord.is_active == True)
+            v_res = await session.execute(v_stmt)
+            versions = list(v_res.scalars().all())
+            if not versions:
+                return []
+
+            v_ids = [v.id for v in versions]
+            fam_ids = list(set(v.family_id for v in versions if v.family_id))
+
+            # Batch fetch families
+            fam_map: dict[str, TemplateFamilyRecord] = {}
+            if fam_ids:
+                fam_stmt = select(TemplateFamilyRecord).where(TemplateFamilyRecord.id.in_(fam_ids))
+                fam_res = await session.execute(fam_stmt)
+                for f in fam_res.scalars().all():
+                    fam_map[f.id] = f
+
+            # Batch fetch field rules
+            rules_map: dict[str, list[TemplateFieldRuleRecord]] = {vid: [] for vid in v_ids}
+            if v_ids:
+                r_stmt = select(TemplateFieldRuleRecord).where(TemplateFieldRuleRecord.version_id.in_(v_ids))
+                r_res = await session.execute(r_stmt)
+                for r in r_res.scalars().all():
+                    rules_map[r.version_id].append(r)
+
+            return [(v, fam_map.get(v.family_id), rules_map.get(v.id, [])) for v in versions]
+
     async def save_field_rules(self, version_id: str, rules: list[dict[str, Any]]):
         from sqlalchemy import delete
         async with self.session_factory() as session:

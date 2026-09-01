@@ -177,9 +177,11 @@ class TemplateExtractor:
         profile: DocumentProfile,
         field_rules: list[Any],
         template_version_id: Optional[str] = None,
+        match_type: str = "exact_version",
     ) -> ExtractedInvoice:
         """
-        Executes field extraction rules against DocumentProfile to build ExtractedInvoice.
+        Executes field extraction rules against DocumentProfile.
+        Distinguishes between exact_version (deterministic rules) and family_anchor (adaptive candidate search).
         """
         extracted = ExtractedInvoice()
         field_confs: dict[str, float] = {}
@@ -188,13 +190,15 @@ class TemplateExtractor:
         if not field_rules:
             field_rules = self._get_default_rules()
 
+        is_family_match = (match_type == "family_anchor")
+
         for rule in field_rules:
             if isinstance(rule, dict):
                 f_name = rule["field_name"]
                 strat = rule.get("strategy", "anchor_relative")
                 anchors = rule.get("anchors", [])
                 search_reg = rule.get("search_region")
-                rel_box = rule.get("relative_box")
+                rel_box = rule.get("relative_box") if not is_family_match else None  # Invalidate rigid offsets for family matches
                 parser_spec = rule.get("parser_spec") or {}
                 base_conf = rule.get("confidence_score", 0.95)
             else:
@@ -202,9 +206,12 @@ class TemplateExtractor:
                 strat = rule.strategy
                 anchors = rule.anchors or []
                 search_reg = rule.search_region
-                rel_box = rule.relative_box
+                rel_box = rule.relative_box if not is_family_match else None
                 parser_spec = rule.parser_spec or {}
                 base_conf = getattr(rule, "confidence_score", 0.95)
+
+            if is_family_match:
+                base_conf = min(0.90, base_conf * 0.92)
 
             res = self._extract_field(
                 profile=profile,
@@ -221,7 +228,7 @@ class TemplateExtractor:
                 ext_field = ExtractedField(
                     value=str(res.value),
                     confidence=res.confidence,
-                    source="tie_template",
+                    source="tie_template" if not is_family_match else "tie_family_anchor",
                 )
                 setattr(extracted, f_name, ext_field)
                 field_confs[f_name] = res.confidence
@@ -281,7 +288,7 @@ class TemplateExtractor:
         search_region: Optional[list[int]],
         relative_box: Optional[list[int]],
         parser_spec: dict[str, Any],
-        base_confidence: float = 0.95,
+        base_confidence: float,
     ) -> Optional[FieldExtractionResult]:
         """Dispatches to the appropriate extraction strategy."""
         if strategy == "anchor_relative":
@@ -312,16 +319,42 @@ class TemplateExtractor:
         parser_spec: dict[str, Any],
         base_confidence: float,
     ) -> Optional[FieldExtractionResult]:
-        """Locates anchor tokens and pulls text from the relative bounding box."""
-        # 1. Locate anchor tokens
-        matched_anchor_seq: Optional[list[WordToken]] = None
+        """
+        Extracts a field value located relative to a discovered text anchor token.
+        Scores candidate anchor occurrences based on expected page layout.
+        """
+        # 1. Find and rank all anchor matches
+        matched_anchor_candidates: list[tuple[float, list[WordToken]]] = []
         for anc in anchors:
             matches = profile.find_anchor_tokens(anc)
-            if matches:
-                matched_anchor_seq = matches[0]
-                break
+            for m in matches:
+                if not m:
+                    continue
+                score = 1.0
+                anc_y1 = min(w.bbox_norm[1] for w in m)
+                anc_x1 = min(w.bbox_norm[0] for w in m)
+                
+                # Context scoring: header fields expect top 50%
+                if field_name in ("invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "buyer_name", "buyer_gstin"):
+                    if anc_y1 <= 450:
+                        score += 0.30
+                    else:
+                        score -= 0.20
+                # Totals expect bottom 50%
+                elif field_name in ("grand_total", "subtotal", "tax_amount", "cgst", "sgst", "igst", "discount", "round_off"):
+                    if anc_y1 >= 400:
+                        score += 0.30
+                    else:
+                        score -= 0.20
 
-        if not matched_anchor_seq:
+                # Buyer fields expect right or middle-left area
+                if "buyer" in field_name:
+                    if 150 <= anc_y1 <= 550:
+                        score += 0.25
+
+                matched_anchor_candidates.append((score, m))
+
+        if not matched_anchor_candidates:
             # Fallback to search_region if provided
             if search_region:
                 words = profile.find_words_in_box(search_region)
@@ -339,11 +372,16 @@ class TemplateExtractor:
                         )
             return None
 
+        # Pick best-scoring anchor occurrence
+        matched_anchor_candidates.sort(key=lambda x: x[0], reverse=True)
+        _, matched_anchor_seq = matched_anchor_candidates[0]
+
         # 2. Compute search box from anchor bounding box + relative offset
         anc_x1 = min(w.bbox_norm[0] for w in matched_anchor_seq)
         anc_y1 = min(w.bbox_norm[1] for w in matched_anchor_seq)
         anc_x2 = max(w.bbox_norm[2] for w in matched_anchor_seq)
         anc_y2 = max(w.bbox_norm[3] for w in matched_anchor_seq)
+        anc_page = matched_anchor_seq[0].page
 
         # Default relative offset if not configured: to the right of anchor or directly below
         if relative_box and len(relative_box) == 4:
@@ -364,8 +402,8 @@ class TemplateExtractor:
                 min(1000, anc_y2 + 15),
             ]
 
-        # 3. Retrieve tokens in target box
-        found_tokens = profile.find_words_in_box(target_box)
+        # 3. Retrieve tokens in target box on the same page
+        found_tokens = profile.find_words_in_box(target_box, page=anc_page)
         # Filter out the anchor tokens themselves
         anc_token_ids = {id(w) for w in matched_anchor_seq}
         target_tokens = [w for w in found_tokens if id(w) not in anc_token_ids]
@@ -378,7 +416,7 @@ class TemplateExtractor:
                 min(1000, anc_x1 + 300),
                 min(1000, anc_y2 + 35),
             ]
-            below_tokens = [w for w in profile.find_words_in_box(below_box) if id(w) not in anc_token_ids]
+            below_tokens = [w for w in profile.find_words_in_box(below_box, page=anc_page) if id(w) not in anc_token_ids]
             if below_tokens:
                 target_tokens = below_tokens
                 target_box = below_box
@@ -411,11 +449,11 @@ class TemplateExtractor:
         search_region: Optional[list[int]],
         base_confidence: float,
     ) -> Optional[FieldExtractionResult]:
-        """Extracts fields matching high-precision regular expressions."""
+        """Extracts fields matching regular expressions using field-aware candidate ranking."""
         pat = None
         if custom_pattern:
             pat = re.compile(custom_pattern)
-        elif field_name == "vendor_gstin" or field_name == "buyer_gstin":
+        elif field_name in ("vendor_gstin", "buyer_gstin"):
             pat = GSTIN_RE
         elif field_name == "vendor_pan":
             pat = PAN_RE
@@ -423,7 +461,7 @@ class TemplateExtractor:
             pat = IFSC_RE
         elif field_name == "vendor_email":
             pat = EMAIL_RE
-        elif field_name == "vendor_phone" or field_name == "buyer_phone":
+        elif field_name in ("vendor_phone", "buyer_phone"):
             pat = PHONE_RE
         elif "date" in field_name:
             pat = DATE_RE
@@ -435,20 +473,75 @@ class TemplateExtractor:
         if search_region:
             scope_words = profile.find_words_in_box(search_region)
 
+        # Collect all pattern matches with spatial ranking
+        candidates: list[tuple[float, str, WordToken]] = []
+
         for w in scope_words:
             m = pat.search(w.text)
-            if m:
-                val = m.group(0).strip()
-                return FieldExtractionResult(
-                    field_name=field_name,
-                    value=val,
-                    confidence=base_confidence * w.confidence,
-                    strategy_used="regex_pattern",
-                    bbox=w.bbox_norm,
-                    raw_tokens=[w],
-                )
+            if not m:
+                continue
 
-        # Check full concatenated text if individual tokens split pattern
+            val = m.group(0).strip()
+            score = 1.0 * w.confidence
+
+            # ── GSTIN Field-Aware Candidate Ranking ───────────────────────────
+            if field_name == "vendor_gstin":
+                # Vendor GSTIN is expected in top 40% of page 1
+                if w.page == 1 and w.bbox_norm[1] <= 400:
+                    score += 0.35
+                elif w.bbox_norm[1] > 600:
+                    score -= 0.30
+
+                # Check preceding lines / spatial context
+                nearby_words = profile.find_words_in_box(
+                    [max(0, w.bbox_norm[0] - 250), max(0, w.bbox_norm[1] - 30), w.bbox_norm[2], w.bbox_norm[3] + 10],
+                    page=w.page
+                )
+                nearby_text = " ".join(nw.text.lower() for nw in nearby_words)
+                if any(k in nearby_text for k in ("seller", "vendor", "supplier", "from", "sold by")):
+                    score += 0.40
+                if any(k in nearby_text for k in ("bill to", "buyer", "ship to", "consignee", "recipient")):
+                    score -= 0.60  # Definitely buyer GSTIN
+
+            elif field_name == "buyer_gstin":
+                # Buyer GSTIN is expected near "Bill To" / "Buyer"
+                nearby_words = profile.find_words_in_box(
+                    [max(0, w.bbox_norm[0] - 250), max(0, w.bbox_norm[1] - 30), w.bbox_norm[2], w.bbox_norm[3] + 10],
+                    page=w.page
+                )
+                nearby_text = " ".join(nw.text.lower() for nw in nearby_words)
+                if any(k in nearby_text for k in ("bill to", "buyer", "ship to", "consignee", "recipient")):
+                    score += 0.50
+                if any(k in nearby_text for k in ("seller", "vendor", "supplier", "from")):
+                    score -= 0.50
+
+            # ── Date Field-Aware Candidate Ranking ───────────────────────────
+            elif field_name == "invoice_date":
+                nearby_words = profile.find_words_in_box(
+                    [max(0, w.bbox_norm[0] - 200), max(0, w.bbox_norm[1] - 15), w.bbox_norm[2], w.bbox_norm[3] + 15],
+                    page=w.page
+                )
+                nearby_text = " ".join(nw.text.lower() for nw in nearby_words)
+                if any(k in nearby_text for k in ("inv date", "invoice date", "bill date", "dated", "date of issue")):
+                    score += 0.50
+                elif "due date" in nearby_text or "po date" in nearby_text or "delivery" in nearby_text:
+                    score -= 0.40
+
+            candidates.append((score, val, w))
+
+        if candidates:
+            candidates.sort(key=lambda c: c[0], reverse=True)
+            best_score, best_val, best_token = candidates[0]
+            return FieldExtractionResult(
+                field_name=field_name,
+                value=best_val,
+                confidence=min(0.99, round(base_confidence * best_token.confidence, 3)),
+                strategy_used="regex_ranked",
+                bbox=best_token.bbox_norm,
+                raw_tokens=[best_token],
+            )
+
+        # Check full text if tokenization split regex
         full_text = " ".join(w.text for w in scope_words)
         m = pat.search(full_text)
         if m:
@@ -456,7 +549,7 @@ class TemplateExtractor:
             return FieldExtractionResult(
                 field_name=field_name,
                 value=val,
-                confidence=base_confidence * 0.90,
+                confidence=round(base_confidence * 0.90, 3),
                 strategy_used="regex_full_text",
             )
         return None

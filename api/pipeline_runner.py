@@ -302,26 +302,40 @@ class InvoicePipeline:
         extracted_per_page                         = []
         path_summary:         list[str]            = []
         all_page_regions:     list                 = []
+        page_dimensions:      dict[int, tuple[int, int]] = {}
 
         for p_idx, p_obj in enumerate(pages):
             logger.info(f"[{job_id}] Processing Page {p_idx + 1}/{page_count}...")
+            p_num = p_idx + 1
+
+            # Compute actual page image dimensions
+            p_w, p_h = 1000, 1414
+            if hasattr(p_obj.image, "shape"):
+                p_h, p_w = p_obj.image.shape[:2]
+            elif hasattr(p_obj.image, "size"):
+                p_w, p_h = p_obj.image.size
+            page_dimensions[p_num] = (p_w, p_h)
 
             # ── YOLO region detection ──────────────────────────────────────
-            _notify("detection", 2, 35, f"Region Detection: YOLOv8 identifying zones (Page {p_idx + 1}/{page_count})")
+            _notify("detection", 2, 35, f"Region Detection: YOLOv8 identifying zones (Page {p_num}/{page_count})")
             det_res = self.detector.detect(p_obj.image)
             detected_models.append(det_res.model_used)
+            # Tag each region with its exact page number
+            for r in det_res.regions:
+                if hasattr(r, "page"):
+                    r.page = p_num
             all_page_regions.append(det_res.regions)
             logger.info(
-                f"[{job_id}] Page {p_idx+1}: {len(det_res.regions)} regions "
+                f"[{job_id}] Page {p_num}: {len(det_res.regions)} regions "
                 f"via {det_res.model_used}"
             )
 
             # ── PATH A: Digital PDF page ───────────────────────────────────
             if isinstance(p_obj, NativePDFPage):
                 path_summary.append("native_pdf")
-                _notify("ocr", 3, 50, f"Extracting native PDF text (Page {p_idx + 1}/{page_count})")
+                _notify("ocr", 3, 50, f"Extracting native PDF text (Page {p_num}/{page_count})")
                 logger.info(
-                    f"[{job_id}] Page {p_idx+1}: PATH A — native text "
+                    f"[{job_id}] Page {p_num}: PATH A — native text "
                     f"({len(p_obj.words)} words, conf=0.99)"
                 )
                 p_ocr = _native_page_to_ocr_results(p_obj, det_res.regions)
@@ -330,36 +344,30 @@ class InvoicePipeline:
             # ── PATH B: Scanned page / direct image ────────────────────────
             else:
                 path_summary.append("ocr")
-                _notify("ocr", 3, 60, f"OCR Extraction: PaddleOCR reading text (Page {p_idx + 1}/{page_count})")
-                logger.info(f"[{job_id}] Page {p_idx+1}: PATH B — Scanned Image OCR")
+                _notify("ocr", 3, 60, f"OCR Extraction: PaddleOCR reading text (Page {p_num}/{page_count})")
+                logger.info(f"[{job_id}] Page {p_num}: PATH B — Scanned Image OCR")
 
                 p_ocr = {}
                 # Always extract full page so global context is never lost on diverse templates
                 full_res = self.ocr.extract_full_page(p_obj.image)
-                p_ocr[f"full_page_p{p_idx+1}"] = full_res
+                p_ocr[f"full_page_p{p_num}"] = full_res
 
                 if det_res.regions:
-                    _notify("ocr", 3, 68, f"OCR Extraction: Reading {len(det_res.regions)} structured region blocks (Page {p_idx + 1}/{page_count})")
+                    _notify("ocr", 3, 68, f"OCR Extraction: Reading {len(det_res.regions)} structured region blocks (Page {p_num}/{page_count})")
                     region_ocr = self.ocr.extract_all_regions(det_res.regions)
                     p_ocr.update(region_ocr)
 
                 pil_image = p_obj.pil_image
 
-            # Accumulate OCR results
+            # Accumulate OCR results with page-specific keys
             for k, v in p_ocr.items():
-                unique_key = k if k not in combined_ocr_results else f"{k}_p{p_idx+1}"
+                unique_key = k if f"_p{p_num}" in k else f"{k}_p{p_num}"
                 combined_ocr_results[unique_key] = v
                 all_raw_ocr_texts[unique_key] = v.full_text
 
         # ── Stage 3: Build DocumentProfile & Multi-Stage TIE Retrieval ──────
         _notify("retrieval", 4, 70, "TIE Retrieval: Checking known layout templates")
-        img_w, img_h = 1200, 1600
-        if pages:
-            img = pages[0].image
-            if hasattr(img, "shape"):
-                img_h, img_w = img.shape[:2]
-            elif hasattr(img, "size"):
-                img_w, img_h = img.size
+        primary_w, primary_h = page_dimensions.get(1, (1200, 1600))
 
         all_regions_flat = []
         for r_list in all_page_regions:
@@ -368,11 +376,12 @@ class InvoicePipeline:
         doc_profile = DocumentProfile.from_ocr_and_regions(
             ocr_results=combined_ocr_results,
             regions=all_regions_flat,
-            width=img_w,
-            height=img_h,
+            width=primary_w,
+            height=primary_h,
             page_count=page_count,
             is_digital_native=("native_pdf" in path_summary),
             quality_score=quality_score,
+            page_dimensions=page_dimensions,
         )
 
         tpl_match = self.template_retriever.retrieve(doc_profile)
@@ -381,18 +390,19 @@ class InvoicePipeline:
 
         # ── Stage 4a: Extraction (TIE Fast Path vs AI Fallback) ─────────────
         if tpl_match.match_type in ("exact_version", "family_anchor"):
-            _notify("understanding", 4, 78, f"TIE Extraction: Running deterministic rules ({tpl_match.match_type})")
+            _notify("understanding", 4, 78, f"TIE Extraction: Running rules ({tpl_match.match_type})")
             logger.info(f"[{job_id}] TIE Match: {tpl_match.match_type} (conf={tpl_match.match_confidence:.2f}, ver={tpl_match.matched_version_id})")
             extracted = self.template_extractor.extract(
                 profile=doc_profile,
                 field_rules=tpl_match.field_rules,
                 template_version_id=tpl_match.matched_version_id,
+                match_type=tpl_match.match_type,
             )
             # Use high-fidelity native digital PDF table items if available
             if pages and isinstance(pages[0], NativePDFPage) and pages[0].line_items:
                 extracted.line_items = pages[0].line_items
 
-            used_tie_fast_path = True
+            used_tie_fast_path = (tpl_match.match_type == "exact_version")
             primary_engine_label = "tie_fast_path" if tpl_match.match_type == "exact_version" else "tie_anchor_family"
 
             # Reconcile any unextracted optional fields with global heuristic
@@ -461,8 +471,9 @@ class InvoicePipeline:
                 needs_ai_enhancement = True
                 break
 
-        if self.settings.enable_llm_fallback and self.llm.is_available() and (needs_ai_enhancement or not used_tie_fast_path):
-            _notify("llm", 5, 90, "LLM Fallback: Checking confidence & completeness")
+        # Risk-based LLM triggering: only trigger when genuine extraction ambiguity or missing critical fields
+        if self.settings.enable_llm_fallback and self.llm.is_available() and needs_ai_enhancement:
+            _notify("llm", 5, 90, "LLM Fallback: Resolving low-confidence/ambiguous fields")
             logger.info(f"[{job_id}] Stage 4b: Selective LLM field enhancement ({self.settings.ollama_model})")
             page_imgs = [p.image for p in pages if hasattr(p, "image") and p.image is not None]
             llm_preds = self.llm.enhance_low_confidence_fields(
@@ -472,7 +483,7 @@ class InvoicePipeline:
                 page_images=page_imgs,
             ) or {}
         else:
-            _notify("llm", 5, 90, "LLM Fallback: Skipped (TIE high-confidence or offline)")
+            _notify("llm", 5, 90, "LLM Fallback: Skipped (High-confidence or offline)")
             llm_preds = {}
 
         # ── Stage 4c: Validation ─────────────────────────────────────────────

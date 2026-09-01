@@ -79,7 +79,9 @@ class TemplateRetriever:
         self.db = db_manager
         self._in_memory_index: list[CachedTemplateVersion] = []
         self._versions_by_id: dict[str, CachedTemplateVersion] = {}
-        self._exact_index: dict[str, CachedTemplateVersion] = {}
+        self._exact_fingerprint_index: dict[str, CachedTemplateVersion] = {}
+        self._version_fingerprint_index: dict[str, CachedTemplateVersion] = {}
+        self._layout_signature_index: dict[str, CachedTemplateVersion] = {}
         self._gstin_index: dict[str, list[CachedTemplateVersion]] = defaultdict(list)
         self._aspect_index: dict[int, list[CachedTemplateVersion]] = defaultdict(list)
         self._anchor_inverted_index: dict[str, set[str]] = defaultdict(set)
@@ -95,11 +97,11 @@ class TemplateRetriever:
         self._versions_by_id[tpl.version_id] = tpl
 
         if tpl.exact_fingerprint:
-            self._exact_index[tpl.exact_fingerprint] = tpl
+            self._exact_fingerprint_index[tpl.exact_fingerprint] = tpl
         if tpl.version_fingerprint:
-            self._exact_index[tpl.version_fingerprint] = tpl
+            self._version_fingerprint_index[tpl.version_fingerprint] = tpl
         if tpl.layout_signature:
-            self._exact_index[tpl.layout_signature] = tpl
+            self._layout_signature_index[tpl.layout_signature] = tpl
 
         if tpl.vendor_gstin:
             self._gstin_index[tpl.vendor_gstin.upper()].append(tpl)
@@ -116,18 +118,28 @@ class TemplateRetriever:
             return
 
         try:
-            versions = await self.db.get_all_active_template_versions()
+            # Use joined query if available to eliminate N+1 DB overhead
+            if hasattr(self.db, "get_all_active_templates_joined"):
+                tpl_data = await self.db.get_all_active_templates_joined()
+            else:
+                versions = await self.db.get_all_active_template_versions()
+                tpl_data = []
+                for ver in versions:
+                    rules = await self.db.get_field_rules_for_version(ver.id)
+                    fam = await self.db.get_template_family(ver.family_id)
+                    tpl_data.append((ver, fam, rules))
             
             # Reset indexes
             self._in_memory_index = []
             self._versions_by_id = {}
-            self._exact_index = {}
+            self._exact_fingerprint_index = {}
+            self._version_fingerprint_index = {}
+            self._layout_signature_index = {}
             self._gstin_index = defaultdict(list)
             self._aspect_index = defaultdict(list)
             self._anchor_inverted_index = defaultdict(set)
 
-            for ver in versions:
-                rules = await self.db.get_field_rules_for_version(ver.id)
+            for ver, fam, rules in tpl_data:
                 rule_dicts = [
                     {
                         "field_name": r.field_name,
@@ -142,8 +154,6 @@ class TemplateRetriever:
                     for r in rules
                 ]
 
-                # Get family info
-                fam = await self.db.get_template_family(ver.family_id)
                 v_gstin = fam.vendor_gstin if fam else None
                 v_name = fam.vendor_name if fam else None
 
@@ -256,8 +266,8 @@ class TemplateRetriever:
         start_t = time.perf_counter()
 
         # ── Fast-Path 1: Instant Exact Hash Match (O(1)) ─────────────────────
-        if profile.exact_fingerprint and profile.exact_fingerprint in self._exact_index:
-            tpl = self._exact_index[profile.exact_fingerprint]
+        if profile.exact_fingerprint and profile.exact_fingerprint in self._exact_fingerprint_index:
+            tpl = self._exact_fingerprint_index[profile.exact_fingerprint]
             dur_ms = (time.perf_counter() - start_t) * 1000.0
             return TemplateMatchResult(
                 matched_version_id=tpl.version_id,
@@ -269,8 +279,8 @@ class TemplateRetriever:
                 latency_ms=dur_ms,
             )
 
-        if profile.layout_signature and profile.layout_signature in self._exact_index:
-            tpl = self._exact_index[profile.layout_signature]
+        if profile.layout_signature and profile.layout_signature in self._layout_signature_index:
+            tpl = self._layout_signature_index[profile.layout_signature]
             dur_ms = (time.perf_counter() - start_t) * 1000.0
             return TemplateMatchResult(
                 matched_version_id=tpl.version_id,
@@ -282,15 +292,15 @@ class TemplateRetriever:
                 latency_ms=dur_ms,
             )
 
-        # ── Stage 1: Indexed Candidate Pruning (100k -> ~50) ─────────────────
+        # ── Stage 1: Indexed Candidate Pruning (100k -> <= 50) ───────────────
         candidate_ids: set[str] = set()
 
-        # 1. Vendor GSTIN exact lookup
+        # 1. Vendor GSTIN exact lookup (bounded to top 20)
         if profile.vendor_gstin and profile.vendor_gstin.upper() in self._gstin_index:
-            for t in self._gstin_index[profile.vendor_gstin.upper()]:
+            for t in self._gstin_index[profile.vendor_gstin.upper()][:20]:
                 candidate_ids.add(t.version_id)
 
-        # 2. Inverted anchor index lookup
+        # 2. Inverted anchor index lookup (bounded to top 30)
         anchor_hits_per_version: dict[str, int] = defaultdict(int)
         for anc in profile.anchor_set:
             if anc in self._anchor_inverted_index:
@@ -301,20 +311,20 @@ class TemplateRetriever:
         sorted_anchor_candidates = sorted(
             anchor_hits_per_version.items(), key=lambda x: x[1], reverse=True
         )
-        for vid, _ in sorted_anchor_candidates[:40]:
+        for vid, _ in sorted_anchor_candidates[:30]:
             candidate_ids.add(vid)
 
-        # 3. Geometry bucket candidates (if candidate pool is small)
+        # 3. Geometry bucket candidates (bounded to top 10 if candidate pool is small)
         if len(candidate_ids) < 10:
             for bucket in (profile.aspect_bucket - 1, profile.aspect_bucket, profile.aspect_bucket + 1):
                 if bucket in self._aspect_index:
-                    for t in self._aspect_index[bucket][:10]:
+                    for t in self._aspect_index[bucket][:5]:
                         candidate_ids.add(t.version_id)
 
-        # Retrieve Candidate Objects
+        # Retrieve Candidate Objects (bounded to at most 50)
         candidates: list[CachedTemplateVersion] = [
             self._versions_by_id[vid] for vid in candidate_ids if vid in self._versions_by_id
-        ]
+        ][:50]
         if not candidates and self._in_memory_index:
             candidates = self._in_memory_index[:20]
 

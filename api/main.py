@@ -1008,16 +1008,6 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
                     )
                     if tpl_ver_id:
                         schema.template_version_id = tpl_ver_id
-
-                # Closed Feedback Loop: Record human feedback against template version in PostgreSQL
-                target_ver_id = tpl_ver_id or record.template_version_id
-                if target_ver_id:
-                    was_correct = (len(corrections_list) == 0)
-                    await db.record_template_feedback(
-                        version_id=target_ver_id,
-                        was_correct=was_correct,
-                        field_corrections=corrections_list,
-                    )
             except Exception as tpl_learn_ex:
                 logger.debug(f"Template learning / feedback notice for {job_id}: {tpl_learn_ex}")
 
