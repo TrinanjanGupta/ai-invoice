@@ -86,13 +86,36 @@ class TemplateRetriever:
         self._aspect_index: dict[int, list[CachedTemplateVersion]] = defaultdict(list)
         self._anchor_inverted_index: dict[str, set[str]] = defaultdict(set)
         self._last_loaded_time: float = 0.0
+        self.is_healthy: bool = True
+        self.last_error: Optional[str] = None
 
     def register_in_memory_template(self, tpl: CachedTemplateVersion):
-        """Registers a template directly in memory and updates all fast indexes."""
+        """Registers a template directly in memory and updates all fast indexes idempotently."""
         self._index_template(tpl)
 
     def _index_template(self, tpl: CachedTemplateVersion):
-        """Adds a template version to the in-memory inverted indexes."""
+        """Adds or updates a template version in the in-memory inverted indexes idempotently."""
+        # 1. Purge old version references if this version_id was already indexed
+        if tpl.version_id in self._versions_by_id:
+            old_tpl = self._versions_by_id[tpl.version_id]
+            self._in_memory_index = [t for t in self._in_memory_index if t.version_id != tpl.version_id]
+            if old_tpl.vendor_gstin:
+                self._gstin_index[old_tpl.vendor_gstin.upper()] = [
+                    t for t in self._gstin_index[old_tpl.vendor_gstin.upper()] if t.version_id != tpl.version_id
+                ]
+            self._aspect_index[old_tpl.aspect_bucket] = [
+                t for t in self._aspect_index[old_tpl.aspect_bucket] if t.version_id != tpl.version_id
+            ]
+            for anc in old_tpl.anchor_set:
+                self._anchor_inverted_index[anc].discard(tpl.version_id)
+            if old_tpl.exact_fingerprint and self._exact_fingerprint_index.get(old_tpl.exact_fingerprint) == old_tpl:
+                del self._exact_fingerprint_index[old_tpl.exact_fingerprint]
+            if old_tpl.version_fingerprint and self._version_fingerprint_index.get(old_tpl.version_fingerprint) == old_tpl:
+                del self._version_fingerprint_index[old_tpl.version_fingerprint]
+            if old_tpl.layout_signature and self._layout_signature_index.get(old_tpl.layout_signature) == old_tpl:
+                del self._layout_signature_index[old_tpl.layout_signature]
+
+        # 2. Insert updated/new version
         self._in_memory_index.append(tpl)
         self._versions_by_id[tpl.version_id] = tpl
 
@@ -160,21 +183,14 @@ class TemplateRetriever:
                 # Extract topology features
                 topo = ver.topology_spec or {}
                 raw_anchor_set = set(topo.get("anchor_set", []))
-                if not raw_anchor_set and rule_dicts:
-                    for rd in rule_dicts:
-                        for a in rd.get("anchors", []):
-                            clean_a = a.replace(" ", "_").replace(":", "").strip("_").lower()
-                            if clean_a:
-                                raw_anchor_set.add(clean_a)
-
-                anchor_positions = topo.get("anchor_positions", {})
+                anchor_positions = {k: (float(v[0]), float(v[1])) for k, v in topo.get("anchor_positions", {}).items()}
                 region_topology = topo.get("region_topology", [])
 
                 cached = CachedTemplateVersion(
                     version_id=ver.id,
                     family_id=ver.family_id,
                     version_num=ver.version_num,
-                    exact_fingerprint=ver.version_fingerprint or "",
+                    exact_fingerprint=ver.version_fingerprint,
                     family_fingerprint=fam.family_fingerprint if fam else "",
                     aspect_bucket=int(round(float(ver.aspect_ratio or 1.41) * 10)),
                     aspect_ratio=ver.aspect_ratio or 1.41,
@@ -194,9 +210,13 @@ class TemplateRetriever:
                 self._index_template(cached)
 
             self._last_loaded_time = time.time()
+            self.is_healthy = True
+            self.last_error = None
             logger.info(f"Loaded {len(self._in_memory_index)} templates into indexed retrieval engine")
         except Exception as e:
-            logger.debug(f"Could not load templates from DB: {e}")
+            self.is_healthy = False
+            self.last_error = str(e)
+            logger.error(f"Failed to load templates from DB into TIE retriever: {e}", exc_info=True)
 
     # ── Mathematical Similarity Metrics ───────────────────────────────────────
 

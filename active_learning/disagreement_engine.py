@@ -51,65 +51,132 @@ def evaluate_model_disagreement(
     layoutlm_preds: Optional[dict] = None,
     heuristic_preds: Optional[dict] = None,
     llm_preds: Optional[dict] = None,
+    tie_preds: Optional[dict] = None,
 ) -> dict[str, Any]:
     """
-    Computes cross-model discrepancy across key semantic invoice fields.
+    Computes cross-model discrepancy across key semantic invoice fields (TIE, LayoutLM, Heuristics, LLM).
     """
     layoutlm = layoutlm_preds or {}
     heuristic = heuristic_preds or {}
     llm = llm_preds or {}
+    tie = tie_preds or {}
 
     disagreements = []
     disagreement_score = 0.0
 
     # 1. Grand Total Consensus (Critical financial metric - highest weight)
+    tt = tie.get("grand_total")
     lt = layoutlm.get("grand_total")
     ht = heuristic.get("grand_total")
     llmt = llm.get("grand_total")
-    present_totals = [t for t in [lt, ht, llmt] if t is not None]
 
-    if len(present_totals) >= 2:
-        if lt is not None and ht is not None and not numeric_match(lt, ht):
+    # If TIE produced a prediction, check against heuristic/LayoutLM
+    if tt is not None:
+        if ht is not None and not numeric_match(tt, ht):
             disagreements.append({
                 "field": "grand_total",
-                "layoutlm": lt,
-                "heuristic": ht,
-                "reason": f"LayoutLM ({lt}) != Heuristic ({ht})",
+                "engine_1": "tie",
+                "val_1": tt,
+                "engine_2": "heuristic",
+                "val_2": ht,
+                "reason": f"TIE ({tt}) != Heuristic ({ht})",
             })
-            disagreement_score += 40.0
+            disagreement_score += 35.0
+        elif lt is not None and not numeric_match(tt, lt):
+            disagreements.append({
+                "field": "grand_total",
+                "engine_1": "tie",
+                "val_1": tt,
+                "engine_2": "layoutlm",
+                "val_2": lt,
+                "reason": f"TIE ({tt}) != LayoutLM ({lt})",
+            })
+            disagreement_score += 30.0
+    elif lt is not None and ht is not None and not numeric_match(lt, ht):
+        disagreements.append({
+            "field": "grand_total",
+            "engine_1": "layoutlm",
+            "val_1": lt,
+            "engine_2": "heuristic",
+            "val_2": ht,
+            "reason": f"LayoutLM ({lt}) != Heuristic ({ht})",
+        })
+        disagreement_score += 40.0
 
     # 2. Vendor GSTIN Consensus (Legal tax entity)
+    tg = tie.get("vendor_gstin")
     lg = layoutlm.get("vendor_gstin")
     hg = heuristic.get("vendor_gstin")
-    if lg and hg and not text_match(lg, hg, threshold=0.90):
+
+    if tg and hg and not text_match(tg, hg, threshold=0.90):
         disagreements.append({
             "field": "vendor_gstin",
-            "layoutlm": lg,
-            "heuristic": hg,
+            "engine_1": "tie",
+            "val_1": tg,
+            "engine_2": "heuristic",
+            "val_2": hg,
+            "reason": f"GSTIN mismatch: TIE ({tg}) vs Heuristic ({hg})",
+        })
+        disagreement_score += 25.0
+    elif lg and hg and not text_match(lg, hg, threshold=0.90):
+        disagreements.append({
+            "field": "vendor_gstin",
+            "engine_1": "layoutlm",
+            "val_1": lg,
+            "engine_2": "heuristic",
+            "val_2": hg,
             "reason": f"GSTIN mismatch: LayoutLM ({lg}) vs Heuristic ({hg})",
         })
         disagreement_score += 30.0
 
     # 3. Invoice Number Consensus
+    ti = tie.get("invoice_number")
     li = layoutlm.get("invoice_number")
     hi = heuristic.get("invoice_number")
-    if li and hi and not text_match(li, hi, threshold=0.85):
+
+    if ti and hi and not text_match(ti, hi, threshold=0.85):
         disagreements.append({
             "field": "invoice_number",
-            "layoutlm": li,
-            "heuristic": hi,
+            "engine_1": "tie",
+            "val_1": ti,
+            "engine_2": "heuristic",
+            "val_2": hi,
+            "reason": f"Invoice No mismatch: TIE ({ti}) vs Heuristic ({hi})",
+        })
+        disagreement_score += 20.0
+    elif li and hi and not text_match(li, hi, threshold=0.85):
+        disagreements.append({
+            "field": "invoice_number",
+            "engine_1": "layoutlm",
+            "val_1": li,
+            "engine_2": "heuristic",
+            "val_2": hi,
             "reason": f"Invoice No mismatch: LayoutLM ({li}) vs Heuristic ({hi})",
         })
         disagreement_score += 20.0
 
     # 4. Vendor Name Consensus
+    tv = tie.get("vendor_name")
     lv = layoutlm.get("vendor_name")
     hv = heuristic.get("vendor_name")
-    if lv and hv and not text_match(lv, hv, threshold=0.75):
+
+    if tv and hv and not text_match(tv, hv, threshold=0.75):
         disagreements.append({
             "field": "vendor_name",
-            "layoutlm": lv,
-            "heuristic": hv,
+            "engine_1": "tie",
+            "val_1": tv,
+            "engine_2": "heuristic",
+            "val_2": hv,
+            "reason": f"Vendor name divergence: TIE ({tv}) vs Heuristic ({hv})",
+        })
+        disagreement_score += 15.0
+    elif lv and hv and not text_match(lv, hv, threshold=0.75):
+        disagreements.append({
+            "field": "vendor_name",
+            "engine_1": "layoutlm",
+            "val_1": lv,
+            "engine_2": "heuristic",
+            "val_2": hv,
             "reason": f"Vendor name divergence: LayoutLM ({lv}) vs Heuristic ({hv})",
         })
         disagreement_score += 15.0

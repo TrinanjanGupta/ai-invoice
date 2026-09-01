@@ -191,27 +191,48 @@ class TemplateLearner:
                     matched_anchor_phrase = anc
                     break
 
-            # Locate ground truth word tokens in profile (strict matching)
-            target_parts = [re.sub(r"[^a-z0-9]", "", p) for p in str(gt_val).lower().split() if len(p) > 0]
-            target_parts = [p for p in target_parts if p]
-            
-            gt_words = []
-            for w in profile.words:
-                w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
-                if not w_clean:
-                    continue
-                if w_clean == clean_gt or (w_clean in target_parts and len(w_clean) >= 2):
-                    gt_words.append(w)
+            # ── Contiguous Ground Truth Sequence Alignment ──
+            target_clean_tokens = [re.sub(r"[^a-z0-9]", "", p) for p in str(gt_val).lower().split() if len(p) > 0]
+            target_clean_tokens = [p for p in target_clean_tokens if p]
 
-            # If anchor is present, filter gt_words to those closest to the anchor
-            if matched_anchor and gt_words:
-                anc_cx = sum(w.center_norm[0] for w in matched_anchor) / len(matched_anchor)
-                anc_cy = sum(w.center_norm[1] for w in matched_anchor) / len(matched_anchor)
-                
-                # Keep words within vertical radius +- 60 norm px of anchor line
-                proximate_words = [w for w in gt_words if abs(w.center_norm[1] - anc_cy) <= 60]
-                if proximate_words:
-                    gt_words = proximate_words
+            candidate_sequences: list[list[WordToken]] = []
+            
+            # 1. Multi-word contiguous sequence match
+            if len(target_clean_tokens) > 1:
+                n_tokens = len(target_clean_tokens)
+                for i in range(len(profile.words) - n_tokens + 1):
+                    window = profile.words[i : i + n_tokens]
+                    # Ensure on same page and same vertical line
+                    if len(set(w.page for w in window)) > 1:
+                        continue
+                    if max(w.bbox_norm[3] for w in window) - min(w.bbox_norm[1] for w in window) > 60:
+                        continue
+                    window_clean = [re.sub(r"[^a-z0-9]", "", w.text.lower()) for w in window]
+                    if window_clean == target_clean_tokens:
+                        candidate_sequences.append(window)
+
+            # 2. Single token exact match or concatenated token match
+            if not candidate_sequences:
+                for i, w in enumerate(profile.words):
+                    w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
+                    if w_clean == clean_gt:
+                        candidate_sequences.append([w])
+                    elif clean_gt in w_clean and len(clean_gt) >= 3:
+                        candidate_sequences.append([w])
+
+            # 3. Select best occurrence based on spatial proximity to anchor
+            gt_words: list[WordToken] = []
+            if candidate_sequences:
+                if matched_anchor:
+                    anc_cy = sum(w.center_norm[1] for w in matched_anchor) / len(matched_anchor)
+                    anc_cx = sum(w.center_norm[0] for w in matched_anchor) / len(matched_anchor)
+                    candidate_sequences.sort(
+                        key=lambda seq: (
+                            (sum(w.center_norm[0] for w in seq) / len(seq) - anc_cx) ** 2 +
+                            (sum(w.center_norm[1] for w in seq) / len(seq) - anc_cy) ** 2
+                        )
+                    )
+                gt_words = candidate_sequences[0]
 
             if matched_anchor and gt_words:
                 # Calculate relative offset from anchor to value

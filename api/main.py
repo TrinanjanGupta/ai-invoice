@@ -158,19 +158,28 @@ async def health_check(request: Request):
     pipeline = get_pipeline(request)
 
     ollama_ok = False
+    tie_healthy = True
+    templates_count = 0
     if pipeline:
         try:
             ollama_ok = await asyncio.to_thread(pipeline.llm.is_available)
         except Exception:
             pass
+        if hasattr(pipeline, "template_retriever") and pipeline.template_retriever:
+            tie_healthy = getattr(pipeline.template_retriever, "is_healthy", True)
+            templates_count = len(getattr(pipeline.template_retriever, "_in_memory_index", []))
+
+    status_str = "ok" if (pipeline and tie_healthy) else "degraded"
 
     return HealthResponse(
-        status="ok",
+        status=status_str,
         version="1.0.0",
         ollama_available=ollama_ok,
         yolo_loaded=pipeline.detector.model is not None if pipeline else False,
         layoutlm_loaded=pipeline.extractor.model is not None if pipeline else False,
         ollama_model=settings.ollama_model,
+        tie_healthy=tie_healthy,
+        tie_templates_loaded=templates_count,
     )
 
 

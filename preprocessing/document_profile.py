@@ -124,6 +124,7 @@ class DocumentProfile:
     # ── Structured Mathematical Features (For Real Similarity) ────────────────
     anchor_set: set[str] = field(default_factory=set)
     anchor_positions: dict[str, tuple[float, float]] = field(default_factory=dict)
+    anchor_occurrences: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     region_topology: list[dict[str, Any]] = field(default_factory=list)
     aspect_bucket: int = 14
 
@@ -167,7 +168,7 @@ class DocumentProfile:
         full_text = " ".join(w.text for w in self.words if w.text)
         lower_full_text = full_text.lower()
 
-        # Extract structured anchor set & spatial centroids
+        # Extract structured anchor set & spatial centroids with multi-page occurrences
         if not self.anchor_set:
             for anc in CANONICAL_ANCHORS:
                 if anc in lower_full_text:
@@ -175,7 +176,21 @@ class DocumentProfile:
                     matched_seqs = self.find_anchor_tokens(anc)
                     if matched_seqs:
                         self.anchor_set.add(clean_anc)
-                        # Compute centroid across all occurrences
+                        self.anchor_occurrences[clean_anc] = []
+                        for seq in matched_seqs:
+                            seq_cx = sum(w.center_norm[0] for w in seq) / len(seq)
+                            seq_cy = sum(w.center_norm[1] for w in seq) / len(seq)
+                            seq_page = seq[0].page
+                            min_x = min(w.bbox_norm[0] for w in seq)
+                            min_y = min(w.bbox_norm[1] for w in seq)
+                            max_x = max(w.bbox_norm[2] for w in seq)
+                            max_y = max(w.bbox_norm[3] for w in seq)
+                            self.anchor_occurrences[clean_anc].append({
+                                "page": seq_page,
+                                "bbox_norm": [min_x, min_y, max_x, max_y],
+                                "center_norm": (round(seq_cx, 1), round(seq_cy, 1)),
+                            })
+                        # Primary centroid (first occurrence)
                         first_seq = matched_seqs[0]
                         cx = sum(w.center_norm[0] for w in first_seq) / len(first_seq)
                         cy = sum(w.center_norm[1] for w in first_seq) / len(first_seq)

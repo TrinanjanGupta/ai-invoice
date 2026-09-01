@@ -410,6 +410,11 @@ class InvoicePipeline:
             heuristic_input = full_page_ocrs if full_page_ocrs else combined_ocr_results
             global_heuristic = self.extractor._extract_heuristic(heuristic_input)
             extracted = self.extractor._merge_invoices(extracted, global_heuristic)
+            tie_snapshot = {
+                f: getattr(extracted, f).value
+                for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
+                if getattr(extracted, f, None) and getattr(extracted, f).value
+            }
             layoutlm_snapshot = {}
             heuristic_snapshot = {
                 f: getattr(global_heuristic, f).value
@@ -445,6 +450,7 @@ class InvoicePipeline:
                 if next_p.line_items:
                     extracted.line_items.extend(next_p.line_items)
 
+            tie_snapshot = {}
             layoutlm_snapshot = {
                 f: getattr(extracted, f).value
                 for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
@@ -504,7 +510,7 @@ class InvoicePipeline:
                     all_region_dicts.append({"label": getattr(r_obj, "label", "region"), "bbox": getattr(r_obj, "bbox", [0, 0, 0, 0])})
 
             tpl_id = compute_template_fingerprint(
-                img_w, img_h, all_region_dicts, vendor_gstin=invoice_schema.vendor_gstin
+                primary_w, primary_h, all_region_dicts, vendor_gstin=invoice_schema.vendor_gstin
             )
             tpl_info = TemplateManager().register_invoice(tpl_id, vendor_name=invoice_schema.vendor_name)
             if not tpl_match.matched_version_id:
@@ -514,6 +520,7 @@ class InvoicePipeline:
                 layoutlm_preds=layoutlm_snapshot,
                 heuristic_preds=heuristic_snapshot,
                 llm_preds=llm_preds,
+                tie_preds=tie_snapshot,
             )
 
             has_contradiction = bool(disagreement_res.get("has_contradiction", False))
@@ -539,6 +546,7 @@ class InvoicePipeline:
             has_contradiction=has_contradiction,
             is_novel_template=is_novel,
             doc_type=routing.doc_type,
+            match_type=tpl_match.match_type,
         )
 
         invoice_schema.needs_review = not is_auto_accepted

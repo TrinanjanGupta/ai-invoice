@@ -532,10 +532,20 @@ class TemplateExtractor:
         if candidates:
             candidates.sort(key=lambda c: c[0], reverse=True)
             best_score, best_val, best_token = candidates[0]
+
+            calibrated_conf = base_confidence * best_token.confidence
+            if len(candidates) > 1:
+                second_score, second_val, _ = candidates[1]
+                if second_val.upper() != best_val.upper():
+                    margin = max(0.0, best_score - second_score)
+                    if margin < 0.20:
+                        # Ambiguous match (e.g. 2 competing candidates with low score separation)
+                        calibrated_conf *= (0.70 + 1.5 * margin)
+
             return FieldExtractionResult(
                 field_name=field_name,
                 value=best_val,
-                confidence=min(0.99, round(base_confidence * best_token.confidence, 3)),
+                confidence=min(0.99, round(calibrated_conf, 3)),
                 strategy_used="regex_ranked",
                 bbox=best_token.bbox_norm,
                 raw_tokens=[best_token],
@@ -644,10 +654,19 @@ class TemplateExtractor:
         candidates.sort(key=lambda c: c[0], reverse=True)
         best_score, best_val, best_token = candidates[0]
 
+        calibrated_conf = base_confidence * best_token.confidence
+        if len(candidates) > 1:
+            second_score, second_val, _ = candidates[1]
+            if abs(best_val - second_val) > 0.05:  # Distinct numeric amounts
+                margin = max(0.0, best_score - second_score)
+                if margin < 0.20:
+                    # Low separation between competing financial amounts -> penalize confidence to trigger review
+                    calibrated_conf *= (0.65 + 1.75 * margin)
+
         return FieldExtractionResult(
             field_name=field_name,
             value=f"{best_val:.2f}",
-            confidence=min(0.99, round(base_confidence * best_token.confidence, 3)),
+            confidence=min(0.99, round(calibrated_conf, 3)),
             strategy_used="semantic_numeric_ranked",
             bbox=best_token.bbox_norm,
             raw_tokens=[best_token],

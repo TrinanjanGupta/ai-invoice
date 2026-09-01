@@ -399,7 +399,7 @@ class DatabaseManager:
         """
         from sqlalchemy import select
         async with self.session_factory() as session:
-            v_stmt = select(TemplateVersionRecord).where(TemplateVersionRecord.is_active == True)
+            v_stmt = select(TemplateVersionRecord).where(TemplateVersionRecord.status == "active")
             v_res = await session.execute(v_stmt)
             versions = list(v_res.scalars().all())
             if not versions:

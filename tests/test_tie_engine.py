@@ -275,6 +275,67 @@ class TestMultiPageAndCandidateRanking:
         assert res.buyer_gstin is not None
         assert res.buyer_gstin.value == "27BBBBB1111B1Z2"
 
+    def test_idempotent_template_registration(self):
+        retriever = TemplateRetriever()
+        tpl = CachedTemplateVersion(
+            version_id="ver_idempotent_1",
+            family_id="fam_test",
+            version_num=1,
+            exact_fingerprint="fp_idem_1",
+            family_fingerprint="fam_idem_1",
+            aspect_bucket=14,
+            aspect_ratio=1.41,
+            page_count=1,
+            vendor_gstin="27AAAAA0000A1Z5",
+            anchor_set={"invoice_no", "date"},
+            field_rules=[],
+        )
+        retriever.register_in_memory_template(tpl)
+        retriever.register_in_memory_template(tpl)  # Register second time
+
+        assert len([t for t in retriever._in_memory_index if t.version_id == "ver_idempotent_1"]) == 1
+        assert len(retriever._gstin_index["27AAAAA0000A1Z5"]) == 1
+        assert len(retriever._anchor_inverted_index["invoice_no"]) == 1
+
+    def test_candidate_margin_ambiguity_penalty(self):
+        words = [
+            WordToken(text="Total:", bbox_norm=[100, 500, 150, 520], bbox_raw=[100, 500, 150, 520], page=1),
+            WordToken(text="156.00", bbox_norm=[160, 500, 210, 520], bbox_raw=[160, 500, 210, 520], page=1, confidence=0.99),
+            WordToken(text="165.00", bbox_norm=[162, 501, 212, 521], bbox_raw=[162, 501, 212, 521], page=1, confidence=0.98),
+        ]
+        profile = DocumentProfile(page_count=1, width=1000, height=1414, aspect_ratio=1.41, words=words)
+        extractor = TemplateExtractor()
+        rules = [{"field_name": "grand_total", "strategy": "semantic_numeric", "anchors": ["total:"]}]
+        res = extractor.extract(profile, rules)
+        assert res.grand_total is not None
+        # Margin penalty must reduce confidence below 0.90 due to competing ambiguous numbers
+        assert res.grand_total.confidence < 0.90
+
+    def test_acceptance_gate_match_type_rigor(self):
+        from validation.acceptance_gate import AutoAcceptanceGate
+        from validation.validator import InvoiceSchema
+
+        invoice = InvoiceSchema(
+            invoice_number="INV-100",
+            invoice_date="10/08/2026",
+            grand_total=1000.0,
+            overall_confidence=0.89,
+            field_confidences={"grand_total": 0.91, "invoice_number": 0.91, "invoice_date": 0.91},
+        )
+
+        # 1. Exact match with 0.89 passes general gate (>= 0.88)
+        accepted_exact, _ = AutoAcceptanceGate.evaluate(invoice, match_type="exact_version")
+        assert accepted_exact is True
+
+        # 2. Family anchor match with 0.89 is rejected because family requires >= 0.92
+        accepted_family, reasons = AutoAcceptanceGate.evaluate(invoice, match_type="family_anchor")
+        assert accepted_family is False
+        assert any("Family" in r or "confidence" in r for r in reasons)
+
+        # 3. Novel layout is rejected
+        accepted_novel, _ = AutoAcceptanceGate.evaluate(invoice, match_type="none")
+        assert accepted_novel is False
+
 
 class TestGoldenSuite:
     def test_golden_suite_execution(self):

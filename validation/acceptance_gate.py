@@ -34,7 +34,9 @@ class AutoAcceptanceGate:
     """
 
     MIN_OVERALL_CONFIDENCE = 0.88
+    MIN_OVERALL_CONFIDENCE_FAMILY = 0.92
     MIN_CRITICAL_FIELD_CONFIDENCE = 0.90
+    MIN_CRITICAL_FIELD_CONFIDENCE_FAMILY = 0.94
     MIN_DOCUMENT_QUALITY_SCORE = 0.60
     CRITICAL_FIELDS = ["grand_total", "invoice_number", "invoice_date"]
 
@@ -47,17 +49,29 @@ class AutoAcceptanceGate:
         has_contradiction: bool = False,
         is_novel_template: bool = False,
         doc_type: str = "UNKNOWN",
+        match_type: Optional[str] = None,
     ) -> tuple[bool, list[str]]:
         """
         Evaluates invoice against all acceptance gates.
+        Enforces distinct rigor for exact_version, family_anchor, and novel templates.
         Returns: (is_auto_accepted, rejection_reasons)
         """
         rejection_reasons: list[str] = []
 
-        # 1. Validation Report Errors
-        if validation_report and (not validation_report.is_valid or validation_report.errors):
-            for err in validation_report.errors:
-                rejection_reasons.append(f"Validation Error: {err}")
+        is_family = (match_type == "family_anchor")
+        req_min_overall = cls.MIN_OVERALL_CONFIDENCE_FAMILY if is_family else cls.MIN_OVERALL_CONFIDENCE
+        req_min_critical = cls.MIN_CRITICAL_FIELD_CONFIDENCE_FAMILY if is_family else cls.MIN_CRITICAL_FIELD_CONFIDENCE
+
+        # 1. Validation Report Errors & Warnings
+        if validation_report:
+            if not validation_report.is_valid or validation_report.errors:
+                for err in validation_report.errors:
+                    rejection_reasons.append(f"Validation Error: {err}")
+            # Family matches must not have unresolved arithmetic warnings
+            if is_family and validation_report.warnings:
+                arithmetic_warnings = [w for w in validation_report.warnings if any(k in w.lower() for k in ("arithmetic", "math", "total", "tax", "mismatch"))]
+                if arithmetic_warnings:
+                    rejection_reasons.append(f"Family match rejected due to arithmetic reconciliation warning: {arithmetic_warnings[0]}")
 
         # 2. Critical Fields & Confidence Thresholds
         confs = invoice.field_confidences or {}
@@ -67,9 +81,9 @@ class AutoAcceptanceGate:
                 rejection_reasons.append(f"Required critical field missing: {cf}")
             else:
                 cf_conf = confs.get(cf, 0.0)
-                if cf_conf < cls.MIN_CRITICAL_FIELD_CONFIDENCE:
+                if cf_conf < req_min_critical:
                     rejection_reasons.append(
-                        f"Critical field {cf} confidence ({cf_conf:.2f}) below threshold ({cls.MIN_CRITICAL_FIELD_CONFIDENCE:.2f})"
+                        f"Critical field {cf} confidence ({cf_conf:.2f}) below threshold ({req_min_critical:.2f})"
                     )
 
         # 3. Vendor GSTIN Checksum
@@ -89,9 +103,9 @@ class AutoAcceptanceGate:
 
         # 5. Overall Calibrated Confidence Threshold
         overall_conf = invoice.overall_confidence or 0.0
-        if overall_conf < cls.MIN_OVERALL_CONFIDENCE:
+        if overall_conf < req_min_overall:
             rejection_reasons.append(
-                f"Overall confidence ({overall_conf:.2f}) below auto-acceptance threshold ({cls.MIN_OVERALL_CONFIDENCE:.2f})"
+                f"Overall confidence ({overall_conf:.2f}) below auto-acceptance threshold ({req_min_overall:.2f})"
             )
 
         # 6. Document Visual Quality
@@ -102,11 +116,11 @@ class AutoAcceptanceGate:
 
         # 7. Model Contradiction / Disagreement
         if has_contradiction:
-            rejection_reasons.append("Extraction contradiction detected between LayoutLM and heuristic engines")
+            rejection_reasons.append("Extraction contradiction detected between consensus engines")
 
-        # 8. Novel Layout Template
-        if is_novel_template:
-            rejection_reasons.append(f"Unseen layout template ({invoice.template_id}) requires initial human verification")
+        # 8. Novel Layout Template / Unknown Template
+        if is_novel_template or match_type == "none":
+            rejection_reasons.append(f"Unseen layout template ({invoice.template_id or 'novel'}) requires initial human verification")
 
         # 9. Document Routing (Handwriting & Mixed must be human reviewed)
         if doc_type in ("HANDWRITTEN", "MIXED"):

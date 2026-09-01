@@ -640,7 +640,24 @@ class OllamaClient:
 
         if unresolved_critical and page_images and self.is_vision_available():
             logger.info(f"Engaging Multimodal Vision-LLM on raw pixels for {len(unresolved_critical)} unresolved critical fields: {unresolved_critical}")
-            vis_results = self.extract_with_vision(page_images[0], unresolved_critical)
+            
+            # Page-aware routing: header fields on Page 1, totals on last page / candidate page
+            header_unresolved = [f for f in unresolved_critical if f in ("vendor_name", "invoice_number", "invoice_date")]
+            total_unresolved = [f for f in unresolved_critical if f in ("grand_total", "subtotal")]
+
+            vis_results = {}
+            if header_unresolved and len(page_images) >= 1:
+                p1_res = self.extract_with_vision(page_images[0], header_unresolved)
+                if p1_res:
+                    vis_results.update(p1_res)
+
+            if total_unresolved:
+                # Use last page where totals normally exist in multi-page invoices
+                target_img = page_images[-1] if len(page_images) > 1 else page_images[0]
+                tot_res = self.extract_with_vision(target_img, total_unresolved)
+                if tot_res:
+                    vis_results.update(tot_res)
+
             for f_name, v_val in vis_results.items():
                 if f_name in unresolved_critical and v_val:
                     v_str = str(v_val).strip()

@@ -57,3 +57,5 @@ class HealthResponse(BaseModel):
     yolo_loaded: bool
     layoutlm_loaded: bool
     ollama_model: str
+    tie_healthy: bool = True
+    tie_templates_loaded: int = 0
