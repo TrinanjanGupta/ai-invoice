@@ -258,8 +258,19 @@ async def upload_invoice(
     filename = file.filename or f"invoice_{job_id}.{suffix}"
     doc_hash = hashlib.sha256(file_bytes).hexdigest()
 
-    # Store to DB
     db: DatabaseManager = app.state.db
+
+    # ── Upfront Document Deduplication & Idempotency Gating ─────────────────
+    existing_job = await db.get_job_by_hash(doc_hash)
+    if existing_job:
+        if existing_job.status in ("done", "reviewed") or (existing_job.output_json and not existing_job.needs_review):
+            logger.info(f"Document deduplication: exact hash {doc_hash[:8]} already processed as job {existing_job.job_id}")
+            return JobResponse(job_id=existing_job.job_id, status=existing_job.status, filename=existing_job.filename)
+        elif existing_job.status in ("processing", "queued"):
+            logger.info(f"Document deduplication: exact hash {doc_hash[:8]} already in progress as job {existing_job.job_id}")
+            return JobResponse(job_id=existing_job.job_id, status="processing", filename=existing_job.filename)
+
+    # Store to DB
     await db.create_job(job_id=job_id, filename=filename, document_hash=doc_hash)
 
     # Save local copy to data/raw for instant document viewing
@@ -279,21 +290,41 @@ async def upload_invoice(
         storage_key = f"raw/{job_id}/{filename}"
         minio.upload_file(file_bytes, storage_key)
 
-    # Run pipeline in background
-    background_tasks.add_task(
-        _run_pipeline_task,
-        job_id=job_id,
-        file_bytes=file_bytes,
-        filename=filename,
-        storage_key=storage_key,
-        db=db,
-        minio=minio,
-        pipeline=app.state.pipeline,
-        settings=settings,
-    )
+    # Dispatch to Celery queue if enabled, or run in BackgroundTasks
+    use_celery = getattr(settings, "use_celery", False)
+    dispatched_celery = False
+    if use_celery:
+        try:
+            from worker.tasks import process_invoice_task
+            process_invoice_task.delay(job_id=job_id, storage_key=storage_key, filename=filename)
+            dispatched_celery = True
+            logger.info(f"Job dispatched to Celery cluster: {job_id} ({filename})")
+        except Exception as ce:
+            logger.warning(f"Celery dispatch failed ({ce}), falling back to background runner")
 
-    logger.info(f"Job queued: {job_id} ({filename})")
+    if not dispatched_celery:
+        background_tasks.add_task(
+            _run_pipeline_task,
+            job_id=job_id,
+            file_bytes=file_bytes,
+            filename=filename,
+            storage_key=storage_key,
+            db=db,
+            minio=minio,
+            pipeline=app.state.pipeline,
+            settings=settings,
+        )
+        logger.info(f"Job queued in local worker pool: {job_id} ({filename})")
+
     return JobResponse(job_id=job_id, status="processing", filename=filename)
+
+
+@app.get("/api/invoices/{job_id}/audit", tags=["Invoices"])
+async def get_invoice_audit_trail(job_id: str):
+    """Fetch complete immutable audit trail, extraction runs, field decisions, and review history."""
+    db: DatabaseManager = app.state.db
+    trail = await db.get_extraction_audit_trail(job_id)
+    return trail
 
 
 @app.post("/api/invoices/upload-batch", response_model=BatchJobResponse, tags=["Invoices"])
@@ -977,6 +1008,21 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
             ground_truth_source = "partial"
 
         schema.ground_truth_source = ground_truth_source
+
+        # Record immutable review events in the audit trail
+        if corrections_list:
+            try:
+                for c in corrections_list:
+                    await db.record_review_event(
+                        job_id=job_id,
+                        field_name=str(c.get("field", "unknown")),
+                        old_value=str(c.get("old_value", "")),
+                        new_value=str(c.get("new_value", "")),
+                        reason=str(c.get("reason", "Human manual correction")),
+                        reviewer_id=None,
+                    )
+            except Exception as rev_err:
+                logger.debug(f"Review event audit notice: {rev_err}")
 
         # Record template feedback lineage against the original prediction version
         if is_verified and record.template_version_id:

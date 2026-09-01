@@ -198,10 +198,43 @@ class InvoicePipeline:
     SUPPORTED_IMAGE_FORMATS = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".webp", ".bmp"}
     SUPPORTED_PDF_FORMATS   = {".pdf"}
 
-    def __init__(self, settings: Settings, db: Optional[Any] = None):
+    def __init__(
+        self,
+        settings: Settings,
+        db: Optional[Any] = None,
+        db_manager: Optional[Any] = None,
+        minio_manager: Optional[Any] = None,
+    ):
         self.settings = settings
-        self.db = db
+        self.db = db_manager or db
+        self.minio = minio_manager
         logger.info("Initialising Invoice Pipeline...")
+
+    @staticmethod
+    def _assign_tokens_to_regions(full_page_ocr: OCRResult, regions: list) -> dict[str, OCRResult]:
+        """Spatially intersects full-page OCR tokens into YOLO regions, eliminating duplicate OCR passes."""
+        results = {}
+        for r in regions:
+            rx1, ry1, rx2, ry2 = getattr(r, "bbox", [0, 0, 0, 0])
+            matching_blocks = []
+            for b in full_page_ocr.text_blocks:
+                bx1, by1, bx2, by2 = b.bbox
+                if bx1 >= rx1 - 10 and by1 >= ry1 - 10 and bx2 <= rx2 + 10 and by2 <= ry2 + 10:
+                    matching_blocks.append(b)
+                elif not (bx2 < rx1 or bx1 > rx2 or by2 < ry1 or by1 > ry2):
+                    matching_blocks.append(b)
+
+            if matching_blocks:
+                full_text = "\n".join(b.text for b in matching_blocks)
+                avg_conf = sum(b.confidence for b in matching_blocks) / len(matching_blocks)
+                label = getattr(r, "label", "region")
+                results[label] = OCRResult(
+                    region_label=label,
+                    text_blocks=matching_blocks,
+                    full_text=full_text,
+                    avg_confidence=round(avg_conf, 3),
+                )
+        return results
 
         self.preprocessor = InvoicePreprocessor()
         self.quality_scorer = DocumentQualityScorer()
@@ -348,13 +381,13 @@ class InvoicePipeline:
                 logger.info(f"[{job_id}] Page {p_num}: PATH B — Scanned Image OCR")
 
                 p_ocr = {}
-                # Always extract full page so global context is never lost on diverse templates
+                # Extract full page once; spatially intersect tokens into YOLO regions to eliminate duplicate OCR passes
                 full_res = self.ocr.extract_full_page(p_obj.image)
                 p_ocr[f"full_page_p{p_num}"] = full_res
 
                 if det_res.regions:
-                    _notify("ocr", 3, 68, f"OCR Extraction: Reading {len(det_res.regions)} structured region blocks (Page {p_num}/{page_count})")
-                    region_ocr = self.ocr.extract_all_regions(det_res.regions)
+                    _notify("ocr", 3, 68, f"OCR Extraction: Mapping {len(det_res.regions)} structured region blocks (Page {p_num}/{page_count})")
+                    region_ocr = self._assign_tokens_to_regions(full_res, det_res.regions)
                     p_ocr.update(region_ocr)
 
                 pil_image = p_obj.pil_image
@@ -364,6 +397,14 @@ class InvoicePipeline:
                 unique_key = k if f"_p{p_num}" in k else f"{k}_p{p_num}"
                 combined_ocr_results[unique_key] = v
                 all_raw_ocr_texts[unique_key] = v.full_text
+
+        # ── Stage 2b: Multi-Invoice Document Segmentation ────────────────────
+        from preprocessing.document_segmenter import DocumentSegmenter
+        segmenter = DocumentSegmenter()
+        page_texts = {p_idx + 1: combined_ocr_results.get(f"full_page_p{p_idx+1}", OCRResult()).full_text for p_idx in range(page_count)}
+        segments = segmenter.segment(page_texts)
+        if len(segments) > 1:
+            logger.info(f"[{job_id}] Merged multi-invoice upload detected ({len(segments)} sub-invoices).")
 
         # ── Stage 3: Build DocumentProfile & Multi-Stage TIE Retrieval ──────
         _notify("retrieval", 4, 70, "TIE Retrieval: Checking known layout templates")

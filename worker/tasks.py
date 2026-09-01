@@ -1,14 +1,24 @@
 """
-Celery worker — alternative to FastAPI background tasks.
-Use this for high-volume production deployments.
+worker/tasks.py
 
-Start with:
-    celery -A worker.celery_app worker --loglevel=info --concurrency=2
+Celery worker for high-throughput (100k+/month) asynchronous invoice processing.
+Features:
+- Lazy warm singleton InvoicePipeline (models loaded ONCE per worker process).
+- Zero-payload Redis queues: passes lightweight MinIO storage keys instead of multi-megabyte base64 blobs.
+- Concurrency-safe database updates and immutable extraction provenance recording.
+
+Start worker with:
+    celery -A worker.tasks.celery_app worker --loglevel=info --concurrency=4
 """
 
+import base64
+import asyncio
+from pathlib import Path
+from typing import Optional
 from celery import Celery
 from loguru import logger
 from config.settings import get_settings
+from storage.db import DatabaseManager, MinIOManager, HAS_MINIO
 
 settings = get_settings()
 
@@ -29,50 +39,106 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
 )
 
+# ── Module-Level Warm Singleton ───────────────────────────────────────────────
+_worker_pipeline = None
+_worker_db = None
+_worker_minio = None
+
+
+def get_worker_components():
+    global _worker_pipeline, _worker_db, _worker_minio
+    if _worker_pipeline is None:
+        logger.info("[Celery Worker] Initializing warm singleton models (PaddleOCR, YOLO, LayoutLM, TIE)...")
+        app_settings = get_settings()
+        _worker_db = DatabaseManager(app_settings.database_url)
+        _worker_minio = None
+        if HAS_MINIO and app_settings.minio_endpoint:
+            try:
+                _worker_minio = MinIOManager(
+                    endpoint=app_settings.minio_endpoint,
+                    access_key=app_settings.minio_access_key,
+                    secret_key=app_settings.minio_secret_key,
+                    bucket=app_settings.minio_bucket,
+                    secure=app_settings.minio_secure,
+                )
+            except Exception as me:
+                logger.warning(f"[Celery Worker] MinIO init notice: {me}")
+
+        from api.pipeline_runner import InvoicePipeline
+        _worker_pipeline = InvoicePipeline(settings=app_settings, db_manager=_worker_db, minio_manager=_worker_minio)
+        logger.info("[Celery Worker] Warm singleton initialized successfully.")
+
+    return _worker_pipeline, _worker_db, _worker_minio
+
 
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=10)
-def process_invoice_task(self, job_id: str, file_bytes_b64: str, filename: str):
+def process_invoice_task(
+    self,
+    job_id: str,
+    storage_key: Optional[str] = None,
+    filename: Optional[str] = None,
+    file_bytes_b64: Optional[str] = None,
+):
     """
     Celery task for processing an invoice.
-    file_bytes_b64: base64-encoded file bytes (JSON-safe).
+    Passes lightweight MinIO storage_key to avoid sending heavy binaries through Redis.
     """
-    import base64
-    import asyncio
-    from api.pipeline_runner import InvoicePipeline
-    from storage.db import DatabaseManager, MinIOManager
-
     try:
-        file_bytes = base64.b64decode(file_bytes_b64)
-        settings = get_settings()
-        pipeline = InvoicePipeline(settings)
+        pipeline, db, minio = get_worker_components()
+        fn = filename or "uploaded_invoice"
 
+        # 1. Retrieve raw file bytes from MinIO or local cache
+        file_bytes = None
+        if storage_key and minio:
+            try:
+                file_bytes = minio.download_file(storage_key)
+            except Exception as dl_err:
+                logger.warning(f"[Celery Worker] MinIO download failed for {storage_key}: {dl_err}")
+
+        if not file_bytes:
+            # Fallback to local raw file cache
+            local_raw_path = Path("data/raw") / f"{job_id}_{fn}"
+            if local_raw_path.exists():
+                with open(local_raw_path, "rb") as f:
+                    file_bytes = f.read()
+
+        if not file_bytes and file_bytes_b64:
+            file_bytes = base64.b64decode(file_bytes_b64)
+
+        if not file_bytes:
+            raise FileNotFoundError(f"Could not locate raw invoice bytes for job {job_id} (key={storage_key})")
+
+        # 2. Run pipeline inference using warm singleton
         result = pipeline.process(
             file_bytes=file_bytes,
-            filename=filename,
+            filename=fn,
             job_id=job_id,
         )
 
-        # Sync DB update
-        import asyncio
-        db = DatabaseManager(settings.database_url)
-
-        async def update():
+        # 3. Synchronize database state
+        async def sync_db():
+            inv = result.invoice
+            rev_status = "auto_accepted" if not inv.needs_review else "pending"
             await db.update_job(
                 job_id,
                 status="done",
-                output_json=result.invoice.model_dump(),
-                ai_output_json=result.invoice.model_dump(),
-                field_confidences=result.invoice.field_confidences,
-                review_status="auto_accepted" if not result.invoice.needs_review else "pending",
-                overall_confidence=result.invoice.overall_confidence,
-                needs_review=result.invoice.needs_review,
-                review_reasons=result.invoice.review_reasons,
+                output_json=inv.model_dump(),
+                ai_output_json=inv.model_dump(),
+                field_confidences=inv.field_confidences,
+                review_status=rev_status,
+                ground_truth_source="auto_accepted" if not inv.needs_review else "partial",
+                overall_confidence=inv.overall_confidence,
+                needs_review=inv.needs_review,
+                review_reasons=inv.review_reasons,
+                template_version_id=inv.template_version_id,
+                disagreement_score=inv.disagreement_score,
+                quality_score=getattr(result, "quality_score", 1.0),
             )
 
-        asyncio.get_event_loop().run_until_complete(update())
-        logger.info(f"Celery task complete: {job_id}")
-        return {"job_id": job_id, "status": "done"}
+        asyncio.run(sync_db())
+        logger.info(f"[Celery Worker] Successfully processed job {job_id} ({fn})")
+        return {"job_id": job_id, "status": "done", "overall_confidence": result.invoice.overall_confidence}
 
     except Exception as exc:
-        logger.error(f"Celery task failed: {job_id} — {exc}")
+        logger.exception(f"[Celery Worker] Task failed for job {job_id}: {exc}")
         self.retry(exc=exc)

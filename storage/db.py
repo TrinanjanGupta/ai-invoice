@@ -129,6 +129,67 @@ class InvoiceRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class ExtractionRunRecord(Base):
+    __tablename__ = "extraction_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    pipeline_version: Mapped[str] = mapped_column(String(32), default="2.0.0")
+    document_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    template_version_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    routing_decision: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    overall_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    decision: Mapped[str] = mapped_column(String(32), default="REVIEW")  # AUTO_ACCEPT | REVIEW
+    is_auto_accepted: Mapped[bool] = mapped_column(Boolean, default=False)
+    model_manifest: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class FieldDecisionRecord(Base):
+    __tablename__ = "field_decisions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    run_id: Mapped[str] = mapped_column(String(36), index=True)
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    field_name: Mapped[str] = mapped_column(String(64), index=True)
+    selected_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(32))  # tie, layoutlm, heuristic, llm, vision_llm, ocr
+    page: Mapped[int] = mapped_column(default=1)
+    bbox: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    ocr_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    validation_status: Mapped[str] = mapped_column(String(32), default="passed")
+    evidence_summary: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class ReviewEventRecord(Base):
+    __tablename__ = "review_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    job_id: Mapped[str] = mapped_column(String(36), index=True)
+    field_name: Mapped[str] = mapped_column(String(64), index=True)
+    old_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    new_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    reviewer_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DocumentSegmentRecord(Base):
+    __tablename__ = "document_segments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    parent_job_id: Mapped[str] = mapped_column(String(36), index=True)
+    child_job_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    segment_index: Mapped[int] = mapped_column(default=0)
+    page_start: Mapped[int] = mapped_column(default=1)
+    page_end: Mapped[int] = mapped_column(default=1)
+    detected_invoice_number: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    detected_vendor: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 # ------------------------------------------------------------------
 # Database manager
 # ------------------------------------------------------------------
@@ -515,6 +576,170 @@ class DatabaseManager:
                         stat.correction_count += 1
 
             await session.commit()
+
+    async def record_extraction_run(
+        self,
+        job_id: str,
+        pipeline_version: str = "2.0.0",
+        document_hash: Optional[str] = None,
+        template_version_id: Optional[str] = None,
+        routing_decision: Optional[str] = None,
+        overall_confidence: float = 0.0,
+        decision: str = "REVIEW",
+        is_auto_accepted: bool = False,
+        model_manifest: Optional[dict] = None,
+        field_decisions: Optional[list[dict]] = None,
+    ) -> str:
+        """Records an immutable extraction run and its field-level decisions."""
+        run_id = str(uuid.uuid4())
+        async with self.session_factory() as session:
+            run_rec = ExtractionRunRecord(
+                id=run_id,
+                job_id=job_id,
+                pipeline_version=pipeline_version,
+                document_hash=document_hash,
+                template_version_id=template_version_id,
+                routing_decision=routing_decision,
+                overall_confidence=overall_confidence,
+                decision=decision,
+                is_auto_accepted=is_auto_accepted,
+                model_manifest=model_manifest or {},
+            )
+            session.add(run_rec)
+
+            if field_decisions:
+                for fd in field_decisions:
+                    fd_rec = FieldDecisionRecord(
+                        id=str(uuid.uuid4()),
+                        run_id=run_id,
+                        job_id=job_id,
+                        field_name=fd["field_name"],
+                        selected_value=str(fd.get("value", "")),
+                        confidence=float(fd.get("confidence", 0.0)),
+                        source=fd.get("source", "ocr"),
+                        page=int(fd.get("page", 1)),
+                        bbox=fd.get("bbox"),
+                        ocr_confidence=float(fd.get("ocr_confidence", 0.0)) if fd.get("ocr_confidence") is not None else None,
+                        validation_status=fd.get("validation_status", "passed"),
+                        evidence_summary=fd.get("evidence_summary"),
+                    )
+                    session.add(fd_rec)
+
+            await session.commit()
+            return run_id
+
+    async def record_review_event(
+        self,
+        job_id: str,
+        field_name: str,
+        old_value: Optional[str],
+        new_value: Optional[str],
+        reason: Optional[str] = None,
+        reviewer_id: Optional[str] = None,
+    ):
+        """Records an immutable review edit event for full human auditability."""
+        async with self.session_factory() as session:
+            ev = ReviewEventRecord(
+                id=str(uuid.uuid4()),
+                job_id=job_id,
+                field_name=field_name,
+                old_value=old_value,
+                new_value=new_value,
+                reason=reason,
+                reviewer_id=reviewer_id,
+            )
+            session.add(ev)
+            await session.commit()
+
+    async def get_extraction_audit_trail(self, job_id: str) -> dict[str, Any]:
+        """Fetches the complete immutable provenance trail for a processed invoice."""
+        from sqlalchemy import select
+        async with self.session_factory() as session:
+            # Fetch latest run
+            r_stmt = select(ExtractionRunRecord).where(ExtractionRunRecord.job_id == job_id).order_by(ExtractionRunRecord.created_at.desc())
+            r_res = await session.execute(r_stmt)
+            latest_run = r_res.scalars().first()
+
+            decisions = []
+            if latest_run:
+                d_stmt = select(FieldDecisionRecord).where(FieldDecisionRecord.run_id == latest_run.id)
+                d_res = await session.execute(d_stmt)
+                for d in d_res.scalars().all():
+                    decisions.append({
+                        "field_name": d.field_name,
+                        "value": d.selected_value,
+                        "confidence": d.confidence,
+                        "source": d.source,
+                        "page": d.page,
+                        "bbox": d.bbox,
+                        "ocr_confidence": d.ocr_confidence,
+                        "validation_status": d.validation_status,
+                    })
+
+            # Fetch review history
+            rev_stmt = select(ReviewEventRecord).where(ReviewEventRecord.job_id == job_id).order_by(ReviewEventRecord.created_at.asc())
+            rev_res = await session.execute(rev_stmt)
+            review_events = [
+                {
+                    "field_name": re.field_name,
+                    "old_value": re.old_value,
+                    "new_value": re.new_value,
+                    "reason": re.reason,
+                    "reviewer_id": re.reviewer_id,
+                    "timestamp": re.created_at.isoformat() if re.created_at else None,
+                }
+                for re in rev_res.scalars().all()
+            ]
+
+            return {
+                "job_id": job_id,
+                "run": {
+                    "run_id": latest_run.id if latest_run else None,
+                    "pipeline_version": latest_run.pipeline_version if latest_run else None,
+                    "document_hash": latest_run.document_hash if latest_run else None,
+                    "template_version_id": latest_run.template_version_id if latest_run else None,
+                    "routing_decision": latest_run.routing_decision if latest_run else None,
+                    "overall_confidence": latest_run.overall_confidence if latest_run else None,
+                    "decision": latest_run.decision if latest_run else None,
+                } if latest_run else None,
+                "field_decisions": decisions,
+                "review_history": review_events,
+            }
+
+    async def record_document_segment(
+        self,
+        parent_job_id: str,
+        child_job_id: str,
+        segment_index: int,
+        page_start: int,
+        page_end: int,
+        detected_invoice_number: Optional[str] = None,
+        detected_vendor: Optional[str] = None,
+    ):
+        """Maps a sub-invoice child job to its parent multi-invoice upload."""
+        async with self.session_factory() as session:
+            seg = DocumentSegmentRecord(
+                id=str(uuid.uuid4()),
+                parent_job_id=parent_job_id,
+                child_job_id=child_job_id,
+                segment_index=segment_index,
+                page_start=page_start,
+                page_end=page_end,
+                detected_invoice_number=detected_invoice_number,
+                detected_vendor=detected_vendor,
+            )
+            session.add(seg)
+            await session.commit()
+
+    async def get_child_segments(self, parent_job_id: str) -> list[DocumentSegmentRecord]:
+        """Retrieves all sub-invoice children belonging to a segmented parent job."""
+        from sqlalchemy import select
+        async with self.session_factory() as session:
+            stmt = select(DocumentSegmentRecord).where(
+                DocumentSegmentRecord.parent_job_id == parent_job_id
+            ).order_by(DocumentSegmentRecord.segment_index.asc())
+            res = await session.execute(stmt)
+            return list(res.scalars().all())
 
 
 
