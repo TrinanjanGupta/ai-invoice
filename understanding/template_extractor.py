@@ -637,6 +637,14 @@ class TemplateExtractor:
                     # D. Confidence of OCR token
                     score *= w.confidence
 
+                    # E. Financial Plausibility Factor
+                    if field_name == "grand_total":
+                        if clean_f >= 1.0:
+                            score += 0.15
+                    elif field_name in ("cgst", "sgst", "igst", "tax_amount", "discount"):
+                        if clean_f > 50000.0:
+                            score -= 0.30
+
                     candidates.append((score, clean_f, w))
 
         # 2. Search fallback region

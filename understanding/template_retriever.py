@@ -286,6 +286,7 @@ class TemplateRetriever:
         start_t = time.perf_counter()
 
         # ── Fast-Path 1: Instant Exact Hash Match (O(1)) ─────────────────────
+        # Only true exact geometric fingerprint triggers instant O(1) exact_version
         if profile.exact_fingerprint and profile.exact_fingerprint in self._exact_fingerprint_index:
             tpl = self._exact_fingerprint_index[profile.exact_fingerprint]
             dur_ms = (time.perf_counter() - start_t) * 1000.0
@@ -293,20 +294,7 @@ class TemplateRetriever:
                 matched_version_id=tpl.version_id,
                 matched_family_id=tpl.family_id,
                 match_type="exact_version",
-                match_confidence=0.98,
-                field_rules=tpl.field_rules,
-                retrieval_stage="exact_hash",
-                latency_ms=dur_ms,
-            )
-
-        if profile.layout_signature and profile.layout_signature in self._layout_signature_index:
-            tpl = self._layout_signature_index[profile.layout_signature]
-            dur_ms = (time.perf_counter() - start_t) * 1000.0
-            return TemplateMatchResult(
-                matched_version_id=tpl.version_id,
-                matched_family_id=tpl.family_id,
-                match_type="exact_version",
-                match_confidence=0.98,
+                match_confidence=0.99,
                 field_rules=tpl.field_rules,
                 retrieval_stage="exact_hash",
                 latency_ms=dur_ms,
@@ -349,7 +337,7 @@ class TemplateRetriever:
             candidates = self._in_memory_index[:20]
 
         # ── Stage 2: Mathematical Similarity & Multi-Factor Scoring ──────────
-        scored_candidates: list[tuple[float, CachedTemplateVersion]] = []
+        scored_candidates: list[tuple[float, CachedTemplateVersion, float]] = []
 
         for tpl in candidates:
             # 1. Page count & geometry compatibility penalty
@@ -359,54 +347,64 @@ class TemplateRetriever:
             # 2. Anchor Jaccard Similarity
             jaccard = self.compute_anchor_jaccard(profile.anchor_set, tpl.anchor_set)
 
-            # 3. Spatial Alignment
+            # 3. Spatial Alignment (Geometric layout preservation)
             shared_anchors = profile.anchor_set & tpl.anchor_set
             spatial = self.compute_spatial_alignment(profile.anchor_positions, tpl.anchor_positions, shared_anchors)
 
             # 4. Region Topology Similarity
             reg_sim = self.compute_region_topology_similarity(profile.region_topology, tpl.region_topology)
 
-            # 5. Vendor GSTIN Match
+            # 5. Vendor GSTIN Match (10% influence - structure & geometry dominate)
             gstin_match = 1.0 if (profile.vendor_gstin and tpl.vendor_gstin and profile.vendor_gstin.upper() == tpl.vendor_gstin.upper()) else 0.0
 
             # Composite Calibrated Score
             composite_score = (
                 0.35 * jaccard +
-                0.25 * spatial +
+                0.35 * spatial +
                 0.20 * reg_sim +
-                0.20 * gstin_match
+                0.10 * gstin_match
             )
 
             # Empirical success rate calibration
             empirical_weight = 0.90 + 0.10 * (tpl.success_rate if tpl.sample_count >= 3 else 1.0)
             final_score = round(composite_score * empirical_weight, 3)
 
-            scored_candidates.append((final_score, tpl))
+            scored_candidates.append((final_score, tpl, spatial))
 
         scored_candidates.sort(key=lambda x: x[0], reverse=True)
 
         dur_ms = (time.perf_counter() - start_t) * 1000.0
 
         if scored_candidates:
-            best_score, best_tpl = scored_candidates[0]
+            best_score, best_tpl, best_spatial = scored_candidates[0]
 
-            # ── Stage 3: Calibrated Decision Gating ───────────────────────────
-            if best_score >= 0.90 or (best_score >= 0.85 and best_tpl.vendor_gstin and profile.vendor_gstin == best_tpl.vendor_gstin):
+            # ── Stage 3: Match Margin & Calibrated Decision Gating ────────────
+            match_margin = 1.0
+            if len(scored_candidates) > 1:
+                second_score, second_tpl, _ = scored_candidates[1]
+                if second_tpl.version_id != best_tpl.version_id:
+                    match_margin = max(0.0, best_score - second_score)
+
+            is_ambiguous = (match_margin < 0.05 and len(scored_candidates) > 1)
+            effective_conf = round(best_score * (0.90 if is_ambiguous else 1.0), 3)
+
+            # Require both high overall score AND strong spatial alignment for exact_version
+            if effective_conf >= 0.88 and not is_ambiguous and best_spatial >= 0.85:
                 return TemplateMatchResult(
                     matched_version_id=best_tpl.version_id,
                     matched_family_id=best_tpl.family_id,
                     match_type="exact_version",
-                    match_confidence=min(0.99, best_score),
+                    match_confidence=min(0.99, effective_conf),
                     field_rules=best_tpl.field_rules,
                     retrieval_stage="indexed_stage3_exact",
                     latency_ms=dur_ms,
                 )
-            elif best_score >= 0.75:
+            elif effective_conf >= 0.70:
                 return TemplateMatchResult(
                     matched_version_id=best_tpl.version_id,
                     matched_family_id=best_tpl.family_id,
                     match_type="family_anchor",
-                    match_confidence=best_score,
+                    match_confidence=effective_conf,
                     field_rules=best_tpl.field_rules,
                     retrieval_stage="indexed_stage3_family",
                     latency_ms=dur_ms,

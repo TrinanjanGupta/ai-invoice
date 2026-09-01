@@ -463,6 +463,7 @@ class DatabaseManager:
         version_id: str,
         was_correct: bool,
         field_corrections: Optional[list[dict]] = None,
+        field_results: Optional[list[dict]] = None,
     ):
         from sqlalchemy import update, select
         async with self.session_factory() as session:
@@ -475,31 +476,42 @@ class DatabaseManager:
                 else:
                     ver.correction_count += 1
                 tot = ver.success_count + ver.correction_count
+                ver.sample_count = tot
                 ver.success_rate = round(ver.success_count / tot, 3) if tot > 0 else 1.0
 
-            if field_corrections:
-                for fc in field_corrections:
-                    f_name = fc.get("field")
-                    if not f_name:
-                        continue
-                    st_stmt = select(TemplateStatisticsRecord).where(
-                        TemplateStatisticsRecord.version_id == version_id,
-                        TemplateStatisticsRecord.field_name == f_name,
+            results_to_process = field_results if field_results else (
+                [{"field": fc.get("field"), "status": "CORRECTED"} for fc in (field_corrections or [])]
+            )
+
+            for fr in results_to_process:
+                f_name = fr.get("field")
+                status = fr.get("status", "CORRECTED")
+                if not f_name or status in ("NOT_PRESENT", "NOT_APPLICABLE"):
+                    continue
+
+                st_stmt = select(TemplateStatisticsRecord).where(
+                    TemplateStatisticsRecord.version_id == version_id,
+                    TemplateStatisticsRecord.field_name == f_name,
+                )
+                st_res = await session.execute(st_stmt)
+                stat = st_res.scalar_one_or_none()
+                is_correct = (status == "CORRECT")
+
+                if not stat:
+                    stat = TemplateStatisticsRecord(
+                        id=str(uuid.uuid4()),
+                        version_id=version_id,
+                        field_name=f_name,
+                        sample_count=1,
+                        correct_count=1 if is_correct else 0,
+                        correction_count=0 if is_correct else 1,
                     )
-                    st_res = await session.execute(st_stmt)
-                    stat = st_res.scalar_one_or_none()
-                    if not stat:
-                        stat = TemplateStatisticsRecord(
-                            id=str(uuid.uuid4()),
-                            version_id=version_id,
-                            field_name=f_name,
-                            sample_count=1,
-                            correct_count=0,
-                            correction_count=1,
-                        )
-                        session.add(stat)
+                    session.add(stat)
+                else:
+                    stat.sample_count += 1
+                    if is_correct:
+                        stat.correct_count += 1
                     else:
-                        stat.sample_count += 1
                         stat.correction_count += 1
 
             await session.commit()

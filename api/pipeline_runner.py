@@ -497,24 +497,11 @@ class InvoicePipeline:
         logger.info(f"[{job_id}] Stage 4c: Validation")
         invoice_schema, validation_report = self.validator.validate(extracted)
 
-        # ── Template Registration & Disagreement Analysis ────────────────────
+        # ── Template Disagreement & Identity Analysis ────────────────────────
         has_contradiction = False
         is_novel = (tpl_match.match_type == "none")
         try:
-            from active_learning.template_fingerprint import compute_template_fingerprint, TemplateManager
             from active_learning.disagreement_engine import evaluate_model_disagreement
-
-            all_region_dicts = []
-            if all_page_regions:
-                for r_obj in all_page_regions[0]:
-                    all_region_dicts.append({"label": getattr(r_obj, "label", "region"), "bbox": getattr(r_obj, "bbox", [0, 0, 0, 0])})
-
-            tpl_id = compute_template_fingerprint(
-                primary_w, primary_h, all_region_dicts, vendor_gstin=invoice_schema.vendor_gstin
-            )
-            tpl_info = TemplateManager().register_invoice(tpl_id, vendor_name=invoice_schema.vendor_name)
-            if not tpl_match.matched_version_id:
-                is_novel = tpl_info.get("is_novel", True)
 
             disagreement_res = evaluate_model_disagreement(
                 layoutlm_preds=layoutlm_snapshot,
@@ -523,14 +510,17 @@ class InvoicePipeline:
                 tie_preds=tie_snapshot,
             )
 
+            canonical_tpl_id = tpl_match.matched_version_id or doc_profile.exact_fingerprint
+            canonical_family_id = tpl_match.matched_family_id or doc_profile.family_fingerprint
+
             has_contradiction = bool(disagreement_res.get("has_contradiction", False))
-            invoice_schema.template_id = tpl_match.matched_version_id or tpl_id
-            invoice_schema.template_family_id = tpl_match.matched_family_id
+            invoice_schema.template_id = canonical_tpl_id
+            invoice_schema.template_family_id = canonical_family_id
             invoice_schema.template_version_id = tpl_match.matched_version_id
             invoice_schema.is_novel_template = is_novel
             invoice_schema.disagreement_score = disagreement_res.get("disagreement_score", 0.0)
             if is_novel:
-                invoice_schema.review_reasons.append(f"Novel layout template ({tpl_id})")
+                invoice_schema.review_reasons.append(f"Novel layout template ({canonical_family_id[:8]})")
             if has_contradiction:
                 for d in disagreement_res.get("disagreements", []):
                     invoice_schema.review_reasons.append(d["reason"])

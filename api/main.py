@@ -978,6 +978,35 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
 
         schema.ground_truth_source = ground_truth_source
 
+        # Record template feedback lineage against the original prediction version
+        if is_verified and record.template_version_id:
+            try:
+                tracked_fields = [
+                    "invoice_number", "invoice_date", "due_date", "vendor_name", "vendor_gstin",
+                    "buyer_name", "buyer_gstin", "grand_total", "subtotal", "tax_amount"
+                ]
+                corrected_field_names = {c.get("field") for c in corrections_list if c.get("field")}
+                field_results = []
+                for fn in tracked_fields:
+                    ai_v = ai_data.get(fn)
+                    gt_v = human_data.get(fn)
+                    if fn in corrected_field_names:
+                        field_results.append({"field": fn, "status": "CORRECTED"})
+                    elif ai_v and gt_v:
+                        field_results.append({"field": fn, "status": "CORRECT"})
+                    elif not ai_v and not gt_v:
+                        field_results.append({"field": fn, "status": "NOT_PRESENT"})
+                    else:
+                        field_results.append({"field": fn, "status": "CORRECTED"})
+
+                await db.record_template_feedback(
+                    version_id=record.template_version_id,
+                    was_correct=(len(corrections_list) == 0),
+                    field_results=field_results,
+                )
+            except Exception as fb_err:
+                logger.debug(f"Template feedback tracking skipped: {fb_err}")
+
         # Automated TIE Template Learning: synthesize rules from verified ground truth
         tpl_ver_id = None
         if is_verified:
@@ -1018,7 +1047,7 @@ async def update_invoice(job_id: str, update: InvoiceUpdateRequest):
                     if tpl_ver_id:
                         schema.template_version_id = tpl_ver_id
             except Exception as tpl_learn_ex:
-                logger.debug(f"Template learning / feedback notice for {job_id}: {tpl_learn_ex}")
+                logger.debug(f"Template learning notice for {job_id}: {tpl_learn_ex}")
 
         updated_rec = await db.update_job(
             job_id,

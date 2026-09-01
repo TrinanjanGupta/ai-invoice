@@ -336,6 +336,75 @@ class TestMultiPageAndCandidateRanking:
         accepted_novel, _ = AutoAcceptanceGate.evaluate(invoice, match_type="none")
         assert accepted_novel is False
 
+    def test_template_learner_anchor_value_pair_scoring(self):
+        from understanding.template_learner import TemplateLearner
+        learner = TemplateLearner()
+
+        words = [
+            # Anchor 1: Due Date with due date value
+            WordToken(text="Due", bbox_norm=[100, 100, 130, 120], bbox_raw=[100, 100, 130, 120], page=1),
+            WordToken(text="Date:", bbox_norm=[135, 100, 175, 120], bbox_raw=[135, 100, 175, 120], page=1),
+            WordToken(text="30/08/2026", bbox_norm=[185, 100, 270, 120], bbox_raw=[185, 100, 270, 120], page=1),
+            
+            # Anchor 2: Invoice Date with invoice date value
+            WordToken(text="Invoice", bbox_norm=[100, 300, 160, 320], bbox_raw=[100, 300, 160, 320], page=1),
+            WordToken(text="Date:", bbox_norm=[165, 300, 210, 320], bbox_raw=[165, 300, 210, 320], page=1),
+            WordToken(text="15/08/2026", bbox_norm=[220, 300, 305, 320], bbox_raw=[220, 300, 305, 320], page=1),
+        ]
+        profile = DocumentProfile(page_count=1, width=1000, height=1414, aspect_ratio=1.41, words=words)
+        
+        rules = learner.synthesize_field_rules(profile, {"invoice_date": "15/08/2026"})
+        assert len(rules) == 1
+        rule = rules[0]
+        assert rule["field_name"] == "invoice_date"
+        # Relative box must originate from Invoice Date (y ~ 300), not Due Date (y ~ 100)
+        assert rule["relative_box"] is not None
+
+    def test_template_retriever_match_margin_ambiguity(self):
+        retriever = TemplateRetriever()
+        tpl1 = CachedTemplateVersion(
+            version_id="ver_tpl_1",
+            family_id="fam_1",
+            version_num=1,
+            exact_fingerprint="fp_1",
+            family_fingerprint="fam_fp_1",
+            aspect_bucket=14,
+            aspect_ratio=1.41,
+            page_count=1,
+            anchor_set={"invoice_no", "invoice_date", "total"},
+            anchor_positions={"invoice_no": (150.0, 100.0), "total": (700.0, 800.0)},
+            field_rules=[],
+        )
+        tpl2 = CachedTemplateVersion(
+            version_id="ver_tpl_2",
+            family_id="fam_2",
+            version_num=1,
+            exact_fingerprint="fp_2",
+            family_fingerprint="fam_fp_2",
+            aspect_bucket=14,
+            aspect_ratio=1.41,
+            page_count=1,
+            anchor_set={"invoice_no", "invoice_date", "total"},
+            anchor_positions={"invoice_no": (151.0, 101.0), "total": (701.0, 801.0)},
+            field_rules=[],
+        )
+        retriever.register_in_memory_template(tpl1)
+        retriever.register_in_memory_template(tpl2)
+
+        prof = DocumentProfile(
+            page_count=1,
+            width=1000,
+            height=1414,
+            aspect_ratio=1.41,
+            exact_fingerprint="fp_different_unseen",
+            anchor_set={"invoice_no", "invoice_date", "total"},
+            anchor_positions={"invoice_no": (150.5, 100.5), "total": (700.5, 800.5)},
+            words=[],
+        )
+        res = retriever.retrieve(prof)
+        # Margin is < 0.05, so retriever must flag ambiguity and degrade match_type to family_anchor
+        assert res.match_type == "family_anchor"
+
 
 class TestGoldenSuite:
     def test_golden_suite_execution(self):

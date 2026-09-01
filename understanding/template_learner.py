@@ -181,23 +181,20 @@ class TemplateLearner:
                 })
                 continue
 
-            # Locate anchor token sequence in profile
-            matched_anchor = None
-            matched_anchor_phrase = None
+            # ── 1. Locate all candidate anchor occurrences ──
+            all_anchor_seqs: list[tuple[str, list[WordToken]]] = []
             for anc in candidate_anchors:
                 matches = profile.find_anchor_tokens(anc)
-                if matches:
-                    matched_anchor = matches[0]
-                    matched_anchor_phrase = anc
-                    break
+                for seq in matches:
+                    all_anchor_seqs.append((anc, seq))
 
-            # ── Contiguous Ground Truth Sequence Alignment ──
+            # ── 2. Locate all candidate ground truth token sequences ──
             target_clean_tokens = [re.sub(r"[^a-z0-9]", "", p) for p in str(gt_val).lower().split() if len(p) > 0]
             target_clean_tokens = [p for p in target_clean_tokens if p]
 
             candidate_sequences: list[list[WordToken]] = []
             
-            # 1. Multi-word contiguous sequence match
+            # A. Multi-word contiguous sequence match
             if len(target_clean_tokens) > 1:
                 n_tokens = len(target_clean_tokens)
                 for i in range(len(profile.words) - n_tokens + 1):
@@ -211,7 +208,7 @@ class TemplateLearner:
                     if window_clean == target_clean_tokens:
                         candidate_sequences.append(window)
 
-            # 2. Single token exact match or concatenated token match
+            # B. Single token exact match or clean substring match
             if not candidate_sequences:
                 for i, w in enumerate(profile.words):
                     w_clean = re.sub(r"[^a-z0-9]", "", w.text.lower())
@@ -220,18 +217,76 @@ class TemplateLearner:
                     elif clean_gt in w_clean and len(clean_gt) >= 3:
                         candidate_sequences.append([w])
 
-            # 3. Select best occurrence based on spatial proximity to anchor
+            # ── 3. Score all (anchor, ground_truth) candidate pairs ──
+            scored_pairs: list[tuple[float, list[WordToken], list[WordToken]]] = []
+
+            for anc_phrase, anc_seq in all_anchor_seqs:
+                anc_p = anc_seq[0].page
+                anc_x1 = min(w.bbox_norm[0] for w in anc_seq)
+                anc_y1 = min(w.bbox_norm[1] for w in anc_seq)
+                anc_x2 = max(w.bbox_norm[2] for w in anc_seq)
+                anc_y2 = max(w.bbox_norm[3] for w in anc_seq)
+                anc_cx = sum(w.center_norm[0] for w in anc_seq) / len(anc_seq)
+                anc_cy = sum(w.center_norm[1] for w in anc_seq) / len(anc_seq)
+
+                for gt_seq in candidate_sequences:
+                    gt_p = gt_seq[0].page
+                    if anc_p != gt_p:
+                        continue  # Must be on same page
+                    
+                    val_x1 = min(w.bbox_norm[0] for w in gt_seq)
+                    val_y1 = min(w.bbox_norm[1] for w in gt_seq)
+                    val_x2 = max(w.bbox_norm[2] for w in gt_seq)
+                    val_y2 = max(w.bbox_norm[3] for w in gt_seq)
+                    val_cx = sum(w.center_norm[0] for w in gt_seq) / len(gt_seq)
+                    val_cy = sum(w.center_norm[1] for w in gt_seq) / len(gt_seq)
+
+                    pair_score = 1.0
+
+                    # A. Semantic anchor specificity & suitability
+                    if len(anc_phrase.split()) > 1:
+                        pair_score += 0.30
+
+                    anc_lower = anc_phrase.lower()
+                    if field_name == "invoice_date":
+                        if any(k in anc_lower for k in ("due", "po", "delivery", "lr", "valid")):
+                            pair_score -= 0.80
+                        if any(k in anc_lower for k in ("invoice date", "bill date", "inv date", "dated")):
+                            pair_score += 0.40
+                    elif field_name == "grand_total":
+                        if any(k in anc_lower for k in ("sub", "taxable", "item", "qty", "rate")):
+                            pair_score -= 0.70
+                        if any(k in anc_lower for k in ("grand total", "net total", "invoice total", "total amount")):
+                            pair_score += 0.40
+
+                    # B. Spatial arrangement
+                    is_inline = (val_x1 >= anc_x1 - 10 and abs(val_cy - anc_cy) <= 25 and val_x1 - anc_x2 <= 450)
+                    is_below = (abs(val_cx - anc_cx) <= 150 and val_y1 >= anc_y1 and val_y1 - anc_y2 <= 80)
+
+                    if is_inline:
+                        dist_x = max(0, val_x1 - anc_x2)
+                        dist_y = abs(val_cy - anc_cy)
+                        pair_score += max(0.0, 0.50 - (dist_x / 500.0) - (dist_y / 50.0))
+                    elif is_below:
+                        dist_y = max(0, val_y1 - anc_y2)
+                        dist_x = abs(val_cx - anc_cx)
+                        pair_score += max(0.0, 0.40 - (dist_y / 150.0) - (dist_x / 200.0))
+                    else:
+                        euc_dist = ((val_cx - anc_cx)**2 + (val_cy - anc_cy)**2) ** 0.5
+                        pair_score -= min(0.80, euc_dist / 600.0)
+
+                    scored_pairs.append((pair_score, anc_seq, gt_seq))
+
+            matched_anchor = None
             gt_words: list[WordToken] = []
-            if candidate_sequences:
-                if matched_anchor:
-                    anc_cy = sum(w.center_norm[1] for w in matched_anchor) / len(matched_anchor)
-                    anc_cx = sum(w.center_norm[0] for w in matched_anchor) / len(matched_anchor)
-                    candidate_sequences.sort(
-                        key=lambda seq: (
-                            (sum(w.center_norm[0] for w in seq) / len(seq) - anc_cx) ** 2 +
-                            (sum(w.center_norm[1] for w in seq) / len(seq) - anc_cy) ** 2
-                        )
-                    )
+
+            if scored_pairs:
+                scored_pairs.sort(key=lambda p: p[0], reverse=True)
+                best_pair_score, best_anc, best_gt = scored_pairs[0]
+                if best_pair_score >= 0.40:
+                    matched_anchor = best_anc
+                    gt_words = best_gt
+            elif candidate_sequences:
                 gt_words = candidate_sequences[0]
 
             if matched_anchor and gt_words:
