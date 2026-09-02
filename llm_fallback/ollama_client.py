@@ -8,6 +8,7 @@ Uses local Ollama inference with candidate evidence and spatial document context
 import re
 import json
 import httpx
+import numpy as np
 from loguru import logger
 from typing import Optional
 from understanding.layoutlm import ExtractedField
@@ -524,6 +525,52 @@ class OllamaClient:
         except Exception as e:
             logger.warning(f"Vision LLM extraction skipped: {e}")
             return {}
+
+    def resolve_crop_ambiguity(
+        self,
+        crop_image: np.ndarray,
+        field_name: str,
+        candidates: list[str],
+        prompt_hint: str = "",
+    ) -> tuple[str, float]:
+        """
+        Targeted Crop-Level VLM Ambiguity Resolver:
+        Sends a small (~200x60 px) field crop rather than a full page to the vision LLM,
+        asking it to disambiguate between specific OCR candidates.
+        """
+        if not self.enable_vision or not self.is_available() or crop_image is None or crop_image.size == 0:
+            return "", 0.0
+
+        try:
+            b64_crop = self._encode_image_b64(crop_image)
+            cands_str = ", ".join(f"'{c}'" for c in candidates if c)
+            prompt = (
+                f"You are examining a tight handwritten image crop for invoice field '{field_name}'.\n"
+                f"Candidate readings from OCR hypotheses: [{cands_str}].\n"
+                f"{prompt_hint}\n"
+                f"What is the exact text written in this crop? Return ONLY the exact text string, no commentary."
+            )
+
+            resp = httpx.post(
+                f"{self.base_url}/api/generate",
+                json={
+                    "model": self.vision_model,
+                    "prompt": prompt,
+                    "images": [b64_crop],
+                    "stream": False,
+                    "keep_alive": self.keep_alive,
+                    "options": self._build_options(num_predict=32, temperature=0.0),
+                },
+                timeout=min(self.timeout, 15.0),
+            )
+            resp.raise_for_status()
+            text = resp.json().get("response", "").strip().strip("\"'")
+            if text and text.lower() != "unknown":
+                return text, 0.90
+            return "", 0.0
+        except Exception as ex:
+            logger.debug(f"Crop VLM resolution skipped: {ex}")
+            return "", 0.0
 
     def enhance_low_confidence_fields(
         self,

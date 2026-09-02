@@ -24,11 +24,24 @@ class PreprocessResult:
     was_binarized: bool
 
 
+@dataclass
+class HandwrittenPreprocessResult(PreprocessResult):
+    original_image: np.ndarray = None       # Untouched image (after orientation/perspective)
+    enhanced_image: np.ndarray = None       # Preprocessed image for recognition
+    ruled_lines_removed: bool = False
+    detected_ink_type: str = "black_ink"
+    text_line_skew: float = 0.0
+    illumination_corrected: bool = False
+    handwriting_level: str = "MOSTLY_HANDWRITTEN"
+
+
 class InvoicePreprocessor:
     """
-    Full pre-processing pipeline for invoice images.
-    Input: path to image or numpy array
-    Output: PreprocessResult with cleaned, deskewed, normalised image
+    Full pre-processing pipeline for invoice images with specialized paths for:
+    - Standard printed scans
+    - Digital PDFs (minimal)
+    - Smartphone camera photos
+    - Handwritten pads and mixed documents
     """
 
     TARGET_DPI = 300
@@ -63,7 +76,6 @@ class InvoicePreprocessor:
             f"orient={orient_angle}°, deskew={angle:.2f}°, binarized={binarized}"
         )
 
-
         return PreprocessResult(
             image=img,
             pil_image=pil_img,
@@ -72,6 +84,214 @@ class InvoicePreprocessor:
             deskew_angle=angle,
             was_binarized=binarized,
         )
+
+    def process_handwritten(
+        self,
+        image_input,
+        handwriting_level: str = "MOSTLY_HANDWRITTEN",
+        is_phone_photo: bool = False,
+    ) -> HandwrittenPreprocessResult:
+        """
+        Specialized pipeline for handwritten pads and mixed documents:
+        1. Auto-orient thumbnail
+        2. Perspective warp (if photo)
+        3. Keep untouched copy as original_image (never destroyed)
+        4. Text-line-level deskew (corrects sloped writing)
+        5. Ruled notebook line suppression (morphological inpainting)
+        6. Foreground/background illumination normalization
+        7. Ink-specific contrast enhancement (blue ink/pencil/black ink)
+        8. DPI normalization & mild unsharp mask
+        """
+        raw_img = self._load(image_input)
+        original_size = (raw_img.shape[1], raw_img.shape[0])
+        logger.info(f"Handwritten pre-process — Input: {original_size[0]}x{original_size[1]} (level={handwriting_level})")
+
+        img, orient_angle = self._auto_orient(raw_img)
+        was_warped = False
+        if is_phone_photo:
+            img, was_warped = self._warp_perspective(img)
+
+        # Retain pristine original image crop for VLM fallback and dual-verification
+        original_kept = img.copy()
+
+        # Step A: Text-line level deskew
+        img, line_skew = self._deskew_text_lines(img)
+
+        # Step B: Ruled line suppression
+        img, lines_removed = self._remove_ruled_lines(img)
+
+        # Step C: Illumination normalization (shadows, stains, folds)
+        img = self._normalize_illumination(img)
+
+        # Step D: Detect and enhance ink strokes
+        ink_type = self._detect_ink_type(img)
+        img = self._enhance_ink(img, ink_type=ink_type)
+
+        # Step E: DPI normalization and sharpening
+        img = self._normalise_dpi(img)
+        img = self._sharpen(img)
+
+        processed_size = (img.shape[1], img.shape[0])
+        pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+        logger.info(
+            f"Handwritten pre-processing done: {original_size} → {processed_size}, "
+            f"ink={ink_type}, ruled_removed={lines_removed}, line_skew={line_skew:.2f}°"
+        )
+
+        return HandwrittenPreprocessResult(
+            image=img,
+            pil_image=pil_img,
+            original_size=original_size,
+            processed_size=processed_size,
+            deskew_angle=line_skew,
+            was_binarized=False,
+            original_image=original_kept,
+            enhanced_image=img,
+            ruled_lines_removed=lines_removed,
+            detected_ink_type=ink_type,
+            text_line_skew=line_skew,
+            illumination_corrected=True,
+            handwriting_level=handwriting_level,
+        )
+
+    def _deskew_text_lines(self, img: np.ndarray) -> tuple[np.ndarray, float]:
+        """
+        Detects text line slope across handwritten document components
+        and corrects line skew.
+        """
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+            lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=50, minLineLength=30, maxLineGap=10)
+            if lines is None:
+                return self._deskew(img)
+
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                if abs(x2 - x1) > 20:
+                    angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                    if abs(angle) < 40:
+                        angles.append(angle)
+
+            if not angles:
+                return self._deskew(img)
+
+            median_angle = float(np.median(angles))
+            if abs(median_angle) < 0.3:
+                return img, 0.0
+
+            h, w = img.shape[:2]
+            center = (w / 2, h / 2)
+            M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+            rotated = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+            return rotated, median_angle
+        except Exception as e:
+            logger.debug(f"Text-line deskew fallback: {e}")
+            return img, 0.0
+
+    def _remove_ruled_lines(self, img: np.ndarray) -> tuple[np.ndarray, bool]:
+        """
+        Suppresses horizontal ruled pad lines using morphological filtering
+        and inpainting so character strokes crossing the lines are preserved.
+        """
+        try:
+            h, w = img.shape[:2]
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+            # Detect horizontal lines spanning >15% of page width
+            kw = max(25, int(w * 0.12))
+            kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+            horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
+
+            h_contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            ruled_lines = [c for c in h_contours if cv2.boundingRect(c)[2] > (w * 0.15)]
+
+            if len(ruled_lines) < 2:
+                return img, False
+
+            # Create line mask
+            line_mask = np.zeros_like(gray)
+            for c in ruled_lines:
+                cv2.drawContours(line_mask, [c], -1, 255, thickness=2)
+
+            # Dilate line mask slightly
+            line_mask = cv2.dilate(line_mask, np.ones((2, 2), np.uint8), iterations=1)
+
+            # Inpaint ruled lines on the image
+            inpainted = cv2.inpaint(img, line_mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+            return inpainted, True
+        except Exception as e:
+            logger.debug(f"Ruled line removal skipped: {e}")
+            return img, False
+
+    def _normalize_illumination(self, img: np.ndarray) -> np.ndarray:
+        """
+        Normalizes background illumination, removing shadows, lighting gradients,
+        and stains from phone photos or old pads.
+        """
+        try:
+            rgb_planes = cv2.split(img)
+            result_planes = []
+            for plane in rgb_planes:
+                dilated = cv2.dilate(plane, np.ones((7, 7), np.uint8))
+                bg_blur = cv2.medianBlur(dilated, 21)
+                diff = 255 - cv2.absdiff(plane, bg_blur)
+                norm = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_8UC1)
+                result_planes.append(norm)
+            return cv2.merge(result_planes)
+        except Exception as e:
+            logger.debug(f"Illumination normalization fallback: {e}")
+            return img
+
+    def _detect_ink_type(self, img: np.ndarray) -> str:
+        """Detects primary ink type: blue_ink, black_ink, pencil, carbon_copy."""
+        try:
+            if len(img.shape) != 3:
+                return "black_ink"
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            fg_mask = thresh > 0
+            if not np.any(fg_mask):
+                return "black_ink"
+
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            fg_hsv = hsv[fg_mask]
+            mean_hue = np.median(fg_hsv[:, 0])
+            mean_sat = np.median(fg_hsv[:, 1])
+
+            if 90 <= mean_hue <= 135 and mean_sat > 35:
+                return "blue_ink"
+            elif mean_sat < 25:
+                mean_val = np.median(fg_hsv[:, 2])
+                return "pencil" if mean_val > 90 else "black_ink"
+            return "black_ink"
+        except Exception:
+            return "black_ink"
+
+    def _enhance_ink(self, img: np.ndarray, ink_type: str = "black_ink") -> np.ndarray:
+        """Enhances contrast tailored to specific ink pigment characteristics."""
+        try:
+            if ink_type == "blue_ink":
+                # For blue ink: increase saturation and CLAHE on blue channel
+                lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
+                cl = clahe.apply(l)
+                return cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+            elif ink_type == "pencil":
+                # For pencil: higher clip limit to boost faint graphite
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+                clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+                enhanced = clahe.apply(gray)
+                return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+            else:
+                # Default black ink / general CLAHE
+                return self._enhance_handwriting_contrast(img)
+        except Exception:
+            return img
 
     def process_minimal(self, image_input) -> PreprocessResult:
         """

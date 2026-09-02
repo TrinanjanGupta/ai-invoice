@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-# Custom 8-class Schema
+# Custom 12-class Schema (8 Invoice structure + 4 Handwriting/verification regions)
 CUSTOM_REGION_LABELS = {
     0: "header",
     1: "vendor_block",
@@ -27,6 +27,10 @@ CUSTOM_REGION_LABELS = {
     5: "tax_block",
     6: "payment_terms",
     7: "qr_barcode",
+    8: "handwriting",      # General handwritten value / note
+    9: "table",            # Table grid structure
+    10: "signature",       # Handwritten signature block
+    11: "stamp",           # Rubber stamp / seal
 }
 REGION_LABELS = CUSTOM_REGION_LABELS
 REGION_IDS = {v: k for k, v in REGION_LABELS.items()}
@@ -54,6 +58,8 @@ class DetectedRegion:
     confidence: float
     bbox: tuple           # (x1, y1, x2, y2) in pixels
     crop: np.ndarray      # cropped image of the region
+    page: int = 1
+    is_handwritten: bool = False
 
 
 @dataclass
@@ -156,6 +162,7 @@ class InvoiceDetector:
                 else:
                     label = CUSTOM_REGION_LABELS.get(cls_id, f"class_{cls_id}")
 
+                is_hw = cls_id in (8, 10, 11) or label in ("handwriting", "signature", "stamp")
                 crop = image[y1:y2, x1:x2]
                 if crop.size > 0:
                     raw_regions.append(DetectedRegion(
@@ -164,11 +171,19 @@ class InvoiceDetector:
                         confidence=conf,
                         bbox=(x1, y1, x2, y2),
                         crop=crop,
+                        is_handwritten=is_hw,
                     ))
 
         raw_regions.sort(key=lambda r: r.bbox[1])  # sort top-to-bottom
         model_tag = "doclayout-yolo" if self.is_doclaynet else "yolo"
         return DetectionResult(regions=raw_regions, image_size=(w, h), model_used=model_tag)
+
+    def detect_handwriting_regions(self, image: np.ndarray, conf_threshold: float = 0.20) -> list[DetectedRegion]:
+        """
+        Detects specifically handwritten zones, signatures, and stamp regions.
+        """
+        res = self.detect(image, conf_threshold=conf_threshold)
+        return [r for r in res.regions if r.is_handwritten or r.label in ("handwriting", "signature", "stamp")]
 
     def _detect_heuristic(self, image: np.ndarray) -> DetectionResult:
         """

@@ -462,7 +462,13 @@ class InvoiceValidator:
 
     TOLERANCE = 0.02   # 2% tolerance for floating-point rounding in OCR amounts
 
-    def validate(self, invoice: ExtractedInvoice) -> tuple[InvoiceSchema, ValidationReport]:
+    def validate(
+        self,
+        invoice: ExtractedInvoice,
+        doc_type: str = "PRINTED_SCAN",
+        handwriting_level: str = "NONE",
+        handwriting_penalty: float = 0.85,
+    ) -> tuple[InvoiceSchema, ValidationReport]:
         report = ValidationReport()
         schema = self._to_schema(invoice)
 
@@ -477,7 +483,13 @@ class InvoiceValidator:
 
         # Multi-evidence field-level confidence and arithmetic consistency evaluation
         from validation.confidence_engine import FieldConfidenceEngine
-        conf_eval = FieldConfidenceEngine().evaluate(schema.model_dump(), ocr_avg_conf=0.90)
+        conf_eval = FieldConfidenceEngine().evaluate(
+            schema.model_dump(),
+            ocr_avg_conf=0.90,
+            handwriting_level=handwriting_level,
+            doc_type=doc_type,
+            handwriting_penalty=handwriting_penalty,
+        )
 
         schema.field_confidences = conf_eval["field_confidences"]
         schema.fields_needing_review = conf_eval["fields_needing_review"]
@@ -552,6 +564,38 @@ class InvoiceValidator:
                 s.account_name = s.vendor_name
 
         return s
+
+    def reconcile_accounting_hypotheses(
+        self,
+        candidate_map: dict[str, list[tuple[str, float]]],
+        subtotal_cands: Optional[list[float]] = None,
+        tax_cands: Optional[list[float]] = None,
+        total_cands: Optional[list[float]] = None,
+    ) -> Optional[dict[str, tuple[float, float]]]:
+        """
+        Accounting Hypothesis Validator:
+        Searches candidate combinations across financial totals to find arithmetic equilibrium:
+        subtotal + tax == grand_total.
+        Returns the winning combination with boosted confidence if verified.
+        """
+        sub_list = subtotal_cands or []
+        tax_list = tax_cands or [0.0]
+        tot_list = total_cands or []
+
+        for sub in sub_list:
+            for tax in tax_list:
+                for tot in tot_list:
+                    if abs((sub + tax) - tot) <= 0.05 and tot > 0:
+                        logger.info(
+                            f"[Accounting Validator] Arithmetic equilibrium verified: "
+                            f"subtotal ({sub}) + tax ({tax}) == grand_total ({tot})"
+                        )
+                        return {
+                            "subtotal": (sub, 0.98),
+                            "tax_amount": (tax, 0.98),
+                            "grand_total": (tot, 0.98),
+                        }
+        return None
 
 
     # ------------------------------------------------------------------

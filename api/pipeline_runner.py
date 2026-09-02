@@ -23,6 +23,7 @@ from loguru import logger
 from dataclasses import dataclass
 from typing import Optional, Any, Callable
 
+import numpy as np
 import pymupdf
 from PIL import Image
 
@@ -34,6 +35,10 @@ from preprocessing.document_router import DocumentRouter, DocumentRoutingDecisio
 from preprocessing.document_profile import DocumentProfile
 from detection.detector import InvoiceDetector
 from ocr.extractor import InvoiceOCR, OCRResult, TextBlock, OCRWord
+from ocr.handwriting_ocr import HandwritingOCR
+from ocr.numeric_recognizer import NumericRecognizer
+from ocr.candidate_generator import CandidateGenerator, OCRCandidate
+from preprocessing.handwriting_cropper import FieldCrop, crop_from_yolo_regions, crop_from_tie_anchors
 from understanding.layoutlm import LayoutLMExtractor, ExtractedInvoice
 from understanding.table_extractor import TableExtractor
 from understanding.template_extractor import TemplateExtractor
@@ -41,6 +46,18 @@ from understanding.template_retriever import TemplateRetriever, TemplateMatchRes
 from llm_fallback.ollama_client import OllamaClient
 from validation.validator import InvoiceValidator, InvoiceSchema, ValidationReport
 from output.renderer import InvoiceRenderer
+
+
+@dataclass
+class ProcessingContext:
+    doc_type: str
+    handwriting_level: str
+    handwriting_confidence: float
+    quality_score: float
+    is_phone_photo: bool
+    original_images: list[np.ndarray] = None
+    enhanced_images: list[np.ndarray] = None
+    has_ruled_lines: bool = False
 
 
 @dataclass
@@ -56,6 +73,7 @@ class PipelineResult:
     doc_type: str = "UNKNOWN"
     quality_score: float = 1.0
     doc_profile: Optional[Any] = None
+    processing_context: Optional[ProcessingContext] = None
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +260,9 @@ class InvoicePipeline:
         self.pdf_converter = PDFConverter()
         self.detector      = InvoiceDetector(model_path=settings.yolo_model_path)
         self.ocr           = InvoiceOCR(languages=settings.ocr_languages, use_gpu=False)
+        self.handwriting_ocr = HandwritingOCR(use_gpu=False, lazy_load=True)
+        self.numeric_recognizer = NumericRecognizer()
+        self.candidate_generator = CandidateGenerator(numeric_recognizer=self.numeric_recognizer)
         self.extractor     = LayoutLMExtractor(
             model_path=settings.layoutlm_model_path,
             base_model=settings.layoutlm_base_model,
@@ -301,29 +322,69 @@ class InvoicePipeline:
         _notify("preprocessing", 1, 10, "Document Routing: Analyzing type & quality")
         routing = self.document_router.route(file_bytes, filename=filename)
         quality_score = 1.0
+        original_images = []
+        enhanced_images = []
+
+        is_handwritten = routing.handwriting_level in ("MOSTLY_HANDWRITTEN", "FULLY_HANDWRITTEN") or routing.doc_type == DocumentRouter.HANDWRITTEN
 
         if suffix in self.SUPPORTED_PDF_FORMATS:
-            logger.info(f"[{job_id}] Stage 2: PDF → dual-path conversion (Route: {routing.doc_type})")
+            logger.info(f"[{job_id}] Stage 2: PDF → dual-path conversion (Route: {routing.doc_type}, HW: {routing.handwriting_level})")
             pages = self.pdf_converter.convert_bytes(file_bytes)
             if pages and hasattr(pages[0], "image"):
                 qa = self.quality_scorer.assess(pages[0].image)
                 quality_score = qa.composite_score
-                # If PDF raster is detected as a phone photo, apply illumination normalization
-                if routing.doc_type == DocumentRouter.PHONE_PHOTO:
-                    for p in pages:
-                        if hasattr(p, "image") and isinstance(p.image, np.ndarray):
+                for p in pages:
+                    if hasattr(p, "image") and isinstance(p.image, np.ndarray):
+                        original_images.append(p.image.copy())
+                        if is_handwritten:
+                            hw_res = self.preprocessor.process_handwritten(
+                                p.image,
+                                handwriting_level=routing.handwriting_level,
+                                is_phone_photo=(routing.doc_type == DocumentRouter.PHONE_PHOTO),
+                            )
+                            p.image = hw_res.image
+                            if hasattr(p, "pil_image"):
+                                p.pil_image = hw_res.pil_image
+                            enhanced_images.append(hw_res.image)
+                        elif routing.doc_type == DocumentRouter.PHONE_PHOTO:
                             p.image = self.preprocessor._remove_shadows(p.image)
+                            enhanced_images.append(p.image)
+                        else:
+                            enhanced_images.append(p.image)
         elif suffix in self.SUPPORTED_IMAGE_FORMATS:
-            logger.info(f"[{job_id}] Stage 2: Image pre-processing (Route: {routing.doc_type})")
+            logger.info(f"[{job_id}] Stage 2: Image pre-processing (Route: {routing.doc_type}, HW: {routing.handwriting_level})")
             qa = self.quality_scorer.assess(file_bytes)
             quality_score = qa.composite_score
-            if routing.doc_type == DocumentRouter.PHONE_PHOTO:
+            if is_handwritten:
+                page = self.preprocessor.process_handwritten(
+                    file_bytes,
+                    handwriting_level=routing.handwriting_level,
+                    is_phone_photo=(routing.doc_type == DocumentRouter.PHONE_PHOTO),
+                )
+                original_images.append(getattr(page, "original_image", page.image))
+                enhanced_images.append(page.image)
+            elif routing.doc_type == DocumentRouter.PHONE_PHOTO:
                 page = self.preprocessor.process_photo(file_bytes)
+                original_images.append(page.image)
+                enhanced_images.append(page.image)
             else:
                 page = self.preprocessor.process(file_bytes)
+                original_images.append(page.image)
+                enhanced_images.append(page.image)
             pages = [page]
         else:
             raise ValueError(f"Unsupported file format: {suffix}")
+
+        processing_ctx = ProcessingContext(
+            doc_type=routing.doc_type,
+            handwriting_level=routing.handwriting_level,
+            handwriting_confidence=routing.handwriting_confidence,
+            quality_score=quality_score,
+            is_phone_photo=(routing.doc_type == DocumentRouter.PHONE_PHOTO),
+            original_images=original_images,
+            enhanced_images=enhanced_images,
+            has_ruled_lines=routing.has_ruled_lines,
+        )
 
         page_count = len(pages)
         logger.info(f"[{job_id}] {page_count} page(s) to process (Quality: {quality_score:.2f})")
@@ -389,6 +450,25 @@ class InvoicePipeline:
                     _notify("ocr", 3, 68, f"OCR Extraction: Mapping {len(det_res.regions)} structured region blocks (Page {p_num}/{page_count})")
                     region_ocr = self._assign_tokens_to_regions(full_res, det_res.regions)
                     p_ocr.update(region_ocr)
+
+                # Generate handwriting & numeric candidates for detected regions
+                is_hw_doc = routing.handwriting_level in ("MOSTLY_HANDWRITTEN", "FULLY_HANDWRITTEN", "MIXED")
+                hw_regions = [r for r in det_res.regions if r.is_handwritten or is_hw_doc]
+                if hw_regions:
+                    enh_img = processing_ctx.enhanced_images[p_idx] if processing_ctx.enhanced_images and p_idx < len(processing_ctx.enhanced_images) else p_obj.image
+                    crops = crop_from_yolo_regions(p_obj.image, hw_regions, enhanced_image=enh_img, page=p_num)
+                    for crop in crops:
+                        region_key = f"{crop.field_name}_p{p_num}" if f"_p{p_num}" not in crop.field_name else crop.field_name
+                        raw_text = p_ocr.get(crop.field_name, full_res).full_text
+                        cands = self.candidate_generator.generate_candidates(
+                            field_crop=crop,
+                            handwriting_ocr=self.handwriting_ocr,
+                            raw_ocr_text=raw_text,
+                        )
+                        if region_key in p_ocr:
+                            p_ocr[region_key].candidates = cands
+                        elif crop.field_name in p_ocr:
+                            p_ocr[crop.field_name].candidates = cands
 
                 pil_image = p_obj.pil_image
 
@@ -545,7 +625,12 @@ class InvoicePipeline:
         # ── Stage 4c: Validation ─────────────────────────────────────────────
         _notify("validation", 6, 95, "Validation: Rules engine & arithmetic reconciliation")
         logger.info(f"[{job_id}] Stage 4c: Validation")
-        invoice_schema, validation_report = self.validator.validate(extracted)
+        invoice_schema, validation_report = self.validator.validate(
+            extracted,
+            doc_type=routing.doc_type,
+            handwriting_level=routing.handwriting_level,
+            handwriting_penalty=getattr(self.settings, "handwriting_confidence_penalty", 0.85),
+        )
 
         # ── Template Disagreement & Identity Analysis ────────────────────────
         has_contradiction = False
@@ -628,5 +713,8 @@ class InvoicePipeline:
             raw_ocr_texts=all_raw_ocr_texts,
             page_count=page_count,
             model_used=model_used,
+            doc_type=routing.doc_type,
+            quality_score=quality_score,
             doc_profile=doc_profile,
+            processing_context=processing_ctx,
         )

@@ -22,21 +22,37 @@ from loguru import logger
 import pymupdf
 
 
+from enum import Enum
+
+
+class HandwritingLevel(str, Enum):
+    NONE = "NONE"
+    FIELD_ONLY = "FIELD_ONLY"
+    MIXED = "MIXED"
+    MOSTLY_HANDWRITTEN = "MOSTLY_HANDWRITTEN"
+    FULLY_HANDWRITTEN = "FULLY_HANDWRITTEN"
+
+
 @dataclass
 class DocumentRoutingDecision:
     doc_type: str                  # DIGITAL_PDF | PRINTED_SCAN | PHONE_PHOTO | HANDWRITTEN | MIXED | UNKNOWN
-    confidence: float              # [0.0, 1.0]
+    confidence: float              # [0.0, 1.0] - document type classification confidence
     is_digital_native: bool
     requires_perspective_warp: bool
     requires_shadow_removal: bool
     requires_stroke_enhancement: bool
     reason: str
+    handwriting_level: str = HandwritingLevel.NONE.value   # NONE | FIELD_ONLY | MIXED | MOSTLY_HANDWRITTEN | FULLY_HANDWRITTEN
+    handwriting_confidence: float = 0.0                    # [0.0, 1.0] - separate from doc_type confidence
+    has_ruled_lines: bool = False
+    stroke_complexity: float = 0.0
+    ruled_line_count: int = 0
 
 
 class DocumentRouter:
     """
     Analyzes document bytes, vector structures, and raster features to
-    determine optimal extraction routing.
+    determine optimal extraction routing and granular handwriting level.
     """
 
     DIGITAL_PDF = "DIGITAL_PDF"
@@ -83,31 +99,22 @@ class DocumentRouter:
 
                     doc.close()
 
-                    # Scanned PDF (e.g. Adobe Scan / phone capture) -> Route to PRINTED_SCAN so PaddleOCR performs high-precision OCR
-                    if is_scanner_app or (has_full_page_raster and len(words) < 250):
-                        logger.info(f"[Router] Detected Scanned PDF (scanner_app={is_scanner_app}, full_raster={has_full_page_raster}) -> Routing to PRINTED_SCAN")
-                        return DocumentRoutingDecision(
-                            doc_type=self.PRINTED_SCAN,
-                            confidence=0.95,
-                            is_digital_native=False,
-                            requires_perspective_warp=False,
-                            requires_shadow_removal=True,
-                            requires_stroke_enhancement=False,
-                            reason=f"Scanned document PDF with background raster image detected ({len(words)} vector words)",
-                        )
-
-                    # True Digital Vector PDF (e.g. Tally, SAP, Zoho, QuickBooks)
-                    if len(words) >= 15 and not has_full_page_raster:
-                        logger.info(f"[Router] Detected DIGITAL_PDF ({len(words)} vector words on page 1)")
-                        return DocumentRoutingDecision(
-                            doc_type=self.DIGITAL_PDF,
-                            confidence=0.98,
-                            is_digital_native=True,
-                            requires_perspective_warp=False,
-                            requires_shadow_removal=False,
-                            requires_stroke_enhancement=False,
-                            reason=f"Native vector PDF text layer detected with {len(words)} words",
-                        )
+                    # Scanned PDF (e.g. Adobe Scan / phone capture) -> Route to raster analysis
+                    if not (is_scanner_app or (has_full_page_raster and len(words) < 250)):
+                        # True Digital Vector PDF (e.g. Tally, SAP, Zoho, QuickBooks)
+                        if len(words) >= 15 and not has_full_page_raster:
+                            logger.info(f"[Router] Detected DIGITAL_PDF ({len(words)} vector words on page 1)")
+                            return DocumentRoutingDecision(
+                                doc_type=self.DIGITAL_PDF,
+                                confidence=0.98,
+                                is_digital_native=True,
+                                requires_perspective_warp=False,
+                                requires_shadow_removal=False,
+                                requires_stroke_enhancement=False,
+                                reason=f"Native vector PDF text layer detected with {len(words)} words",
+                                handwriting_level=HandwritingLevel.NONE.value,
+                                handwriting_confidence=0.0,
+                            )
             except Exception as e:
                 logger.debug(f"[Router] PDF vector inspection skipped: {e}")
 
@@ -125,6 +132,8 @@ class DocumentRouter:
                 requires_shadow_removal=False,
                 requires_stroke_enhancement=False,
                 reason="Could not decode image raster for document type classification",
+                handwriting_level=HandwritingLevel.NONE.value,
+                handwriting_confidence=0.0,
             )
 
         # Compute image geometry & lighting features
@@ -133,7 +142,6 @@ class DocumentRouter:
 
         # Feature A: Lighting uniformity / shadow presence
         blur_bg = cv2.GaussianBlur(gray, (51, 51), 0)
-        bg_diff = cv2.absdiff(gray, blur_bg)
         lighting_var = float(blur_bg.var())
 
         # Feature B: Boundary contour rectangularity (photos often have dark desk margins or skewed corners)
@@ -145,56 +153,129 @@ class DocumentRouter:
             peri = cv2.arcLength(largest, True)
             approx = cv2.approxPolyDP(largest, 0.02 * peri, True)
             area_ratio = cv2.contourArea(largest) / (w * h)
-            # If large polygon has 4 distinct non-axis-aligned corners and doesn't cover 98% of the image
             if len(approx) == 4 and 0.40 < area_ratio < 0.94:
                 has_photo_perspective = True
 
-        # Feature C: Stroke curvature / handwriting density
-        edges = cv2.Canny(gray, 80, 180)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=40, minLineLength=25, maxLineGap=5)
-        straight_line_count = len(lines) if lines is not None else 0
+        # Feature C: Granular handwriting & ruled pad analysis
+        hw_level, hw_conf, stroke_complexity, has_ruled, ruled_count = self._analyze_handwriting(gray)
+
+        # Primary doc_type classification
+        doc_type = self.PRINTED_SCAN
+        doc_conf = 0.90
+        reason = "Standard scanned document with uniform layout geometry"
+        req_warp = False
+        req_shadow = False
+        req_stroke = False
+
+        if has_photo_perspective or lighting_var > 1800:
+            doc_type = self.PHONE_PHOTO
+            doc_conf = 0.88
+            req_warp = has_photo_perspective
+            req_shadow = lighting_var > 1200
+            reason = "Camera capture detected with perspective angle / non-uniform background lighting"
+        elif hw_level in (HandwritingLevel.MOSTLY_HANDWRITTEN.value, HandwritingLevel.FULLY_HANDWRITTEN.value):
+            doc_type = self.HANDWRITTEN
+            doc_conf = 0.85
+            req_stroke = True
+            reason = f"High cursive stroke complexity ({stroke_complexity:.1f}) and handwriting patterns"
+        elif hw_level in (HandwritingLevel.MIXED.value, HandwritingLevel.FIELD_ONLY.value):
+            doc_type = self.MIXED
+            doc_conf = 0.82
+            req_stroke = True
+            reason = f"Mixed document: printed structural template with handwritten entries (level={hw_level})"
+
+        if hw_level != HandwritingLevel.NONE.value:
+            req_stroke = True
+
+        logger.info(
+            f"[Router] Classification: {doc_type} (conf={doc_conf:.2f}), "
+            f"Handwriting: {hw_level} (conf={hw_conf:.2f}, ruled_lines={has_ruled}, count={ruled_count})"
+        )
+
+        return DocumentRoutingDecision(
+            doc_type=doc_type,
+            confidence=doc_conf,
+            is_digital_native=False,
+            requires_perspective_warp=req_warp,
+            requires_shadow_removal=req_shadow,
+            requires_stroke_enhancement=req_stroke,
+            reason=reason,
+            handwriting_level=hw_level,
+            handwriting_confidence=hw_conf,
+            has_ruled_lines=has_ruled,
+            stroke_complexity=round(stroke_complexity, 2),
+            ruled_line_count=ruled_count,
+        )
+
+    def _analyze_handwriting(self, gray: np.ndarray) -> tuple[str, float, float, bool, int]:
+        """
+        Analyzes stroke complexity, straight line grid density, and notebook rulings
+        to classify handwriting level into NONE, FIELD_ONLY, MIXED, MOSTLY_HANDWRITTEN, FULLY_HANDWRITTEN.
+        """
+        h, w = gray.shape[:2]
+
+        # 1. Edge & Line Analysis
+        edges = cv2.Canny(gray, 40, 140)
         edge_pixel_count = cv2.countNonZero(edges)
-        
-        # Ratio of unstructured edge pixels to straight lines indicates cursive / handwriting
-        stroke_complexity = edge_pixel_count / max(1, straight_line_count * 20)
         edge_density = edge_pixel_count / float(w * h)
 
-        # Classification rules
-        if has_photo_perspective or lighting_var > 1800:
-            logger.info(f"[Router] Detected PHONE_PHOTO (perspective={has_photo_perspective}, lighting_var={lighting_var:.1f})")
-            return DocumentRoutingDecision(
-                doc_type=self.PHONE_PHOTO,
-                confidence=0.88,
-                is_digital_native=False,
-                requires_perspective_warp=has_photo_perspective,
-                requires_shadow_removal=lighting_var > 1200,
-                requires_stroke_enhancement=False,
-                reason="Camera capture detected with perspective angle / non-uniform background lighting",
-            )
+        lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30, minLineLength=25, maxLineGap=10)
+        straight_line_mask = np.zeros_like(edges)
+        straight_h_lines = 0
+        straight_v_lines = 0
+        straight_line_count = len(lines) if lines is not None else 0
 
-        if stroke_complexity > 8.0 and straight_line_count < 15 and edge_density > 0.015:
-            logger.info(f"[Router] Detected HANDWRITTEN (stroke_complexity={stroke_complexity:.1f}, edge_density={edge_density:.4f})")
-            return DocumentRoutingDecision(
-                doc_type=self.HANDWRITTEN,
-                confidence=0.82,
-                is_digital_native=False,
-                requires_perspective_warp=False,
-                requires_shadow_removal=False,
-                requires_stroke_enhancement=True,
-                reason="High cursive stroke curvature and low straight line grid density",
-            )
+        if lines is not None:
+            for l in lines:
+                x1, y1, x2, y2 = l[0]
+                cv2.line(straight_line_mask, (x1, y1), (x2, y2), 255, thickness=3)
+                angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+                if angle < 15 or angle > 165:
+                    straight_h_lines += 1
+                elif 75 < angle < 105:
+                    straight_v_lines += 1
 
-        # Default to clean PRINTED_SCAN
-        logger.info("[Router] Detected PRINTED_SCAN (flat raster invoice)")
-        return DocumentRoutingDecision(
-            doc_type=self.PRINTED_SCAN,
-            confidence=0.90,
-            is_digital_native=False,
-            requires_perspective_warp=False,
-            requires_shadow_removal=False,
-            requires_stroke_enhancement=False,
-            reason="Standard scanned document with uniform layout geometry",
-        )
+        # Calculate true non-straight cursive edge pixels
+        non_straight_edges = cv2.bitwise_and(edges, cv2.bitwise_not(straight_line_mask))
+        non_straight_count = cv2.countNonZero(non_straight_edges)
+        cursive_ratio = (non_straight_count / max(1, edge_pixel_count)) if edge_pixel_count > 0 else 0.0
+
+        # 2. Detect Horizontal Ruled Notebook Lines
+        kw = max(20, int(w * 0.10))
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+        h_edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_h)
+        h_contours, _ = cv2.findContours(h_edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        long_h_lines = [c for c in h_contours if cv2.boundingRect(c)[2] > (w * 0.15)]
+        ruled_count = len(long_h_lines)
+
+        # Ruled pad lines exist when horizontal lines dominate and cursive handwriting is present
+        has_ruled_lines = ruled_count >= 3 and straight_h_lines >= (2 * straight_v_lines) and non_straight_count > 100
+
+        # 3. Zoned Analysis (Header top 25%, Body middle 50%, Footer bottom 25%)
+        h25 = int(h * 0.25)
+        h75 = int(h * 0.75)
+        ns_header = cv2.countNonZero(non_straight_edges[:h25, :]) / float(w * h25) if h25 > 0 else 0
+        ns_body = cv2.countNonZero(non_straight_edges[h25:h75, :]) / float(w * (h75 - h25)) if (h75 - h25) > 0 else 0
+
+        # Classification decision based on cursive_ratio, non_straight_count, and ruled structure
+        if (cursive_ratio > 0.50 and edge_density > 0.008 and straight_v_lines < 8) or (non_straight_count > 2500 and straight_line_count < 10):
+            hw_level = HandwritingLevel.FULLY_HANDWRITTEN.value
+            hw_conf = min(0.95, round(0.75 + (cursive_ratio * 0.20), 2))
+        elif (has_ruled_lines and (cursive_ratio > 0.08 or non_straight_count > 200)) or (cursive_ratio > 0.35 and edge_density > 0.004):
+            hw_level = HandwritingLevel.MOSTLY_HANDWRITTEN.value
+            hw_conf = 0.85
+        elif (ns_body > ns_header * 1.5 and non_straight_count > 150) or (has_ruled_lines and non_straight_count > 80):
+            hw_level = HandwritingLevel.MIXED.value
+            hw_conf = 0.80
+        elif (cursive_ratio > 0.15 and edge_density > 0.002) or (non_straight_count > 300 and straight_h_lines > 8):
+            hw_level = HandwritingLevel.FIELD_ONLY.value
+            hw_conf = 0.70
+        else:
+            hw_level = HandwritingLevel.NONE.value
+            hw_conf = 0.0
+
+        stroke_complexity = round(cursive_ratio * 100.0, 2)
+        return hw_level, hw_conf, stroke_complexity, has_ruled_lines, ruled_count
 
     def _decode_image(self, file_bytes: bytes) -> Optional[np.ndarray]:
         try:

@@ -76,19 +76,43 @@ def validate_date(date_str: Optional[str]) -> bool:
     return False
 
 
+from validation.char_confusion import (
+    correct_gstin,
+    correct_ifsc,
+    correct_date,
+    correct_numeric_field,
+    correct_phone,
+)
+
+
 class FieldConfidenceEngine:
     """
     Evaluates field-level extraction evidence and generates calibrated confidence scores.
+    Separates document type confidence from field extraction confidence.
+    Incorporates handwriting penalties, character confusion corrections, and domain-aware uncertainty budgets.
     """
 
     CONFIDENCE_AUTO_ACCEPT = 0.85
     CONFIDENCE_QUICK_CONFIRM = 0.65
 
-    def evaluate(self, invoice_dict: dict, ocr_avg_conf: float = 0.90) -> dict[str, Any]:
+    def evaluate(
+        self,
+        invoice_dict: dict,
+        ocr_avg_conf: float = 0.90,
+        handwriting_level: str = "NONE",
+        doc_type: str = "PRINTED_SCAN",
+        handwriting_penalty: float = 0.85,
+    ) -> dict[str, Any]:
         field_confidences: dict[str, float] = {}
         fields_needing_review: list[str] = []
         auto_accepted_fields: list[str] = []
         review_reasons: list[str] = []
+
+        is_handwritten_doc = (
+            doc_type in ("HANDWRITTEN", "MIXED")
+            or handwriting_level in ("MOSTLY_HANDWRITTEN", "FULLY_HANDWRITTEN", "MIXED", "FIELD_ONLY")
+        )
+        hw_mult = handwriting_penalty if is_handwritten_doc else 1.0
 
         # 1. Invoice Number
         inv_no = str(invoice_dict.get("invoice_number") or "").strip()
@@ -96,7 +120,7 @@ class FieldConfidenceEngine:
             conf = min(0.98, max(0.60, ocr_avg_conf))
             if re.search(r"[0-9]", inv_no) and len(inv_no) >= 2:
                 conf += 0.05
-            field_confidences["invoice_number"] = min(0.99, conf)
+            field_confidences["invoice_number"] = round(min(0.99, conf * hw_mult), 2)
         else:
             field_confidences["invoice_number"] = 0.0
             fields_needing_review.append("invoice_number")
@@ -105,12 +129,18 @@ class FieldConfidenceEngine:
         # 2. Invoice Date
         inv_date = invoice_dict.get("invoice_date")
         if inv_date:
-            if validate_date(str(inv_date)):
-                field_confidences["invoice_date"] = 0.96
+            raw_date_str = str(inv_date).strip()
+            if validate_date(raw_date_str):
+                field_confidences["invoice_date"] = round(min(0.98, 0.96 * hw_mult), 2)
             else:
-                field_confidences["invoice_date"] = 0.60
-                fields_needing_review.append("invoice_date")
-                review_reasons.append("Invoice date format unrecognised")
+                # Try character confusion correction
+                date_cands = correct_date(raw_date_str)
+                if date_cands and date_cands[0][1] >= 0.70:
+                    field_confidences["invoice_date"] = round(date_cands[0][1] * hw_mult, 2)
+                else:
+                    field_confidences["invoice_date"] = 0.60
+                    fields_needing_review.append("invoice_date")
+                    review_reasons.append("Invoice date format unrecognised")
         else:
             field_confidences["invoice_date"] = 0.0
             fields_needing_review.append("invoice_date")
@@ -119,7 +149,7 @@ class FieldConfidenceEngine:
         # 3. Vendor Name & GSTIN
         v_name = str(invoice_dict.get("vendor_name") or "").strip()
         if v_name and len(v_name) >= 3:
-            field_confidences["vendor_name"] = 0.92
+            field_confidences["vendor_name"] = round(0.92 * hw_mult, 2)
         else:
             field_confidences["vendor_name"] = 0.40
             fields_needing_review.append("vendor_name")
@@ -127,29 +157,40 @@ class FieldConfidenceEngine:
 
         v_gstin = invoice_dict.get("vendor_gstin")
         if v_gstin:
-            if validate_gstin_checksum(str(v_gstin)):
+            raw_gstin = str(v_gstin).strip().upper()
+            if validate_gstin_checksum(raw_gstin):
                 field_confidences["vendor_gstin"] = 0.99
-            elif bool(re.match(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", str(v_gstin).strip().upper())):
-                field_confidences["vendor_gstin"] = 0.70
-                fields_needing_review.append("vendor_gstin")
-                review_reasons.append("Vendor GSTIN checksum mismatch")
+            elif bool(re.match(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", raw_gstin)):
+                # Positional format is valid, try checksum candidate correction
+                gstin_cands = correct_gstin(raw_gstin)
+                if gstin_cands and gstin_cands[0][1] >= 0.85:
+                    field_confidences["vendor_gstin"] = round(gstin_cands[0][1] * hw_mult, 2)
+                else:
+                    field_confidences["vendor_gstin"] = 0.70
+                    fields_needing_review.append("vendor_gstin")
+                    review_reasons.append("Vendor GSTIN checksum mismatch")
             else:
-                field_confidences["vendor_gstin"] = 0.40
-                fields_needing_review.append("vendor_gstin")
-                review_reasons.append("Vendor GSTIN format invalid")
+                gstin_cands = correct_gstin(raw_gstin)
+                if gstin_cands and gstin_cands[0][1] >= 0.80:
+                    field_confidences["vendor_gstin"] = round(gstin_cands[0][1] * hw_mult, 2)
+                else:
+                    field_confidences["vendor_gstin"] = 0.40
+                    fields_needing_review.append("vendor_gstin")
+                    review_reasons.append("Vendor GSTIN format invalid")
 
         # 4. Buyer Name & GSTIN
         b_name = str(invoice_dict.get("buyer_name") or "").strip()
         if b_name and len(b_name) >= 3:
-            field_confidences["buyer_name"] = 0.92
+            field_confidences["buyer_name"] = round(0.92 * hw_mult, 2)
         else:
             field_confidences["buyer_name"] = 0.50
 
         b_gstin = invoice_dict.get("buyer_gstin")
         if b_gstin:
-            if validate_gstin_checksum(str(b_gstin)):
+            raw_bgstin = str(b_gstin).strip().upper()
+            if validate_gstin_checksum(raw_bgstin):
                 field_confidences["buyer_gstin"] = 0.99
-            elif bool(re.match(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", str(b_gstin).strip().upper())):
+            elif bool(re.match(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", raw_bgstin)):
                 field_confidences["buyer_gstin"] = 0.70
                 fields_needing_review.append("buyer_gstin")
                 review_reasons.append("Buyer GSTIN checksum mismatch")
@@ -160,20 +201,34 @@ class FieldConfidenceEngine:
         # 5. Bank Details (IFSC & Account Number)
         ifsc = invoice_dict.get("ifsc_code")
         if ifsc:
-            if validate_ifsc(str(ifsc)):
+            raw_ifsc = str(ifsc).strip().upper()
+            if validate_ifsc(raw_ifsc):
                 field_confidences["ifsc_code"] = 0.98
             else:
-                field_confidences["ifsc_code"] = 0.60
-                fields_needing_review.append("ifsc_code")
-                review_reasons.append("IFSC code format invalid")
+                ifsc_cands = correct_ifsc(raw_ifsc)
+                if ifsc_cands and ifsc_cands[0][1] >= 0.75:
+                    field_confidences["ifsc_code"] = round(ifsc_cands[0][1] * hw_mult, 2)
+                else:
+                    field_confidences["ifsc_code"] = 0.60
+                    fields_needing_review.append("ifsc_code")
+                    review_reasons.append("IFSC code format invalid")
 
         acc_no = str(invoice_dict.get("account_number") or "").strip()
         if acc_no:
             if re.match(r"^[0-9]{9,18}$", acc_no):
-                field_confidences["account_number"] = 0.94
+                field_confidences["account_number"] = round(0.94 * hw_mult, 2)
             else:
-                field_confidences["account_number"] = 0.62
-                fields_needing_review.append("account_number")
+                num_cands = correct_numeric_field(acc_no, allow_decimal=False)
+                if num_cands and re.match(r"^[0-9]{9,18}$", num_cands[0][0]):
+                    field_confidences["account_number"] = round(num_cands[0][1] * hw_mult, 2)
+                else:
+                    field_confidences["account_number"] = 0.62
+                    fields_needing_review.append("account_number")
+
+        # Permissive fields (Remarks, Payment Terms) - do NOT block entire document
+        remarks = invoice_dict.get("remarks")
+        if remarks:
+            field_confidences["remarks"] = 0.88
 
         # 6. Financial Arithmetic Cross-Validation (Holistic Scheme Resolver)
         subtotal = invoice_dict.get("subtotal")
@@ -193,25 +248,24 @@ class FieldConfidenceEngine:
         # Tax calculation hypothesis resolver
         tax_total = (cgst + sgst + igst) if (cgst or sgst or igst) else (tax_amt or 0.0)
         if tax_total == 0.0 and subtotal and total_global_rate > 0:
-            # Global GST hypothesis
             computed_global_tax = round(subtotal * (total_global_rate / 100.0), 2)
             tax_total = computed_global_tax
 
         arithmetic_valid = False
         if grand_total is not None and grand_total > 0:
-            field_confidences["grand_total"] = 0.92
+            field_confidences["grand_total"] = round(0.92 * hw_mult, 2)
             if subtotal is not None and subtotal > 0:
                 expected_total = subtotal + tax_total - discount + round_off
                 diff = abs(expected_total - grand_total)
                 if diff <= max(1.5, grand_total * 0.015):
                     arithmetic_valid = True
-                    field_confidences["grand_total"] = 0.99
-                    field_confidences["subtotal"] = 0.98
+                    field_confidences["grand_total"] = round(min(0.99, 0.99 * (1.0 if not is_handwritten_doc else 0.95)), 2)
+                    field_confidences["subtotal"] = round(min(0.98, 0.98 * (1.0 if not is_handwritten_doc else 0.95)), 2)
                     if tax_total > 0:
-                        field_confidences["tax_amount"] = 0.98
-                        if cgst: field_confidences["cgst"] = 0.98
-                        if sgst: field_confidences["sgst"] = 0.98
-                        if igst: field_confidences["igst"] = 0.98
+                        field_confidences["tax_amount"] = round(min(0.98, 0.98 * hw_mult), 2)
+                        if cgst: field_confidences["cgst"] = round(min(0.98, 0.98 * hw_mult), 2)
+                        if sgst: field_confidences["sgst"] = round(min(0.98, 0.98 * hw_mult), 2)
+                        if igst: field_confidences["igst"] = round(min(0.98, 0.98 * hw_mult), 2)
                         if global_cgst_rate: field_confidences["global_cgst_rate"] = 0.98
                         if global_sgst_rate: field_confidences["global_sgst_rate"] = 0.98
                         if global_igst_rate: field_confidences["global_igst_rate"] = 0.98
@@ -224,7 +278,7 @@ class FieldConfidenceEngine:
                         f"Financial total mismatch: Subtotal ({subtotal}) + Tax ({tax_total}) - Disc ({discount}) != Grand Total ({grand_total})"
                     )
             else:
-                field_confidences["grand_total"] = 0.85
+                field_confidences["grand_total"] = round(0.85 * hw_mult, 2)
         else:
             field_confidences["grand_total"] = 0.0
             fields_needing_review.append("grand_total")
@@ -237,13 +291,12 @@ class FieldConfidenceEngine:
             elif f_conf < self.CONFIDENCE_AUTO_ACCEPT and f_name not in fields_needing_review:
                 fields_needing_review.append(f_name)
 
-        # 8. "DO NOT AUTO ACCEPT" Critical Gatekeeper
+        # 8. "DO NOT AUTO ACCEPT" Critical Gatekeeper & Uncertainty Budget
         CRITICAL_FIELDS = {"grand_total", "vendor_gstin", "invoice_number", "invoice_date", "account_number", "ifsc_code"}
         critical_failure = False
         for crit in CRITICAL_FIELDS:
             crit_conf = field_confidences.get(crit)
             if crit_conf is None or crit_conf < self.CONFIDENCE_AUTO_ACCEPT or crit in fields_needing_review:
-                # If field was extracted but failed format/confidence
                 if invoice_dict.get(crit):
                     critical_failure = True
                     if crit not in fields_needing_review:
@@ -276,4 +329,5 @@ class FieldConfidenceEngine:
             "review_reasons": list(set(review_reasons)),
             "arithmetic_valid": arithmetic_valid,
             "critical_failure": critical_failure,
+            "is_handwritten": is_handwritten_doc,
         }

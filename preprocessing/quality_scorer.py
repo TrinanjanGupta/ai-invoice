@@ -34,6 +34,10 @@ class QualityAssessment:
     text_density: float             # Foreground pixel ratio [0.0, 1.0]
     is_acceptable: bool             # Whether document is readable
     recommended_actions: list[str] = field(default_factory=list)
+    has_ruled_lines: bool = False
+    ink_strength: float = 1.0       # [0.0, 1.0] foreground ink contrast
+    background_uniformity: float = 1.0 # [0.0, 1.0] paper texture cleanliness
+    estimated_ink_type: str = "black_ink" # "blue_ink" | "black_ink" | "pencil" | "carbon_copy" | "mixed"
 
 
 class DocumentQualityScorer:
@@ -71,12 +75,51 @@ class DocumentQualityScorer:
         # 3. Estimated Skew Angle
         skew_angle = self._estimate_skew(gray)
 
-        # 4. Text density (Otsu foreground ratio)
+        # 4. Text density (Otsu foreground ratio) & Ruled lines
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         fg_pixels = cv2.countNonZero(thresh)
         text_density = float(fg_pixels / (w * h)) if (w * h) > 0 else 0.0
 
-        # 5. Recommended Actions & Composite Quality Scoring
+        kw = max(20, int(w * 0.08))
+        kernel_h = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 1))
+        horizontal_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_h)
+        h_contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        ruled_lines = [c for c in h_contours if cv2.boundingRect(c)[2] > (w * 0.20)]
+        has_ruled_lines = len(ruled_lines) >= 3
+
+        # 5. Ink Strength & Background Uniformity
+        fg_mask = thresh > 0
+        bg_mask = thresh == 0
+        mean_fg = float(np.mean(gray[fg_mask])) if np.any(fg_mask) else 0.0
+        mean_bg = float(np.mean(gray[bg_mask])) if np.any(bg_mask) else 255.0
+        std_bg = float(np.std(gray[bg_mask])) if np.any(bg_mask) else 0.0
+
+        ink_strength = round(max(0.0, min(1.0, (mean_bg - mean_fg) / max(1.0, mean_bg))), 3)
+        background_uniformity = round(max(0.0, min(1.0, 1.0 - (std_bg / 100.0))), 3)
+
+        # 6. Estimate Ink Type
+        estimated_ink_type = "black_ink"
+        if len(img.shape) == 3 and np.any(fg_mask):
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            fg_hsv = hsv[fg_mask]
+            if len(fg_hsv) > 0:
+                mean_hue = np.median(fg_hsv[:, 0])
+                mean_sat = np.median(fg_hsv[:, 1])
+                mean_val = np.median(fg_hsv[:, 2])
+
+                # Blue ink in OpenCV HSV (H: 90-130) with decent saturation
+                if 90 <= mean_hue <= 135 and mean_sat > 40:
+                    estimated_ink_type = "blue_ink"
+                elif mean_sat < 30 and 80 < mean_val < 180:
+                    estimated_ink_type = "pencil"
+                elif mean_sat < 30 and mean_val <= 80:
+                    estimated_ink_type = "black_ink"
+                elif mean_sat < 40 and std_bg > 35:
+                    estimated_ink_type = "carbon_copy"
+                else:
+                    estimated_ink_type = "mixed"
+
+        # 7. Recommended Actions & Composite Quality Scoring
         actions = []
         blur_factor = min(1.0, blur_var / 300.0)
         contrast_factor = min(1.0, rms_contrast / 0.40)
@@ -91,6 +134,10 @@ class DocumentQualityScorer:
             actions.append("apply_illumination_normalization")
         if abs(skew_angle) > 0.8:
             actions.append("apply_deskew")
+        if has_ruled_lines:
+            actions.append("remove_ruled_lines")
+        if estimated_ink_type in ("blue_ink", "pencil", "carbon_copy"):
+            actions.append(f"enhance_{estimated_ink_type}")
 
         composite = round(
             0.40 * blur_factor +
@@ -113,6 +160,10 @@ class DocumentQualityScorer:
             text_density=round(text_density, 4),
             is_acceptable=is_acceptable,
             recommended_actions=actions,
+            has_ruled_lines=has_ruled_lines,
+            ink_strength=ink_strength,
+            background_uniformity=background_uniformity,
+            estimated_ink_type=estimated_ink_type,
         )
 
     def _estimate_skew(self, gray: np.ndarray) -> float:

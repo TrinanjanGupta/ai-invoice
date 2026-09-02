@@ -49,6 +49,14 @@ class Settings(BaseSettings):
     supported_formats: str = "pdf,jpg,jpeg,png,tiff,webp"
     cors_origins: str = "*"
 
+    # Handwriting processing
+    handwriting_confidence_penalty: float = 0.85
+    handwriting_strict_review_fields: str = "grand_total,invoice_number,vendor_gstin,tax_amount"
+    handwriting_permissive_fields: str = "remarks,payment_terms"
+    enable_ruled_line_removal: bool = True
+    enable_illumination_normalization: bool = True
+    enable_ink_detection: bool = True
+
     celery_broker_url: str = "redis://localhost:6379/0"
     celery_result_backend: str = "redis://localhost:6379/1"
 
