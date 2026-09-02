@@ -20,7 +20,7 @@ Usage:
 import uuid
 from pathlib import Path
 from loguru import logger
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Any, Callable
 
 import numpy as np
@@ -74,6 +74,8 @@ class PipelineResult:
     quality_score: float = 1.0
     doc_profile: Optional[Any] = None
     processing_context: Optional[ProcessingContext] = None
+    child_invoices: list[Any] = field(default_factory=list)
+    document_segments: list[Any] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +494,76 @@ class InvoicePipeline:
                     if f"_p{p_num}" in k and hasattr(ocr_res, "full_text")
                 )
         segments = segmenter.segment(page_texts)
+        child_invoices = []
         if len(segments) > 1:
-            logger.info(f"[{job_id}] Merged multi-invoice upload detected ({len(segments)} sub-invoices).")
+            logger.info(f"[{job_id}] Merged multi-invoice upload detected ({len(segments)} sub-invoices). Executing sub-document extractions.")
+            for seg in segments:
+                child_job_id = f"{job_id}_seg{seg.segment_index + 1}"
+                seg_ocr = {}
+                seg_regions = []
+                seg_dims = {}
+                seg_pages = []
+                for p_num in seg.page_indices:
+                    for k, v in combined_ocr_results.items():
+                        if f"_p{p_num}" in k or (len(seg.page_indices) == 1 and k.endswith(f"p{p_num}")):
+                            seg_ocr[k] = v
+                    if p_num <= len(all_page_regions):
+                        seg_regions.extend(all_page_regions[p_num - 1])
+                    if p_num in page_dimensions:
+                        seg_dims[p_num] = page_dimensions[p_num]
+                    if p_num <= len(pages):
+                        seg_pages.append(pages[p_num - 1])
+
+                sub_w, sub_h = seg_dims.get(seg.page_indices[0], (1200, 1600))
+                sub_profile = DocumentProfile.from_ocr_and_regions(
+                    ocr_results=seg_ocr,
+                    regions=seg_regions,
+                    width=sub_w,
+                    height=sub_h,
+                    page_count=len(seg.page_indices),
+                    is_digital_native=("native_pdf" in path_summary),
+                    quality_score=quality_score,
+                    page_dimensions=seg_dims,
+                )
+
+                sub_match = self.template_retriever.retrieve(sub_profile)
+                if sub_match.match_type in ("exact_version", "family_anchor"):
+                    sub_extracted = self.template_extractor.extract(
+                        profile=sub_profile,
+                        field_rules=sub_match.field_rules,
+                        template_version_id=sub_match.matched_version_id,
+                        match_type=sub_match.match_type,
+                    )
+                else:
+                    sub_extracted_pages = []
+                    for sp_idx, sp_obj in enumerate(seg_pages):
+                        sp_num = seg.page_indices[sp_idx]
+                        sp_ocr = {k: v for k, v in seg_ocr.items() if f"p{sp_num}" in k}
+                        sub_extracted_pages.append(self.extractor.extract(sp_ocr, image=sp_obj.pil_image))
+                    sub_extracted = sub_extracted_pages[0] if sub_extracted_pages else self.extractor.extract(seg_ocr)
+                    for nxt in sub_extracted_pages[1:]:
+                        sub_extracted = self.extractor._merge_invoices(sub_extracted, nxt)
+
+                sub_schema, sub_val = self.validator.validate(
+                    sub_extracted,
+                    doc_type=routing.doc_type,
+                    handwriting_level=routing.handwriting_level,
+                    handwriting_penalty=getattr(self.settings, "handwriting_confidence_penalty", 0.85),
+                )
+                sub_schema.job_id = child_job_id
+                child_invoices.append(PipelineResult(
+                    job_id=child_job_id,
+                    invoice=sub_schema,
+                    validation_report=sub_val,
+                    html_output=self.renderer.to_html(sub_schema, sub_val),
+                    pdf_path=None,
+                    raw_ocr_texts={k: v.full_text for k, v in seg_ocr.items() if hasattr(v, "full_text")},
+                    page_count=len(seg.page_indices),
+                    model_used=f"{sub_match.match_type}+split",
+                    doc_type=routing.doc_type,
+                    quality_score=quality_score,
+                    doc_profile=sub_profile,
+                ))
 
         # ── Stage 3: Build DocumentProfile & Multi-Stage TIE Retrieval ──────
         _notify("retrieval", 4, 70, "TIE Retrieval: Checking known layout templates")
@@ -598,6 +668,55 @@ class InvoicePipeline:
             extracted = self.extractor._merge_invoices(extracted, global_heuristic)
             primary_engine_label = "layoutlm" if self.extractor.model else "heuristic"
 
+        # ── Stage 4a.1: Handwriting Candidate Extraction & Ambiguity Resolution ──
+        if routing.doc_type in ("HANDWRITTEN", "MIXED") or routing.handwriting_level != HandwritingLevel.NONE.value:
+            from preprocessing.handwriting_cropper import HandwritingCropper
+            from understanding.layoutlm import ExtractedField
+            cropper = HandwritingCropper()
+            for p_idx, p_obj in enumerate(pages):
+                pil_img = p_obj.pil_image
+                p_regions = all_page_regions[p_idx] if p_idx < len(all_page_regions) else []
+                hw_crops = cropper.crop_from_yolo_regions(pil_img, p_regions, page_num=p_idx + 1)
+                for crop in hw_crops:
+                    cands = self.candidate_generator.generate_candidates(
+                        field_crop=crop,
+                        handwriting_ocr=self.handwriting_ocr,
+                    )
+                    if cands:
+                        best_cand = cands[0]
+                        curr_f = getattr(extracted, crop.field_name, None)
+                        if not curr_f or not curr_f.value or curr_f.confidence < best_cand.confidence:
+                            setattr(extracted, crop.field_name, ExtractedField(
+                                value=best_cand.text,
+                                confidence=best_cand.confidence,
+                                source="trocr" if best_cand.source == "trocr" else "handwriting_specializer",
+                            ))
+
+            # Accounting equilibrium reconciliation across monetary fields
+            sub_val = getattr(extracted, "subtotal", None)
+            tax_val = getattr(extracted, "tax_amount", None)
+            tot_val = getattr(extracted, "grand_total", None)
+            if tot_val and tot_val.value:
+                try:
+                    s_num = float(str(sub_val.value).replace(",", "")) if sub_val and sub_val.value else 0.0
+                    t_num = float(str(tax_val.value).replace(",", "")) if tax_val and tax_val.value else 0.0
+                    g_num = float(str(tot_val.value).replace(",", ""))
+                    winner = self.validator.reconcile_accounting_hypotheses(
+                        candidate_map={},
+                        subtotal_cands=[s_num] if s_num > 0 else [],
+                        tax_cands=[t_num] if t_num > 0 else [],
+                        total_cands=[g_num],
+                    )
+                    if winner:
+                        if sub_val:
+                            sub_val.confidence = min(0.99, sub_val.confidence + 0.10)
+                        if tax_val:
+                            tax_val.confidence = min(0.99, tax_val.confidence + 0.10)
+                        if tot_val:
+                            tot_val.confidence = min(0.99, tot_val.confidence + 0.10)
+                except Exception as eq_ex:
+                    logger.debug(f"Accounting equilibrium check: {eq_ex}")
+
         # ── Stage 4b: Field-Level Routing & Selective LLM fallback ───────────
         critical_fields = ["grand_total", "invoice_number", "invoice_date", "vendor_gstin"]
         needs_ai_enhancement = False
@@ -678,6 +797,53 @@ class InvoicePipeline:
         if not is_auto_accepted:
             invoice_schema.review_reasons = list(dict.fromkeys(invoice_schema.review_reasons + rejection_reasons))
 
+        # ── Stage 4e: Immutable Audit Trail Persistence ───────────────────────
+        if self.db is not None:
+            try:
+                import asyncio
+                import hashlib
+                field_decisions = []
+                for fname in [
+                    "invoice_number", "invoice_date", "due_date", "po_number",
+                    "vendor_name", "vendor_gstin", "vendor_pan",
+                    "buyer_name", "buyer_gstin",
+                    "subtotal", "tax_amount", "grand_total",
+                    "cgst", "sgst", "igst"
+                ]:
+                    f_val = getattr(invoice_schema, fname, None)
+                    if f_val is not None and str(f_val).strip():
+                        field_decisions.append({
+                            "field_name": fname,
+                            "value": str(f_val),
+                            "confidence": invoice_schema.field_confidences.get(fname, 0.90),
+                            "source": primary_engine_label,
+                            "page": 1,
+                            "validation_status": "passed" if fname not in str(invoice_schema.review_reasons) else "flagged",
+                        })
+
+                doc_hash = hashlib.sha256(file_bytes).hexdigest() if isinstance(file_bytes, (bytes, bytearray)) else ""
+
+                async def _persist_audit():
+                    await self.db.record_extraction_run(
+                        job_id=job_id,
+                        pipeline_version="2.0.0",
+                        document_hash=doc_hash,
+                        template_version_id=invoice_schema.template_id,
+                        routing_decision=routing.doc_type,
+                        overall_confidence=invoice_schema.overall_confidence,
+                        decision="auto_accepted" if is_auto_accepted else "human_review",
+                        is_auto_accepted=is_auto_accepted,
+                        model_manifest={"model_used": primary_engine_label, "quality_score": quality_score},
+                        field_decisions=field_decisions,
+                    )
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(_persist_audit())
+                except RuntimeError:
+                    asyncio.run(_persist_audit())
+            except Exception as audit_ex:
+                logger.debug(f"Audit trail persistence error: {audit_ex}")
+
         # ── Stage 5: Render ──────────────────────────────────────────────────
         logger.info(f"[{job_id}] Stage 5: Rendering output (Auto-Accepted: {is_auto_accepted})")
         html_output = self.renderer.to_html(invoice_schema)
@@ -717,4 +883,6 @@ class InvoicePipeline:
             quality_score=quality_score,
             doc_profile=doc_profile,
             processing_context=processing_ctx,
+            child_invoices=child_invoices,
+            document_segments=segments,
         )

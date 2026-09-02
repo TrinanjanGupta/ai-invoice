@@ -66,6 +66,11 @@ def get_worker_components():
 
         from api.pipeline_runner import InvoicePipeline
         _worker_pipeline = InvoicePipeline(settings=app_settings, db_manager=_worker_db, minio_manager=_worker_minio)
+        try:
+            asyncio.run(_worker_pipeline.template_retriever.load_templates_from_db())
+            logger.info("[Celery Worker] Pre-warmed TIE template cache from database.")
+        except Exception as tpl_err:
+            logger.debug(f"[Celery Worker] Template cache pre-warm notice: {tpl_err}")
         logger.info("[Celery Worker] Warm singleton initialized successfully.")
 
     return _worker_pipeline, _worker_db, _worker_minio

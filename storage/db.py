@@ -651,6 +651,33 @@ class DatabaseManager:
             session.add(ev)
             await session.commit()
 
+    async def record_document_segment(
+        self,
+        parent_job_id: str,
+        child_job_id: str,
+        segment_index: int,
+        page_start: int,
+        page_end: int,
+        detected_invoice_number: Optional[str] = None,
+        detected_vendor: Optional[str] = None,
+    ) -> str:
+        """Records a detected document segment linking parent multi-invoice job to child extraction."""
+        rec_id = str(uuid.uuid4())
+        async with self.session_factory() as session:
+            seg_rec = DocumentSegmentRecord(
+                id=rec_id,
+                parent_job_id=parent_job_id,
+                child_job_id=child_job_id,
+                segment_index=segment_index,
+                page_start=page_start,
+                page_end=page_end,
+                detected_invoice_number=detected_invoice_number,
+                detected_vendor=detected_vendor,
+            )
+            session.add(seg_rec)
+            await session.commit()
+            return rec_id
+
     async def get_extraction_audit_trail(self, job_id: str) -> dict[str, Any]:
         """Fetches the complete immutable provenance trail for a processed invoice."""
         from sqlalchemy import select

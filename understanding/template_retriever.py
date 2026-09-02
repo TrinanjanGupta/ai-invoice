@@ -263,7 +263,11 @@ class TemplateRetriever:
         doc_regions: list[dict[str, Any]],
         tpl_regions: list[dict[str, Any]],
     ) -> float:
-        """Compares visual region structure (headers, tables, totals)."""
+        """
+        Compares visual region structure (headers, tables, totals) using:
+        1. Label set overlap (Jaccard).
+        2. Normalized bounding box spatial IoU & centroid Euclidean proximity.
+        """
         if not doc_regions and not tpl_regions:
             return 1.0
         if not doc_regions or not tpl_regions:
@@ -276,8 +280,40 @@ class TemplateRetriever:
         if not doc_labels or not tpl_labels:
             return 0.50
 
-        jaccard = len(doc_labels & tpl_labels) / float(len(doc_labels | tpl_labels))
-        return jaccard
+        # 1. Label set Jaccard
+        label_jaccard = len(doc_labels & tpl_labels) / float(len(doc_labels | tpl_labels))
+
+        # 2. Geometric spatial matching for shared region labels
+        shared_labels = doc_labels & tpl_labels
+        if not shared_labels:
+            return round(label_jaccard * 0.50, 3)
+
+        spatial_scores = []
+        for lbl in shared_labels:
+            d_boxes = [r.get("bbox_norm") for r in doc_regions if r.get("label") == lbl and r.get("bbox_norm")]
+            t_boxes = [r.get("bbox_norm") for r in tpl_regions if r.get("label") == lbl and r.get("bbox_norm")]
+            if d_boxes and t_boxes:
+                db = d_boxes[0]
+                tb = t_boxes[0]
+                dcx, dcy = (db[0] + db[2]) / 2.0, (db[1] + db[3]) / 2.0
+                tcx, tcy = (tb[0] + tb[2]) / 2.0, (tb[1] + tb[3]) / 2.0
+                dist = math.sqrt((dcx - tcx) ** 2 + (dcy - tcy) ** 2)
+                prox_score = max(0.0, 1.0 - (dist / 500.0))
+
+                ix1 = max(db[0], tb[0])
+                iy1 = max(db[1], tb[1])
+                ix2 = min(db[2], tb[2])
+                iy2 = min(db[3], tb[3])
+                inter_area = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                d_area = max(1, (db[2] - db[0]) * (db[3] - db[1]))
+                t_area = max(1, (tb[2] - tb[0]) * (tb[3] - tb[1]))
+                union_area = d_area + t_area - inter_area
+                iou = inter_area / float(union_area) if union_area > 0 else 0.0
+
+                spatial_scores.append(0.6 * prox_score + 0.4 * iou)
+
+        avg_spatial = sum(spatial_scores) / len(spatial_scores) if spatial_scores else 0.5
+        return round(0.40 * label_jaccard + 0.60 * avg_spatial, 3)
 
     def retrieve(self, profile: DocumentProfile) -> TemplateMatchResult:
         """
@@ -333,8 +369,18 @@ class TemplateRetriever:
         candidates: list[CachedTemplateVersion] = [
             self._versions_by_id[vid] for vid in candidate_ids if vid in self._versions_by_id
         ][:50]
-        if not candidates and self._in_memory_index:
-            candidates = self._in_memory_index[:20]
+        if not candidates:
+            # No indexed candidates matched -> return none (never arbitrary fallback)
+            dur_ms = (time.perf_counter() - start_t) * 1000.0
+            return TemplateMatchResult(
+                matched_version_id="",
+                matched_family_id="",
+                match_type="none",
+                match_confidence=0.0,
+                field_rules=[],
+                retrieval_stage="indexed_pruning",
+                latency_ms=dur_ms,
+            )
 
         # ── Stage 2: Mathematical Similarity & Multi-Factor Scoring ──────────
         scored_candidates: list[tuple[float, CachedTemplateVersion, float]] = []

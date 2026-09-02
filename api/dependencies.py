@@ -8,7 +8,9 @@ def get_pipeline(request: Request):
     pipeline = getattr(request.app.state, "pipeline", None)
     if pipeline is None:
         from api.pipeline_runner import InvoicePipeline
-        pipeline = InvoicePipeline(get_settings())
+        db = getattr(request.app.state, "db", None)
+        minio = getattr(request.app.state, "minio", None)
+        pipeline = InvoicePipeline(get_settings(), db_manager=db, minio_manager=minio)
         request.app.state.pipeline = pipeline
     return pipeline
 

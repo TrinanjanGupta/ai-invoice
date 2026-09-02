@@ -353,7 +353,8 @@ async def upload_batch_invoices(
             continue
 
         job_id = str(uuid.uuid4())
-        await db.create_job(job_id=job_id, filename=filename)
+        doc_hash = hashlib.sha256(file_bytes).hexdigest()
+        await db.create_job(job_id=job_id, filename=filename, document_hash=doc_hash)
 
         # Save local copy
         try:
@@ -374,20 +375,32 @@ async def upload_batch_invoices(
             except Exception as e:
                 logger.warning(f"MinIO upload error: {e}")
 
-        # Queue pipeline task
-        background_tasks.add_task(
-            _run_pipeline_task,
-            job_id=job_id,
-            file_bytes=file_bytes,
-            filename=filename,
-            storage_key=storage_key,
-            db=db,
-            minio=minio,
-            pipeline=app.state.pipeline,
-            settings=settings,
-        )
+        # Dispatch to Celery cluster if enabled, or run in BackgroundTasks
+        use_celery = getattr(settings, "use_celery", False)
+        dispatched_celery = False
+        if use_celery:
+            try:
+                from worker.tasks import process_invoice_task
+                process_invoice_task.delay(job_id=job_id, storage_key=storage_key, filename=filename)
+                dispatched_celery = True
+                logger.info(f"[Batch] Job dispatched to Celery cluster: {job_id} ({filename})")
+            except Exception as ce:
+                logger.warning(f"[Batch] Celery dispatch failed ({ce}), falling back to background runner")
 
-        logger.info(f"[Batch] Queued job: {job_id} ({filename})")
+        if not dispatched_celery:
+            background_tasks.add_task(
+                _run_pipeline_task,
+                job_id=job_id,
+                file_bytes=file_bytes,
+                filename=filename,
+                storage_key=storage_key,
+                db=db,
+                minio=minio,
+                pipeline=app.state.pipeline,
+                settings=settings,
+            )
+            logger.info(f"[Batch] Queued job in local worker pool: {job_id} ({filename})")
+
         queued_jobs.append(JobResponse(job_id=job_id, status="processing", filename=filename))
 
     return BatchJobResponse(

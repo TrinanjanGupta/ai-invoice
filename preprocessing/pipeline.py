@@ -10,7 +10,7 @@ from PIL import Image
 from pathlib import Path
 from loguru import logger
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 import io
 
 
@@ -22,6 +22,7 @@ class PreprocessResult:
     processed_size: tuple       # (width, height) after processing
     deskew_angle: float         # degrees of rotation applied
     was_binarized: bool
+    page_routing: Any = None    # PageRoutingDecision for adaptive page-level provenance
 
 
 @dataclass
@@ -48,7 +49,7 @@ class InvoicePreprocessor:
     BINARIZE_BLOCK_SIZE = 31
     BINARIZE_C = 10
 
-    def process(self, image_input) -> PreprocessResult:
+    def process(self, image_input, quality_score: Optional[float] = None) -> PreprocessResult:
         """
         Main entry point. Accepts:
         - str / Path: file path
@@ -61,12 +62,19 @@ class InvoicePreprocessor:
 
         img, orient_angle = self._auto_orient(img)
         img = self._normalise_dpi(img)
-        img = self._enhance_handwriting_contrast(img)
-        img = self._denoise(img)
-        img, angle = self._deskew(img)
-        img, binarized = self._adaptive_binarize(img)
-        img = self._remove_borders(img)
-        img = self._sharpen(img)
+
+        # Adaptive Fast-Path for high-quality clean scans (skips heavy CLAHE / binarization)
+        is_clean_fast_path = (quality_score is not None and quality_score >= 0.85)
+        if not is_clean_fast_path:
+            img = self._enhance_handwriting_contrast(img)
+            img = self._denoise(img)
+            img, angle = self._deskew(img)
+            img, binarized = self._adaptive_binarize(img)
+            img = self._remove_borders(img)
+            img = self._sharpen(img)
+        else:
+            img, angle = self._deskew(img)
+            binarized = False
 
         processed_size = (img.shape[1], img.shape[0])
         pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))

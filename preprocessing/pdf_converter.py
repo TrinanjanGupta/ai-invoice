@@ -21,8 +21,9 @@ from PIL import Image
 from pathlib import Path
 from loguru import logger
 from dataclasses import dataclass, field
-from typing import Union
+from typing import Union, Optional, Any
 from preprocessing.pipeline import InvoicePreprocessor, PreprocessResult
+from preprocessing.document_router import DocumentRouter, PageRoutingDecision, HandwritingLevel
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,7 @@ class NativePDFPage:
     line_items: list[dict] = field(default_factory=list)
     dpi: int = 150
     is_digital: bool = True
+    page_routing: Optional[PageRoutingDecision] = None
 
 
 
@@ -157,6 +159,7 @@ class PDFConverter:
 
     def __init__(self):
         self.preprocessor = InvoicePreprocessor()
+        self.document_router = DocumentRouter()
 
     # ------------------------------------------------------------------
     # Public API
@@ -222,6 +225,12 @@ class PDFConverter:
         table_ext = TableExtractor()
         line_items = table_ext.extract_tables_from_page(page)
 
+        page_decision = self.document_router.route_page(
+            bgr,
+            is_native_pdf=True,
+            page_num=page_num + 1,
+        )
+
         logger.debug(
             f"  Page {page_num + 1}: {len(words)} native words, {len(line_items)} table items, "
             f"image={bgr.shape[1]}x{bgr.shape[0]}"
@@ -237,20 +246,45 @@ class PDFConverter:
             line_items=line_items,
             dpi=self.LOW_DPI,
             is_digital=True,
+            page_routing=page_decision,
         )
-
 
     def _process_scanned_page(self, page: pymupdf.Page, page_num: int) -> PreprocessResult:
         """
-        Rasterize a scanned page at 300 DPI and run the full preprocessor.
-        Identical behaviour to the old PDFConverter.
+        Rasterize a scanned page at 300 DPI and run page-adaptive preprocessing.
+        Distinguishes phone photos, handwriting, and standard scans.
         """
         logger.debug(f"  Page {page_num + 1}: SCANNED — rasterising at {self.HIGH_DPI} DPI")
         zoom = self.HIGH_DPI / 72.0
         mat = pymupdf.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_bytes = pix.tobytes("png")
-        result = self.preprocessor.process(img_bytes)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        import cv2
+        raw_bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+        # Adaptive per-page classification
+        page_decision = self.document_router.route_page(
+            raw_bgr,
+            is_native_pdf=False,
+            page_num=page_num + 1,
+        )
+
+        logger.info(
+            f"  Page {page_num + 1} route: {page_decision.doc_type} "
+            f"(hw_level={page_decision.handwriting_level}, warp={page_decision.requires_perspective_warp})"
+        )
+
+        if page_decision.doc_type == DocumentRouter.PHONE_PHOTO:
+            result = self.preprocessor.process_photo(raw_bgr)
+        elif page_decision.doc_type in (DocumentRouter.HANDWRITTEN, DocumentRouter.MIXED):
+            result = self.preprocessor.process_handwritten(
+                raw_bgr,
+                is_phone_photo=page_decision.requires_perspective_warp,
+            )
+        else:
+            result = self.preprocessor.process(raw_bgr)
+
+        result.page_routing = page_decision
         return result
 
     # ------------------------------------------------------------------

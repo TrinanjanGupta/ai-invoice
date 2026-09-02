@@ -189,6 +189,16 @@ class TemplateExtractor:
         # Default rules if empty
         if not field_rules:
             field_rules = self._get_default_rules()
+        elif isinstance(field_rules, dict):
+            normalized_rules = []
+            for k, v in field_rules.items():
+                if isinstance(v, dict):
+                    v_copy = dict(v)
+                    v_copy.setdefault("field_name", k)
+                    normalized_rules.append(v_copy)
+                else:
+                    normalized_rules.append(v)
+            field_rules = normalized_rules
 
         is_family_match = (match_type == "family_anchor")
 
@@ -590,14 +600,15 @@ class TemplateExtractor:
                 anc_x2 = max(w.bbox_norm[2] for w in anchor_seq)
                 anc_y2 = max(w.bbox_norm[3] for w in anchor_seq)
                 anc_cy = sum(w.center_norm[1] for w in anchor_seq) / len(anchor_seq)
+                anc_page = anchor_seq[0].page
 
-                # Search horizontal strip to the right (inline)
+                # Search horizontal strip to the right (inline) on the same page
                 strip_box = [anc_x2, max(0, anc_y1 - 12), 1000, min(1000, anc_y2 + 15)]
-                inline_words = profile.find_words_in_box(strip_box)
+                inline_words = profile.find_words_in_box(strip_box, page=anc_page)
 
-                # Also search below anchor (for vertical key-value pairs)
+                # Also search below anchor (for vertical key-value pairs) on the same page
                 below_box = [max(0, anc_x1 - 20), anc_y2, min(1000, anc_x2 + 250), min(1000, anc_y2 + 35)]
-                below_words = profile.find_words_in_box(below_box)
+                below_words = profile.find_words_in_box(below_box, page=anc_page)
 
                 for w, is_inline in [(w, True) for w in inline_words] + [(w, False) for w in below_words]:
                     # Exclude anchor tokens

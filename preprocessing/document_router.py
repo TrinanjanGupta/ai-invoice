@@ -15,7 +15,7 @@ Routes each document to its optimal preprocessing and extraction strategy.
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Union
 from pathlib import Path
 from loguru import logger
@@ -34,9 +34,26 @@ class HandwritingLevel(str, Enum):
 
 
 @dataclass
+class PageRoutingDecision:
+    page_num: int
+    doc_type: str                          # DIGITAL_PDF | PRINTED_SCAN | PHONE_PHOTO | HANDWRITTEN | MIXED
+    confidence: float
+    is_digital_native: bool
+    requires_perspective_warp: bool
+    requires_shadow_removal: bool
+    requires_stroke_enhancement: bool
+    reason: str
+    handwriting_level: str = HandwritingLevel.NONE.value
+    handwriting_confidence: float = 0.0
+    has_ruled_lines: bool = False
+    stroke_complexity: float = 0.0
+    ruled_line_count: int = 0
+
+
+@dataclass
 class DocumentRoutingDecision:
-    doc_type: str                  # DIGITAL_PDF | PRINTED_SCAN | PHONE_PHOTO | HANDWRITTEN | MIXED | UNKNOWN
-    confidence: float              # [0.0, 1.0] - document type classification confidence
+    doc_type: str                          # DIGITAL_PDF | PRINTED_SCAN | PHONE_PHOTO | HANDWRITTEN | MIXED | UNKNOWN
+    confidence: float
     is_digital_native: bool
     requires_perspective_warp: bool
     requires_shadow_removal: bool
@@ -47,6 +64,7 @@ class DocumentRoutingDecision:
     has_ruled_lines: bool = False
     stroke_complexity: float = 0.0
     ruled_line_count: int = 0
+    page_decisions: list[PageRoutingDecision] = field(default_factory=list)
 
 
 class DocumentRouter:
@@ -204,6 +222,107 @@ class DocumentRouter:
             handwriting_confidence=hw_conf,
             has_ruled_lines=has_ruled,
             stroke_complexity=round(stroke_complexity, 2),
+            ruled_line_count=ruled_count,
+        )
+
+    def route_page(
+        self,
+        page_image: np.ndarray,
+        is_native_pdf: bool = False,
+        page_num: int = 1,
+    ) -> PageRoutingDecision:
+        """
+        Classifies an individual page raster and determines page-specific preprocessing path.
+        """
+        if is_native_pdf:
+            return PageRoutingDecision(
+                page_num=page_num,
+                doc_type=self.DIGITAL_PDF,
+                confidence=0.99,
+                is_digital_native=True,
+                requires_perspective_warp=False,
+                requires_shadow_removal=False,
+                requires_stroke_enhancement=False,
+                reason="Native digital vector page layer",
+                handwriting_level=HandwritingLevel.NONE.value,
+                handwriting_confidence=0.0,
+            )
+
+        if page_image is None or page_image.size == 0:
+            return PageRoutingDecision(
+                page_num=page_num,
+                doc_type=self.UNKNOWN,
+                confidence=0.0,
+                is_digital_native=False,
+                requires_perspective_warp=False,
+                requires_shadow_removal=False,
+                requires_stroke_enhancement=False,
+                reason="Empty page image",
+            )
+
+        gray = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY) if len(page_image.shape) == 3 else page_image
+        h, w = gray.shape[:2]
+
+        # 1. Stroke & Handwriting Analysis
+        hw_level, hw_conf, stroke_complexity, has_ruled_lines, ruled_count = self._analyze_handwriting(gray)
+
+        # 2. Camera / Perspective & Illumination Analysis
+        requires_warp = False
+        requires_shadow = False
+
+        # Illumination gradient check (e.g. phone camera lighting)
+        small_gray = cv2.resize(gray, (100, 100))
+        mean_top = np.mean(small_gray[:30, :])
+        mean_bot = np.mean(small_gray[70:, :])
+        mean_left = np.mean(small_gray[:, :30])
+        mean_right = np.mean(small_gray[:, 70:])
+        lighting_diff = max(abs(mean_top - mean_bot), abs(mean_left - mean_right))
+        if lighting_diff > 35.0:
+            requires_shadow = True
+
+        # Non-orthogonal border / perspective warp check
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        edges = cv2.Canny(blur, 50, 150)
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+            area = cv2.contourArea(c)
+            if area > (w * h * 0.35):
+                peri = cv2.arcLength(c, True)
+                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                if len(approx) == 4:
+                    requires_warp = True
+                    break
+
+        if hw_level in (HandwritingLevel.MOSTLY_HANDWRITTEN.value, HandwritingLevel.FULLY_HANDWRITTEN.value):
+            doc_type = self.HANDWRITTEN
+            conf = hw_conf
+            reason = f"Handwritten page (level={hw_level}, complexity={stroke_complexity})"
+        elif hw_level in (HandwritingLevel.MIXED.value, HandwritingLevel.FIELD_ONLY.value):
+            doc_type = self.MIXED
+            conf = 0.85
+            reason = f"Mixed printed and handwritten page (level={hw_level})"
+        elif requires_warp or requires_shadow:
+            doc_type = self.PHONE_PHOTO
+            conf = 0.88
+            reason = f"Phone photo capture page (warp={requires_warp}, shadow={requires_shadow})"
+        else:
+            doc_type = self.PRINTED_SCAN
+            conf = 0.92
+            reason = "Standard scanned page with uniform layout geometry"
+
+        return PageRoutingDecision(
+            page_num=page_num,
+            doc_type=doc_type,
+            confidence=conf,
+            is_digital_native=False,
+            requires_perspective_warp=requires_warp,
+            requires_shadow_removal=requires_shadow,
+            requires_stroke_enhancement=(hw_level != HandwritingLevel.NONE.value),
+            reason=reason,
+            handwriting_level=hw_level,
+            handwriting_confidence=hw_conf,
+            has_ruled_lines=has_ruled_lines,
+            stroke_complexity=stroke_complexity,
             ruled_line_count=ruled_count,
         )
 

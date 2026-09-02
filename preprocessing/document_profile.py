@@ -261,20 +261,22 @@ class DocumentProfile:
 
         return "\n".join(rendered_lines)
 
-    def find_words_in_box(self, box_norm: list[int], page: int = 1) -> list[WordToken]:
+    def find_words_in_box(self, box_norm: list[int], page: Optional[int] = None) -> list[WordToken]:
         """
         Finds all word tokens whose centers fall within the normalized bounding box.
         box_norm: [x1, y1, x2, y2] in 0-1000
+        If page is specified (1-indexed), filters strictly to that page.
+        If page is None, searches across all document pages.
         """
         x1, y1, x2, y2 = box_norm
         matched = []
         for w in self.words:
-            if w.page != page:
+            if page is not None and w.page != page:
                 continue
             cx, cy = w.center_norm
             if x1 <= cx <= x2 and y1 <= cy <= y2:
                 matched.append(w)
-        return sorted(matched, key=lambda w: (w.bbox_norm[1], w.bbox_norm[0]))
+        return sorted(matched, key=lambda w: (w.page, w.bbox_norm[1], w.bbox_norm[0]))
 
     def find_anchor_tokens(self, anchor_phrase: str, page: Optional[int] = None) -> list[list[WordToken]]:
         """
@@ -429,7 +431,12 @@ class DocumentProfile:
                     seen_word_keys.add(dedup_key)
 
                     conf = float(getattr(w, "confidence", 0.95))
-                    source = getattr(w, "source", "paddleocr") if not is_digital_native else "native_pdf"
+                    source = (
+                        getattr(w, "source", None)
+                        or getattr(block, "engine", None)
+                        or getattr(res, "engine", None)
+                        or ("native_pdf" if is_digital_native else "paddleocr")
+                    )
 
                     word_tokens.append(
                         WordToken(

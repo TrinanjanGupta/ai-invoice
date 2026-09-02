@@ -36,6 +36,8 @@ SOURCE_WEIGHTS: dict[str, float] = {
     "heuristic":        0.65,   # regex fallback
     "heuristic_reconciled": 0.70,
     "paddleocr":        0.75,   # OCR on clean image
+    "trocr":            0.85,   # fine-tuned handwriting OCR
+    "handwriting_specializer": 0.85,
     "easyocr":          0.65,   # fallback OCR
     "llm":              0.60,   # LLM guess
     "llm_unavailable":  0.00,
