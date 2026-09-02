@@ -337,22 +337,8 @@ class InvoicePipeline:
                 quality_score = qa.composite_score
                 for p in pages:
                     if hasattr(p, "image") and isinstance(p.image, np.ndarray):
-                        original_images.append(p.image.copy())
-                        if is_handwritten:
-                            hw_res = self.preprocessor.process_handwritten(
-                                p.image,
-                                handwriting_level=routing.handwriting_level,
-                                is_phone_photo=(routing.doc_type == DocumentRouter.PHONE_PHOTO),
-                            )
-                            p.image = hw_res.image
-                            if hasattr(p, "pil_image"):
-                                p.pil_image = hw_res.pil_image
-                            enhanced_images.append(hw_res.image)
-                        elif routing.doc_type == DocumentRouter.PHONE_PHOTO:
-                            p.image = self.preprocessor._remove_shadows(p.image)
-                            enhanced_images.append(p.image)
-                        else:
-                            enhanced_images.append(p.image)
+                        original_images.append(getattr(p, "original_image", p.image.copy()))
+                        enhanced_images.append(p.image)
         elif suffix in self.SUPPORTED_IMAGE_FORMATS:
             logger.info(f"[{job_id}] Stage 2: Image pre-processing (Route: {routing.doc_type}, HW: {routing.handwriting_level})")
             qa = self.quality_scorer.assess(file_bytes)
@@ -551,7 +537,7 @@ class InvoicePipeline:
                     handwriting_penalty=getattr(self.settings, "handwriting_confidence_penalty", 0.85),
                 )
                 sub_schema.job_id = child_job_id
-                child_invoices.append(PipelineResult(
+                child_res = PipelineResult(
                     job_id=child_job_id,
                     invoice=sub_schema,
                     validation_report=sub_val,
@@ -563,7 +549,46 @@ class InvoicePipeline:
                     doc_type=routing.doc_type,
                     quality_score=quality_score,
                     doc_profile=sub_profile,
-                ))
+                )
+                child_invoices.append(child_res)
+
+                if self.db is not None:
+                    try:
+                        import asyncio
+                        async def _record_seg(s=seg, cid=child_job_id):
+                            await self.db.record_document_segment(
+                                parent_job_id=job_id,
+                                child_job_id=cid,
+                                segment_index=s.segment_index,
+                                page_indices=s.page_indices,
+                                invoice_number_hint=s.invoice_number_hint,
+                                vendor_gstin_hint=s.vendor_gstin_hint,
+                            )
+                        try:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(_record_seg())
+                        except RuntimeError:
+                            asyncio.run(_record_seg())
+                    except Exception as seg_db_err:
+                        logger.debug(f"Document segment recording error: {seg_db_err}")
+
+            logger.info(f"[{job_id}] Finished processing {len(child_invoices)} split invoice segments. Returning parent container.")
+            first_child = child_invoices[0]
+            return PipelineResult(
+                job_id=job_id,
+                invoice=first_child.invoice,
+                validation_report=first_child.validation_report,
+                html_output=first_child.html_output,
+                pdf_path=None,
+                raw_ocr_texts=all_raw_ocr_texts,
+                page_count=page_count,
+                model_used="multi_invoice_split",
+                doc_type=routing.doc_type,
+                quality_score=quality_score,
+                doc_profile=None,
+                child_invoices=child_invoices,
+                document_segments=segments,
+            )
 
         # ── Stage 3: Build DocumentProfile & Multi-Stage TIE Retrieval ──────
         _notify("retrieval", 4, 70, "TIE Retrieval: Checking known layout templates")
@@ -572,6 +597,11 @@ class InvoicePipeline:
         all_regions_flat = []
         for r_list in all_page_regions:
             all_regions_flat.extend(r_list)
+
+        doc_page_sources = {
+            (p_idx + 1): ("native_pdf" if isinstance(p_obj, NativePDFPage) else "paddleocr")
+            for p_idx, p_obj in enumerate(pages)
+        }
 
         doc_profile = DocumentProfile.from_ocr_and_regions(
             ocr_results=combined_ocr_results,
@@ -582,6 +612,7 @@ class InvoicePipeline:
             is_digital_native=("native_pdf" in path_summary),
             quality_score=quality_score,
             page_dimensions=page_dimensions,
+            page_sources=doc_page_sources,
         )
 
         tpl_match = self.template_retriever.retrieve(doc_profile)
@@ -672,6 +703,7 @@ class InvoicePipeline:
         if routing.doc_type in ("HANDWRITTEN", "MIXED") or routing.handwriting_level != HandwritingLevel.NONE.value:
             from preprocessing.handwriting_cropper import HandwritingCropper
             from understanding.layoutlm import ExtractedField
+            from ocr.candidate_fusion import CandidateFusionEngine
             cropper = HandwritingCropper()
             for p_idx, p_obj in enumerate(pages):
                 pil_img = p_obj.pil_image
@@ -683,13 +715,21 @@ class InvoicePipeline:
                         handwriting_ocr=self.handwriting_ocr,
                     )
                     if cands:
-                        best_cand = cands[0]
+                        fused = CandidateFusionEngine.fuse_candidates(
+                            candidates=cands,
+                            field_name=crop.field_name,
+                            expected_type="numeric" if crop.field_name in ("grand_total", "subtotal", "tax_amount", "cgst", "sgst", "igst")
+                                          else ("gstin" if crop.field_name in ("vendor_gstin", "buyer_gstin") else "text"),
+                        )
                         curr_f = getattr(extracted, crop.field_name, None)
-                        if not curr_f or not curr_f.value or curr_f.confidence < best_cand.confidence:
+                        if not curr_f or not curr_f.value or curr_f.confidence < fused.confidence:
                             setattr(extracted, crop.field_name, ExtractedField(
-                                value=best_cand.text,
-                                confidence=best_cand.confidence,
-                                source="trocr" if best_cand.source == "trocr" else "handwriting_specializer",
+                                value=fused.selected_text,
+                                confidence=fused.confidence,
+                                source=fused.source,
+                                page=crop.page,
+                                bbox=crop.bbox,
+                                ocr_confidence=fused.confidence,
                             ))
 
             # Accounting equilibrium reconciliation across monetary fields
@@ -812,12 +852,15 @@ class InvoicePipeline:
                 ]:
                     f_val = getattr(invoice_schema, fname, None)
                     if f_val is not None and str(f_val).strip():
+                        prov = invoice_schema.field_provenance.get(fname, {})
                         field_decisions.append({
                             "field_name": fname,
                             "value": str(f_val),
-                            "confidence": invoice_schema.field_confidences.get(fname, 0.90),
-                            "source": primary_engine_label,
-                            "page": 1,
+                            "confidence": invoice_schema.field_confidences.get(fname, prov.get("confidence", 0.90)),
+                            "source": prov.get("source", primary_engine_label),
+                            "page": prov.get("page", 1),
+                            "bbox": prov.get("bbox", None),
+                            "ocr_confidence": prov.get("ocr_confidence", None),
                             "validation_status": "passed" if fname not in str(invoice_schema.review_reasons) else "flagged",
                         })
 

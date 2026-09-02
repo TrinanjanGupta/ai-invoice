@@ -118,6 +118,7 @@ class InvoiceSchema(BaseModel):
     disagreement_score: Optional[float] = 0.0
     is_novel_template: bool = False
     ground_truth_source: str = "auto_accepted"
+    field_provenance: dict[str, dict] = Field(default_factory=dict)
 
     def to_invoice_builder_json(self) -> dict:
         """
@@ -691,6 +692,24 @@ class InvoiceValidator:
             payment_terms=self._get_val(inv.payment_terms),
             remarks=self._get_val(getattr(inv, "remarks", None)),
             overall_confidence=inv.overall_confidence,
+            field_provenance={
+                fname: {
+                    "value": str(getattr(inv, fname).value),
+                    "confidence": float(getattr(getattr(inv, fname), "confidence", 0.90)),
+                    "source": str(getattr(getattr(inv, fname), "source", "ocr")),
+                    "page": int(getattr(getattr(inv, fname), "page", 1)),
+                    "bbox": getattr(getattr(inv, fname), "bbox", None),
+                    "ocr_confidence": getattr(getattr(inv, fname), "ocr_confidence", None),
+                }
+                for fname in [
+                    "invoice_number", "invoice_date", "due_date", "po_number", "place_of_supply",
+                    "vendor_name", "vendor_gstin", "vendor_pan", "vendor_email", "vendor_phone",
+                    "buyer_name", "buyer_gstin", "buyer_phone",
+                    "subtotal", "tax_amount", "grand_total", "cgst", "sgst", "igst",
+                    "bank_name", "branch_name", "account_name", "account_number", "ifsc_code"
+                ]
+                if getattr(inv, fname, None) and getattr(getattr(inv, fname), "value", None)
+            },
         )
 
 

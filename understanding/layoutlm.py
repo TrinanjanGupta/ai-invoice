@@ -23,7 +23,10 @@ from ocr.extractor import OCRWord, decompose_line_into_words
 class ExtractedField:
     value: str
     confidence: float
-    source: str   # "native_pdf", "layoutlm", "heuristic", or "llm"
+    source: str   # "native_pdf", "layoutlm", "heuristic", "trocr", "tie_fast_path", etc.
+    page: int = 1
+    bbox: Optional[list[float]] = None
+    ocr_confidence: Optional[float] = None
 
 
 # Quality multiplier per source — used by _merge_invoices to pick the

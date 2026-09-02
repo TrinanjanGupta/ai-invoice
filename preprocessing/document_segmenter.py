@@ -108,9 +108,54 @@ class DocumentSegmenter:
             text_length=len(clean_text),
         )
 
+    def compute_boundary_score(
+        self,
+        sig: PageSignals,
+        prev_sig: PageSignals,
+        current_inv_no: Optional[str],
+        current_gstin: Optional[str],
+    ) -> tuple[float, list[str]]:
+        """
+        Calculates a statistical multi-signal boundary score between adjacent pages.
+        Returns (score, explanations). Threshold >= 0.40 indicates a document split.
+        """
+        score = 0.0
+        reasons = []
+
+        # 1. Invoice Number Discontinuity (+0.35)
+        if sig.invoice_number and current_inv_no:
+            clean_curr = re.sub(r"[^A-Z0-9]", "", current_inv_no.upper())
+            clean_new = re.sub(r"[^A-Z0-9]", "", sig.invoice_number.upper())
+            if clean_curr and clean_new and clean_curr != clean_new and clean_new not in clean_curr:
+                score += 0.35
+                reasons.append(f"+0.35 inv_no_changed({clean_curr} -> {clean_new})")
+
+        # 2. Vendor GSTIN Discontinuity (+0.30)
+        if sig.vendor_gstin and current_gstin:
+            if sig.vendor_gstin.upper() != current_gstin.upper():
+                score += 0.30
+                reasons.append(f"+0.30 gstin_changed({current_gstin} -> {sig.vendor_gstin})")
+
+        # 3. New Invoice Title (+0.20)
+        if sig.has_invoice_title:
+            score += 0.20
+            reasons.append("+0.20 new_invoice_title")
+
+        # 4. Totals Block on Previous Page (+0.10)
+        if prev_sig.has_totals_block:
+            score += 0.10
+            reasons.append("+0.10 previous_page_had_totals")
+
+        # 5. Continuation Markers (-0.35)
+        if sig.has_continuation_marker:
+            score -= 0.35
+            reasons.append("-0.35 continuation_marker_present")
+
+        return score, reasons
+
     def segment(self, pages_text: dict[int, str]) -> list[DocumentSegment]:
         """
-        Segments a multi-page document into distinct invoice page groups.
+        Segments a multi-page document into distinct invoice page groups using multi-signal scoring.
         pages_text: dict mapping 1-indexed page numbers to raw extracted page text.
         """
         if not pages_text:
@@ -126,6 +171,7 @@ class DocumentSegmenter:
                     invoice_number_hint=signals.invoice_number,
                     vendor_gstin_hint=signals.vendor_gstin,
                     is_multi_page=False,
+                    confidence=1.0,
                 )
             ]
 
@@ -145,26 +191,11 @@ class DocumentSegmenter:
             sig = all_signals[p]
             prev_sig = all_signals[prev_p]
 
-            is_new_segment = False
-
-            # Condition A: Discontinuous Invoice Number on later page
-            if sig.invoice_number and current_inv_no:
-                clean_curr = re.sub(r"[^A-Z0-9]", "", current_inv_no.upper())
-                clean_new = re.sub(r"[^A-Z0-9]", "", sig.invoice_number.upper())
-                if clean_curr and clean_new and clean_curr != clean_new and clean_new not in clean_curr:
-                    is_new_segment = True
-
-            # Condition B: Different Vendor GSTIN on later page
-            if not is_new_segment and sig.vendor_gstin and current_gstin:
-                if sig.vendor_gstin.upper() != current_gstin.upper():
-                    is_new_segment = True
-
-            # Condition C: New explicit Invoice Title following a completed Totals block without continuation marker
-            if not is_new_segment:
-                if sig.has_invoice_title and prev_sig.has_totals_block and not sig.has_continuation_marker:
-                    is_new_segment = True
+            score, reasons = self.compute_boundary_score(sig, prev_sig, current_inv_no, current_gstin)
+            is_new_segment = score >= 0.40
 
             if is_new_segment:
+                logger.info(f"[DocumentSegmenter] Split at page {p} (Score: {score:.2f}, Reasons: {reasons})")
                 # Flush current segment
                 segments.append(
                     DocumentSegment(
@@ -173,6 +204,7 @@ class DocumentSegmenter:
                         invoice_number_hint=current_inv_no,
                         vendor_gstin_hint=current_gstin,
                         is_multi_page=len(current_pages) > 1,
+                        confidence=min(1.0, max(0.5, score)),
                     )
                 )
                 # Start new segment
@@ -195,6 +227,7 @@ class DocumentSegmenter:
                     invoice_number_hint=current_inv_no,
                     vendor_gstin_hint=current_gstin,
                     is_multi_page=len(current_pages) > 1,
+                    confidence=1.0,
                 )
             )
 

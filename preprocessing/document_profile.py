@@ -363,6 +363,7 @@ class DocumentProfile:
         quality_score: float = 1.0,
         page_num: int = 1,
         page_dimensions: Optional[dict[int, tuple[int, int]]] = None,
+        page_sources: Optional[dict[int, str]] = None,
     ) -> DocumentProfile:
         """
         Builds a DocumentProfile from OCR results and YOLO detected regions.
@@ -372,6 +373,7 @@ class DocumentProfile:
         h_safe = max(1, height)
         aspect_ratio = round(float(h_safe) / float(w_safe), 2)
         page_dims = page_dimensions or {}
+        sources_map = page_sources or {}
 
         # 1. Convert words to normalized WordTokens
         word_tokens: list[WordToken] = []
@@ -404,14 +406,17 @@ class DocumentProfile:
                 if not words_list:
                     # Decompose line into words if not already done
                     from ocr.extractor import decompose_line_into_words
-                    words_list = decompose_line_into_words(block)
+                    b_text = getattr(block, "text", "")
+                    b_bbox = getattr(block, "bbox", [0, 0, 0, 0])
+                    b_conf = float(getattr(block, "confidence", 0.95))
+                    words_list = decompose_line_into_words(b_text, b_bbox, b_conf)
 
                 for w_idx, w in enumerate(words_list):
                     w_text = getattr(w, "text", "")
                     if not w_text or not str(w_text).strip():
                         continue
 
-                    w_page = getattr(w, "page", block_page)
+                    w_page = block_page
                     w_p_w, w_p_h = page_dims.get(w_page, (p_w, p_h))
 
                     raw_box = getattr(w, "bbox", [0, 0, 0, 0])
@@ -431,12 +436,15 @@ class DocumentProfile:
                     seen_word_keys.add(dedup_key)
 
                     conf = float(getattr(w, "confidence", 0.95))
-                    source = (
-                        getattr(w, "source", None)
-                        or getattr(block, "engine", None)
-                        or getattr(res, "engine", None)
-                        or ("native_pdf" if is_digital_native else "paddleocr")
-                    )
+                    if w_page in sources_map:
+                        source = sources_map[w_page]
+                    else:
+                        source = (
+                            getattr(w, "source", None)
+                            or getattr(block, "engine", None)
+                            or getattr(res, "engine", None)
+                            or ("native_pdf" if is_digital_native else "paddleocr")
+                        )
 
                     word_tokens.append(
                         WordToken(
