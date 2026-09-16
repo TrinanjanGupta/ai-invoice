@@ -56,7 +56,14 @@ class HandwritingOCR:
             import torch
 
             logger.info(f"Loading Handwriting TrOCR model: {self.model_name}...")
-            self.processor = TrOCRProcessor.from_pretrained(self.model_name)
+            try:
+                self.processor = TrOCRProcessor.from_pretrained(self.model_name)
+            except Exception:
+                from transformers import AutoImageProcessor, AutoTokenizer
+                img_proc = AutoImageProcessor.from_pretrained(self.model_name)
+                tok = AutoTokenizer.from_pretrained("xlm-roberta-base")
+                self.processor = TrOCRProcessor(image_processor=img_proc, tokenizer=tok)
+
             self.model = VisionEncoderDecoderModel.from_pretrained(self.model_name)
             self.device = "cuda" if self.use_gpu and torch.cuda.is_available() else "cpu"
             self.model.to(self.device)

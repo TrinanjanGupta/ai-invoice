@@ -51,20 +51,38 @@ def expand_crop_margin(
 
 
 def crop_from_yolo_regions(
-    image: np.ndarray,
+    image: Any,
     regions: list[DetectedRegion],
-    enhanced_image: Optional[np.ndarray] = None,
+    enhanced_image: Optional[Any] = None,
     page: int = 1,
+    page_num: Optional[int] = None,
 ) -> list[FieldCrop]:
-    """Crops all detected handwriting/custom regions from full-page raster."""
-    h, w = image.shape[:2]
-    enh = enhanced_image if enhanced_image is not None else image
+    """Crops all detected handwriting/custom regions from full-page raster or PIL image."""
+    actual_page = page_num if page_num is not None else page
+
+    if hasattr(image, "convert") and not isinstance(image, np.ndarray):
+        img_arr = np.array(image)
+        if len(img_arr.shape) == 3 and img_arr.shape[2] == 3:
+            img_arr = cv2.cvtColor(img_arr, cv2.COLOR_RGB2BGR)
+    else:
+        img_arr = image
+
+    if img_arr is None or not hasattr(img_arr, "shape"):
+        return []
+
+    h, w = img_arr.shape[:2]
+    enh = enhanced_image if enhanced_image is not None else img_arr
+    if hasattr(enh, "convert") and not isinstance(enh, np.ndarray):
+        enh = np.array(enh)
+        if len(enh.shape) == 3 and enh.shape[2] == 3:
+            enh = cv2.cvtColor(enh, cv2.COLOR_RGB2BGR)
+
     crops: list[FieldCrop] = []
 
     for r in regions:
         exp_bbox = expand_crop_margin(r.bbox, w, h, margin_pct=0.04)
         x1, y1, x2, y2 = exp_bbox
-        orig_crop = image[y1:y2, x1:x2]
+        orig_crop = img_arr[y1:y2, x1:x2]
         enh_crop = enh[y1:y2, x1:x2]
 
         if orig_crop.size > 0:
@@ -75,7 +93,7 @@ def crop_from_yolo_regions(
                 bbox_page=exp_bbox,
                 label_text=r.label,
                 crop_source="yolo_region",
-                page=getattr(r, "page", page),
+                page=getattr(r, "page", actual_page),
             ))
 
     return crops
@@ -190,3 +208,54 @@ def crop_text_lines(region_crop: np.ndarray) -> list[np.ndarray]:
             line_crops.append(crop)
 
     return line_crops
+
+
+class HandwritingCropper:
+    """
+    Object-oriented wrapper and utility class for handwriting and anchor-based crop extraction.
+    """
+
+    @staticmethod
+    def expand_crop_margin(
+        bbox: list[int] | tuple[int, int, int, int],
+        img_w: int,
+        img_h: int,
+        margin_pct: float = 0.05,
+    ) -> list[int]:
+        return expand_crop_margin(bbox, img_w, img_h, margin_pct=margin_pct)
+
+    @staticmethod
+    def crop_from_yolo_regions(
+        image: Any,
+        regions: list[DetectedRegion],
+        enhanced_image: Optional[Any] = None,
+        page: int = 1,
+        page_num: Optional[int] = None,
+    ) -> list[FieldCrop]:
+        return crop_from_yolo_regions(
+            image=image,
+            regions=regions,
+            enhanced_image=enhanced_image,
+            page=page,
+            page_num=page_num,
+        )
+
+    @staticmethod
+    def crop_from_tie_anchors(
+        image: np.ndarray,
+        profile: DocumentProfile,
+        field_rules: list[dict],
+        enhanced_image: Optional[np.ndarray] = None,
+        page: int = 1,
+    ) -> list[FieldCrop]:
+        return crop_from_tie_anchors(
+            image=image,
+            profile=profile,
+            field_rules=field_rules,
+            enhanced_image=enhanced_image,
+            page=page,
+        )
+
+    @staticmethod
+    def crop_text_lines(region_crop: np.ndarray) -> list[np.ndarray]:
+        return crop_text_lines(region_crop)
