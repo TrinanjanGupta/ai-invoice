@@ -99,6 +99,7 @@ class RegionBlock:
     bbox_raw: list[float]
     confidence: float = 0.90
     page: int = 1
+    is_handwritten: bool = False
 
     @property
     def center_norm(self) -> tuple[float, float]:

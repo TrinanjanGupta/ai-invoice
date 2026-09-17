@@ -31,7 +31,7 @@ from config.settings import Settings
 from preprocessing.pipeline import InvoicePreprocessor
 from preprocessing.pdf_converter import PDFConverter, NativePDFPage, PreprocessResult
 from preprocessing.quality_scorer import DocumentQualityScorer, QualityAssessment
-from preprocessing.document_router import DocumentRouter, DocumentRoutingDecision
+from preprocessing.document_router import DocumentRouter, DocumentRoutingDecision, HandwritingLevel
 from preprocessing.document_profile import DocumentProfile
 from detection.detector import InvoiceDetector
 from ocr.extractor import InvoiceOCR, OCRResult, TextBlock, OCRWord
@@ -76,6 +76,22 @@ class PipelineResult:
     processing_context: Optional[ProcessingContext] = None
     child_invoices: list[Any] = field(default_factory=list)
     document_segments: list[Any] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Valid Invoice Fields Definition
+# ---------------------------------------------------------------------------
+
+VALID_INVOICE_FIELDS = {
+    "invoice_number", "invoice_date", "due_date", "po_number", "place_of_supply",
+    "category", "subcategory", "vendor_name", "vendor_address", "vendor_address_line1",
+    "vendor_address_line2", "vendor_gstin", "vendor_pan", "vendor_email", "vendor_phone",
+    "buyer_name", "buyer_address", "buyer_address_line1", "buyer_address_line2",
+    "buyer_gstin", "buyer_phone", "sls_code", "subtotal", "tax_rate", "tax_amount",
+    "discount", "round_off", "grand_total", "amount_in_words", "currency", "cgst",
+    "sgst", "igst", "bank_name", "branch_name", "account_name", "account_number",
+    "ifsc_code", "payment_terms", "remarks",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +174,7 @@ def _native_page_to_ocr_results(
         }
 
     # ── Assign each line to a detected region ──
-    region_line_groups: dict[str, list[list]] = {r.label: [] for r in det_regions}
+    region_line_groups: dict[str, list[list]] = {getattr(r, "label", "region"): [] for r in det_regions}
 
     for line_words in sorted_lines:
         # Centre of this line in pixel coords
@@ -167,9 +183,24 @@ def _native_page_to_ocr_results(
 
         placed = False
         for region in det_regions:
-            rx1, ry1, rx2, ry2 = region.bbox
+            r_label = getattr(region, "label", "region")
+            if hasattr(region, "bbox_raw") and region.bbox_raw:
+                rx1 = region.bbox_raw[0] * sx
+                ry1 = region.bbox_raw[1] * sy
+                rx2 = region.bbox_raw[2] * sx
+                ry2 = region.bbox_raw[3] * sy
+            elif hasattr(region, "bbox"):
+                rx1, ry1, rx2, ry2 = region.bbox
+            elif hasattr(region, "bbox_norm"):
+                rx1 = region.bbox_norm[0] / 1000.0 * img_w
+                ry1 = region.bbox_norm[1] / 1000.0 * img_h
+                rx2 = region.bbox_norm[2] / 1000.0 * img_w
+                ry2 = region.bbox_norm[3] / 1000.0 * img_h
+            else:
+                continue
+
             if rx1 <= cx <= rx2 and ry1 <= cy <= ry2:
-                region_line_groups[region.label].append(line_words)
+                region_line_groups[r_label].append(line_words)
                 placed = True
                 break
         if not placed:
@@ -398,41 +429,86 @@ class InvoicePipeline:
                 p_w, p_h = p_obj.image.size
             page_dimensions[p_num] = (p_w, p_h)
 
-            # ── YOLO region detection ──────────────────────────────────────
-            _notify("detection", 2, 35, f"Region Detection: YOLOv8 identifying zones (Page {p_num}/{page_count})")
-            det_res = self.detector.detect(p_obj.image)
-            detected_models.append(det_res.model_used)
-            # Tag each region with its exact page number
-            for r in det_res.regions:
-                if hasattr(r, "page"):
-                    r.page = p_num
-            all_page_regions.append(det_res.regions)
-            logger.info(
-                f"[{job_id}] Page {p_num}: {len(det_res.regions)} regions "
-                f"via {det_res.model_used}"
-            )
-
             # ── PATH A: Digital PDF page ───────────────────────────────────
             if isinstance(p_obj, NativePDFPage):
                 path_summary.append("native_pdf")
-                _notify("ocr", 3, 50, f"Extracting native PDF text (Page {p_num}/{page_count})")
+                _notify("ocr", 3, 50, f"Extracting native PDF vector layout (Page {p_num}/{page_count})")
+                
+                # Authoritative vector regions from PyMuPDF geometry
+                page_regions = list(p_obj.regions)
+                
+                # Run YOLO as advisory/secondary detector (detect stamps, signatures, or logos)
+                det_res = self.detector.detect(p_obj.image)
+                detected_models.append("native_vector_geometry")
+                for yr in det_res.regions:
+                    if yr.label in ("stamp", "signature", "handwriting") or yr.is_handwritten:
+                        page_regions.append(yr)
+                
+                for r in page_regions:
+                    if hasattr(r, "page"):
+                        r.page = p_num
+                all_page_regions.append(page_regions)
+                
                 logger.info(
-                    f"[{job_id}] Page {p_num}: PATH A — native text "
-                    f"({len(p_obj.words)} words, conf=0.99)"
+                    f"[{job_id}] Page {p_num}: PATH A — native vector geometry "
+                    f"({len(p_obj.words)} words, {len(page_regions)} regions, conf=0.99)"
                 )
-                p_ocr = _native_page_to_ocr_results(p_obj, det_res.regions)
+                p_ocr = _native_page_to_ocr_results(p_obj, page_regions)
                 pil_image = p_obj.pil_image
 
             # ── PATH B: Scanned page / direct image ────────────────────────
             else:
+                # ── YOLO region detection ──────────────────────────────────
+                _notify("detection", 2, 35, f"Region Detection: YOLOv8 identifying zones (Page {p_num}/{page_count})")
+                det_res = self.detector.detect(p_obj.image)
+                detected_models.append(det_res.model_used)
+                for r in det_res.regions:
+                    if hasattr(r, "page"):
+                        r.page = p_num
+                all_page_regions.append(det_res.regions)
+                logger.info(
+                    f"[{job_id}] Page {p_num}: {len(det_res.regions)} regions "
+                    f"via {det_res.model_used}"
+                )
                 path_summary.append("ocr")
                 _notify("ocr", 3, 60, f"OCR Extraction: PaddleOCR reading text (Page {p_num}/{page_count})")
                 logger.info(f"[{job_id}] Page {p_num}: PATH B — Scanned Image OCR")
 
                 p_ocr = {}
-                # Extract full page once; spatially intersect tokens into YOLO regions to eliminate duplicate OCR passes
-                full_res = self.ocr.extract_full_page(p_obj.image)
+                # Extract full page once; reconstruct layout into lines and blocks
+                raw_full_res = self.ocr.extract_full_page(p_obj.image)
+                
+                from ocr.layout_reconstructor import LayoutReconstructor
+                reconstructor = LayoutReconstructor(page_width=p_w, page_height=p_h)
+                full_res, macro_regions = reconstructor.reconstruct(
+                    raw_full_res.text_blocks,
+                    page_num=p_num,
+                    yolo_regions=det_res.regions,
+                )
                 p_ocr[f"full_page_p{p_num}"] = full_res
+
+                # Augment YOLO regions with reconstructed macro zones if YOLO missed any critical zones
+                from detection.detector import DetectedRegion
+                existing_labels = {getattr(r, "label", "region") for r in det_res.regions}
+                for mr in macro_regions:
+                    if mr.label not in existing_labels:
+                        raw_b = getattr(mr, "bbox_raw", None) or [0, 0, 0, 0]
+                        rx1 = int(max(0, raw_b[0]))
+                        ry1 = int(max(0, raw_b[1]))
+                        rx2 = int(min(p_w, raw_b[2]))
+                        ry2 = int(min(p_h, raw_b[3]))
+                        crop_arr = p_obj.image[ry1:ry2, rx1:rx2] if hasattr(p_obj, "image") and ry2 > ry1 and rx2 > rx1 else np.zeros((1, 1, 3), dtype=np.uint8)
+                        det_res.regions.append(
+                            DetectedRegion(
+                                label=mr.label,
+                                class_id=0,
+                                confidence=float(mr.confidence),
+                                bbox=(rx1, ry1, rx2, ry2),
+                                crop=crop_arr,
+                                page=p_num,
+                                is_handwritten=False,
+                            )
+                        )
 
                 if det_res.regions:
                     _notify("ocr", 3, 68, f"OCR Extraction: Mapping {len(det_res.regions)} structured region blocks (Page {p_num}/{page_count})")
@@ -441,7 +517,7 @@ class InvoicePipeline:
 
                 # Generate handwriting & numeric candidates for detected regions
                 is_hw_doc = routing.handwriting_level in ("MOSTLY_HANDWRITTEN", "FULLY_HANDWRITTEN", "MIXED")
-                hw_regions = [r for r in det_res.regions if r.is_handwritten or is_hw_doc]
+                hw_regions = [r for r in det_res.regions if getattr(r, "is_handwritten", False) or is_hw_doc]
                 if hw_regions:
                     enh_img = processing_ctx.enhanced_images[p_idx] if processing_ctx.enhanced_images and p_idx < len(processing_ctx.enhanced_images) else p_obj.image
                     crops = crop_from_yolo_regions(p_obj.image, hw_regions, enhanced_image=enh_img, page=p_num)
@@ -629,9 +705,35 @@ class InvoicePipeline:
                 template_version_id=tpl_match.matched_version_id,
                 match_type=tpl_match.match_type,
             )
-            # Use high-fidelity native digital PDF table items if available
-            if pages and isinstance(pages[0], NativePDFPage) and pages[0].line_items:
-                extracted.line_items = pages[0].line_items
+            # Use high-fidelity native digital PDF table items and fields if available
+            if pages and isinstance(pages[0], NativePDFPage):
+                if pages[0].line_items:
+                    extracted.line_items = pages[0].line_items
+                if getattr(pages[0], "extracted_fields", None):
+                    from understanding.layoutlm import ExtractedField
+                    for fn, fd in pages[0].extracted_fields.items():
+                        if fn in VALID_INVOICE_FIELDS:
+                            curr_f = getattr(extracted, fn, None)
+                            if not curr_f or not getattr(curr_f, "value", None):
+                                setattr(
+                                    extracted,
+                                    fn,
+                                    ExtractedField(
+                                        value=str(fd["value"]),
+                                        confidence=float(fd.get("confidence", 0.99)),
+                                        source=str(fd.get("source", "native_vector_geometry")),
+                                        page=1,
+                                        bbox=fd.get("bbox_norm"),
+                                        selection_reason=fd.get("selection_reason"),
+                                        candidates=[{
+                                            "value": str(fd["value"]),
+                                            "source": str(fd.get("source", "native_vector_geometry")),
+                                            "confidence": float(fd.get("confidence", 0.99)),
+                                            "page": 1,
+                                            "bbox_norm": fd.get("bbox_norm"),
+                                        }]
+                                    )
+                                )
 
             used_tie_fast_path = (tpl_match.match_type == "exact_version")
             primary_engine_label = "tie_fast_path" if tpl_match.match_type == "exact_version" else "tie_anchor_family"
@@ -644,13 +746,13 @@ class InvoicePipeline:
             tie_snapshot = {
                 f: getattr(extracted, f).value
                 for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
-                if getattr(extracted, f, None) and getattr(extracted, f).value
+                if getattr(extracted, f, None) and getattr(getattr(extracted, f, None), "value", None)
             }
             layoutlm_snapshot = {}
             heuristic_snapshot = {
                 f: getattr(global_heuristic, f).value
                 for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
-                if getattr(global_heuristic, f, None) and getattr(global_heuristic, f).value
+                if getattr(global_heuristic, f, None) and getattr(getattr(global_heuristic, f, None), "value", None)
             }
         else:
             # Unknown / Novel layout -> AI Pipeline (LayoutLM / Heuristic)
@@ -660,8 +762,34 @@ class InvoicePipeline:
                 pil_image = p_obj.pil_image
                 p_ocr = {k: v for k, v in combined_ocr_results.items() if f"p{p_idx+1}" in k or page_count == 1}
                 p_extracted = self.extractor.extract(p_ocr, image=pil_image)
-                if isinstance(p_obj, NativePDFPage) and p_obj.line_items:
-                    p_extracted.line_items = p_obj.line_items
+                if isinstance(p_obj, NativePDFPage):
+                    if p_obj.line_items:
+                        p_extracted.line_items = p_obj.line_items
+                    if getattr(p_obj, "extracted_fields", None):
+                        from understanding.layoutlm import ExtractedField
+                        for fn, fd in p_obj.extracted_fields.items():
+                            if fn in VALID_INVOICE_FIELDS and hasattr(p_extracted, fn):
+                                curr_f = getattr(p_extracted, fn)
+                                if not curr_f or not getattr(curr_f, "value", None) or getattr(curr_f, "confidence", 0.0) <= fd.get("confidence", 0.90):
+                                    setattr(
+                                        p_extracted,
+                                        fn,
+                                        ExtractedField(
+                                            value=str(fd["value"]),
+                                            confidence=float(fd.get("confidence", 0.99)),
+                                            source=str(fd.get("source", "native_vector_geometry")),
+                                            page=p_idx + 1,
+                                            bbox=fd.get("bbox_norm"),
+                                            selection_reason=fd.get("selection_reason"),
+                                            candidates=[{
+                                                "value": str(fd["value"]),
+                                                "source": str(fd.get("source", "native_vector_geometry")),
+                                                "confidence": float(fd.get("confidence", 0.99)),
+                                                "page": p_idx + 1,
+                                                "bbox_norm": fd.get("bbox_norm"),
+                                            }]
+                                        )
+                                    )
                 else:
                     table_ocr_res = (
                         p_ocr.get("line_items")
@@ -685,7 +813,7 @@ class InvoicePipeline:
             layoutlm_snapshot = {
                 f: getattr(extracted, f).value
                 for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
-                if getattr(extracted, f, None) and getattr(extracted, f).value
+                if getattr(extracted, f, None) and getattr(getattr(extracted, f, None), "value", None)
             }
 
             full_page_ocrs = {k: v for k, v in combined_ocr_results.items() if "full_page" in k}
@@ -694,13 +822,14 @@ class InvoicePipeline:
             heuristic_snapshot = {
                 f: getattr(global_heuristic, f).value
                 for f in ["invoice_number", "invoice_date", "vendor_name", "vendor_gstin", "subtotal", "tax_amount", "grand_total"]
-                if getattr(global_heuristic, f, None) and getattr(global_heuristic, f).value
+                if getattr(global_heuristic, f, None) and getattr(getattr(global_heuristic, f, None), "value", None)
             }
             extracted = self.extractor._merge_invoices(extracted, global_heuristic)
             primary_engine_label = "layoutlm" if self.extractor.model else "heuristic"
 
         # ── Stage 4a.1: Handwriting Candidate Extraction & Ambiguity Resolution ──
-        if routing.doc_type in ("HANDWRITTEN", "MIXED") or routing.handwriting_level != HandwritingLevel.NONE.value:
+        hw_lvl = getattr(routing, "handwriting_level", HandwritingLevel.NONE.value)
+        if routing.doc_type in ("HANDWRITTEN", "MIXED") or hw_lvl != HandwritingLevel.NONE.value:
             from preprocessing.handwriting_cropper import HandwritingCropper
             from understanding.layoutlm import ExtractedField
             from ocr.candidate_fusion import CandidateFusionEngine
@@ -721,25 +850,26 @@ class InvoicePipeline:
                             expected_type="numeric" if crop.field_name in ("grand_total", "subtotal", "tax_amount", "cgst", "sgst", "igst")
                                           else ("gstin" if crop.field_name in ("vendor_gstin", "buyer_gstin") else "text"),
                         )
-                        curr_f = getattr(extracted, crop.field_name, None)
-                        if not curr_f or not curr_f.value or curr_f.confidence < fused.confidence:
-                            setattr(extracted, crop.field_name, ExtractedField(
-                                value=fused.selected_text,
-                                confidence=fused.confidence,
-                                source=fused.source,
-                                page=crop.page,
-                                bbox=crop.bbox,
-                                ocr_confidence=fused.confidence,
-                            ))
+                        if crop.field_name in VALID_INVOICE_FIELDS:
+                            curr_f = getattr(extracted, crop.field_name, None)
+                            if not curr_f or not getattr(curr_f, "value", None) or getattr(curr_f, "confidence", 0.0) < fused.confidence:
+                                setattr(extracted, crop.field_name, ExtractedField(
+                                    value=fused.selected_text,
+                                    confidence=fused.confidence,
+                                    source=fused.source,
+                                    page=crop.page,
+                                    bbox=getattr(crop, "bbox_page", getattr(crop, "bbox", None)),
+                                    ocr_confidence=fused.confidence,
+                                ))
 
             # Accounting equilibrium reconciliation across monetary fields
             sub_val = getattr(extracted, "subtotal", None)
             tax_val = getattr(extracted, "tax_amount", None)
             tot_val = getattr(extracted, "grand_total", None)
-            if tot_val and tot_val.value:
+            if tot_val and getattr(tot_val, "value", None):
                 try:
-                    s_num = float(str(sub_val.value).replace(",", "")) if sub_val and sub_val.value else 0.0
-                    t_num = float(str(tax_val.value).replace(",", "")) if tax_val and tax_val.value else 0.0
+                    s_num = float(str(sub_val.value).replace(",", "")) if sub_val and getattr(sub_val, "value", None) else 0.0
+                    t_num = float(str(tax_val.value).replace(",", "")) if tax_val and getattr(tax_val, "value", None) else 0.0
                     g_num = float(str(tot_val.value).replace(",", ""))
                     winner = self.validator.reconcile_accounting_hypotheses(
                         candidate_map={},
@@ -762,7 +892,7 @@ class InvoicePipeline:
         needs_ai_enhancement = False
         for cf in critical_fields:
             cf_obj = getattr(extracted, cf, None)
-            if not cf_obj or not cf_obj.value or cf_obj.confidence < self.settings.llm_fallback_threshold:
+            if not cf_obj or not getattr(cf_obj, "value", None) or getattr(cf_obj, "confidence", 0.0) < self.settings.llm_fallback_threshold:
                 needs_ai_enhancement = True
                 break
 

@@ -41,6 +41,7 @@ venv.bak/
 .env
 .env.*
 *.env.local
+!.env.example
 
 # ===================================================================
 # ML Models, Weights & Checkpoints (Large binaries)
@@ -78,13 +79,19 @@ data/archive/
 data/outputs/
 data/temp_raw/
 data/evaluation/
+data/debug/
 data/templates_registry.json
 data/models/*.lock
-output/
 output/debug_viz/
 *.zip
 *.tar.gz
 *.lock
+
+# ===================================================================
+# Celery & Worker Runtime Artifacts
+# ===================================================================
+celerybeat-schedule*
+*.pid
 
 # ===================================================================
 # Label Studio Local State & SQLite DBs

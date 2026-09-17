@@ -27,24 +27,32 @@ class ExtractedField:
     page: int = 1
     bbox: Optional[list[float]] = None
     ocr_confidence: Optional[float] = None
+    candidates: list[dict] = field(default_factory=list)
+    selection_reason: Optional[str] = None
+    disagreement_score: Optional[float] = 0.0
 
 
 # Quality multiplier per source — used by _merge_invoices to pick the
 # best value when multiple sources disagree.
 SOURCE_WEIGHTS: dict[str, float] = {
-    "tie_template":     1.10,   # deterministic template extraction — highest priority
-    "tie_fast_path":    1.10,
-    "native_pdf":       1.00,   # direct from PDF text layer
-    "layoutlm":         0.85,   # model inference
-    "heuristic":        0.65,   # regex fallback
-    "heuristic_reconciled": 0.70,
-    "paddleocr":        0.75,   # OCR on clean image
-    "trocr":            0.85,   # fine-tuned handwriting OCR
-    "handwriting_specializer": 0.85,
-    "easyocr":          0.65,   # fallback OCR
-    "llm":              0.60,   # LLM guess
-    "llm_unavailable":  0.00,
-    "llm_error":        0.00,
+    "tie_template":                 1.10,   # deterministic template extraction — highest priority
+    "tie_fast_path":                1.10,
+    "native_vector_geometry":       1.05,   # direct vector geometry extraction
+    "native_vector_font_hierarchy": 1.05,   # vendor name font hierarchy
+    "native_vector_buyer_block":    1.05,   # buyer block vector extraction
+    "native_vector_regex":          1.05,   # exact regex on native text
+    "native_vector_totals":         1.05,   # exact totals from native text
+    "native_pdf":                   1.00,   # direct from PDF text layer
+    "layoutlm":                     0.85,   # model inference
+    "heuristic":                    0.65,   # regex fallback
+    "heuristic_reconciled":         0.70,
+    "paddleocr":                    0.75,   # OCR on clean image
+    "trocr":                        0.85,   # fine-tuned handwriting OCR
+    "handwriting_specializer":      0.85,
+    "easyocr":                      0.65,   # fallback OCR
+    "llm":                          0.60,   # LLM guess
+    "llm_unavailable":              0.00,
+    "llm_error":                    0.00,
 }
 
 # Major Indian Bank IFSC 4-letter prefix mapping

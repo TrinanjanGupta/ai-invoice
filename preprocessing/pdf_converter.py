@@ -45,12 +45,12 @@ class NativeWord:
 class NativePDFPage:
     """
     Represents one page of a digital PDF.
-    Contains the full native word list, structured line items, AND a low-DPI
-    raster image for YOLO region detection and LayoutLMv3.
+    Contains the full native word list, structured line items, authoritative vector regions,
+    direct field evidence, AND a low-DPI raster image for LayoutLMv3 / visual overlay.
     """
     words: list[NativeWord]
     full_text: str
-    image: np.ndarray          # BGR ndarray at 150 DPI (for YOLO)
+    image: np.ndarray          # BGR ndarray at 150 DPI (for preview / LayoutLMv3)
     pil_image: Image.Image     # RGB PIL image (for LayoutLMv3)
     page_width: float          # original page width in points
     page_height: float         # original page height in points
@@ -58,6 +58,9 @@ class NativePDFPage:
     dpi: int = 150
     is_digital: bool = True
     page_routing: Optional[PageRoutingDecision] = None
+    vector_page: Optional[Any] = None
+    regions: list[Any] = field(default_factory=list)
+    extracted_fields: dict[str, Any] = field(default_factory=dict)
 
 
 
@@ -220,10 +223,17 @@ class PDFConverter:
         full_text = " ".join(w.text for w in words)
         bgr, pil = _rasterize_page_low_dpi(page, dpi=self.LOW_DPI)
 
-        # Extract structured line items using TableExtractor
-        from understanding.table_extractor import TableExtractor
-        table_ext = TableExtractor()
-        line_items = table_ext.extract_tables_from_page(page)
+        # ── Vector Geometry & Direct Text Parsing ─────────────────────────
+        from preprocessing.native_pdf_parser import NativePDFParser
+        parser = NativePDFParser()
+        vec_page = parser.parse_page(page, page_num=page_num + 1)
+
+        # Extract structured line items using TableExtractor (or parser table items)
+        line_items = vec_page.table_items
+        if not line_items:
+            from understanding.table_extractor import TableExtractor
+            table_ext = TableExtractor()
+            line_items = table_ext.extract_tables_from_page(page)
 
         page_decision = self.document_router.route_page(
             bgr,
@@ -233,7 +243,7 @@ class PDFConverter:
 
         logger.debug(
             f"  Page {page_num + 1}: {len(words)} native words, {len(line_items)} table items, "
-            f"image={bgr.shape[1]}x{bgr.shape[0]}"
+            f"{len(vec_page.regions)} vector regions, image={bgr.shape[1]}x{bgr.shape[0]}"
         )
 
         return NativePDFPage(
@@ -247,6 +257,9 @@ class PDFConverter:
             dpi=self.LOW_DPI,
             is_digital=True,
             page_routing=page_decision,
+            vector_page=vec_page,
+            regions=vec_page.regions,
+            extracted_fields=vec_page.extracted_fields,
         )
 
     def _process_scanned_page(self, page: pymupdf.Page, page_num: int) -> PreprocessResult:

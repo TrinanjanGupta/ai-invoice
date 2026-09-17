@@ -320,6 +320,7 @@ class InvoiceSchema(BaseModel):
             payment_terms=bank.get("paymentTerms") or data.get("paymentTerms") or data.get("payment_terms"),
             remarks=data.get("remarks"),
             certified_remarks=certified_remarks,
+            field_provenance=data.get("field_provenance") or {},
         )
 
 
@@ -700,6 +701,9 @@ class InvoiceValidator:
                     "page": int(getattr(getattr(inv, fname), "page", 1)),
                     "bbox": getattr(getattr(inv, fname), "bbox", None),
                     "ocr_confidence": getattr(getattr(inv, fname), "ocr_confidence", None),
+                    "selection_reason": getattr(getattr(inv, fname), "selection_reason", None) or f"Extracted via {getattr(getattr(inv, fname), 'source', 'heuristic')}",
+                    "candidates": getattr(getattr(inv, fname), "candidates", []),
+                    "disagreement_score": float(getattr(getattr(inv, fname), "disagreement_score", 0.0) or 0.0),
                 }
                 for fname in [
                     "invoice_number", "invoice_date", "due_date", "po_number", "place_of_supply",

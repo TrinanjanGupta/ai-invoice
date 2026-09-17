@@ -11,6 +11,19 @@ import {
   Play, Cpu, X, Layers
 } from 'lucide-react'
 
+import {
+  DebugOverlaySvg,
+  DebugLayerControls,
+  DebugHoverTooltip,
+  FieldEvidenceInspector,
+  FIELD_NAME_MAP,
+  getCanonicalFieldName,
+  getFormFieldPath,
+  getFieldValue,
+  findOcrMatchesForValue,
+  getOcrTextInBox,
+} from '../components/DebugOverlay'
+
 // ── Number to Words Helper (Indian Numbering System) ──────────────────────────
 
 function numberToWords(num) {
@@ -202,6 +215,21 @@ export default function ReviewPage() {
   const [docSource, setDocSource] = useState('original') // 'original' | 'rendered'
   const [previewHtml, setPreviewHtml] = useState('')
 
+  // ── Invoice Debug Mode State ────────────────────────────────────────────────
+  const [isDebugMode, setIsDebugMode] = useState(false)
+  const [debugOverlay, setDebugOverlay] = useState(null)
+  const [isLoadingDebug, setIsLoadingDebug] = useState(false)
+  const [showYolo, setShowYolo] = useState(true)
+  const [showOcr, setShowOcr] = useState(true)
+  const [showAnchors, setShowAnchors] = useState(true)
+  const [showHandwriting, setShowHandwriting] = useState(true)
+  const [showFields, setShowFields] = useState(true)
+  const [activeEvidenceField, setActiveEvidenceField] = useState('grand_total')
+  const [hoveredDebugElement, setHoveredDebugElement] = useState(null)
+  const [showEvidenceInspector, setShowEvidenceInspector] = useState(true)
+  const [isLocateMode, setIsLocateMode] = useState(false)
+  const [isDrawMode, setIsDrawMode] = useState(false)
+
   // Document Viewer state
   const [docPage, setDocPage] = useState(0)
   const [docTotalPages, setDocTotalPages] = useState(1)
@@ -309,6 +337,24 @@ export default function ReviewPage() {
   useEffect(() => {
     return () => { if (rescanEsRef.current) rescanEsRef.current.close() }
   }, [])
+
+  // ── Load Invoice Debug Overlay Data ───────────────────────────────────────
+  useEffect(() => {
+    if (!isDebugMode || !jobId) return
+    let isMounted = true
+    setIsLoadingDebug(true)
+    axios.get(`/api/invoices/${jobId}/debug-overlay?page=${docPage}`)
+      .then(res => {
+        if (isMounted) setDebugOverlay(res.data)
+      })
+      .catch(err => {
+        console.debug('Debug overlay load error:', err)
+      })
+      .finally(() => {
+        if (isMounted) setIsLoadingDebug(false)
+      })
+    return () => { isMounted = false }
+  }, [isDebugMode, jobId, docPage])
 
 
   // ── Auto-Calculate Totals (Exact parity with InvoiceCalculationService) ────
@@ -593,7 +639,105 @@ export default function ReviewPage() {
     }
   }, [job, fetchJob])
 
-  // ── Form Updaters ──────────────────────────────────────────────────────────
+  // ── Form Updaters & Location Synced Editing ────────────────────────────────
+
+  // Handle manual or visual updates to bounding box location
+  const handleUpdateFieldBbox = useCallback((fieldName, newBboxNorm, matchedText = null) => {
+    if (!fieldName) return
+    setDebugOverlay(prev => {
+      if (!prev) return prev
+      const evidence = prev.field_evidence?.[fieldName] || {}
+      const updatedEvidence = {
+        ...evidence,
+        field_name: fieldName,
+        selected_value: matchedText || evidence.selected_value || getFieldValue(formDataRef.current, fieldName),
+        selected_source: 'human_corrected',
+        confidence: 1.0,
+        bbox_norm: newBboxNorm,
+        page: docPage + 1,
+        selection_reason: newBboxNorm ? 'Human adjusted bounding box on document' : 'Cleared location',
+        is_human_corrected: true,
+      }
+      const newFieldEvidence = {
+        ...prev.field_evidence,
+        [fieldName]: updatedEvidence,
+      }
+      return {
+        ...prev,
+        field_evidence: newFieldEvidence,
+        summary: {
+          ...prev.summary,
+          fields_located_count: Object.values(newFieldEvidence).filter(f => f.bbox_norm).length,
+        }
+      }
+    })
+    setDirty(true)
+    if (newBboxNorm) {
+      toast.success(`📍 Updated location for ${fieldName.replace('_', ' ')}: [${newBboxNorm.join(', ')}]`, { duration: 2000 })
+    } else {
+      toast('Cleared location for ' + fieldName.replace('_', ' '))
+    }
+    setIsLocateMode(false)
+    setIsDrawMode(false)
+  }, [docPage])
+
+  // Handle clicking an OCR box in "Pick Location" mode
+  const handlePickOcrBox = useCallback((ocrBox) => {
+    if (!activeEvidenceField || !ocrBox) return
+    handleUpdateFieldBbox(activeEvidenceField, ocrBox.bbox_norm, ocrBox.text)
+    const fieldPath = getFormFieldPath(activeEvidenceField)
+    if (fieldPath) {
+      const [sec, k] = fieldPath
+      const currentVal = formDataRef.current[sec]?.[k]
+      if (!currentVal || String(currentVal).trim() === '') {
+        setFormData(prev => ({
+          ...prev,
+          [sec]: {
+            ...prev[sec],
+            [k]: ocrBox.text,
+          }
+        }))
+        toast.success(`Populated ${activeEvidenceField.replace('_', ' ')} with "${ocrBox.text}"`)
+      }
+    }
+    setIsLocateMode(false)
+  }, [activeEvidenceField, handleUpdateFieldBbox])
+
+  // Handle syncing text from box directly into form
+  const handleUpdateFormField = useCallback((fieldName, newText) => {
+    const fieldPath = getFormFieldPath(fieldName)
+    if (!fieldPath) return
+    const [sec, k] = fieldPath
+    setFormData(prev => ({
+      ...prev,
+      [sec]: {
+        ...prev[sec],
+        [k]: newText,
+      }
+    }))
+    setDirty(true)
+    toast.success(`Updated ${fieldName.replace('_', ' ')}: "${newText}"`)
+  }, [])
+
+  // Quick jump & locate on document from form input
+  const locateFieldOnDocument = useCallback((fieldName, value) => {
+    setIsDebugMode(true)
+    setActiveEvidenceField(fieldName)
+    setShowEvidenceInspector(true)
+    if (activeTab === 'edit') {
+      setActiveTab('split')
+    }
+    if (value && debugOverlay?.ocr_boxes) {
+      const match = findOcrMatchesForValue(value, debugOverlay.ocr_boxes)
+      if (match) {
+        handleUpdateFieldBbox(fieldName, match.bbox_norm, match.matchedText)
+        toast.success(`📍 Found "${match.matchedText}" on document! Snapped location.`)
+        return
+      }
+    }
+    setIsLocateMode(true)
+    toast('Click text on document to anchor its location', { icon: '🎯' })
+  }, [activeTab, debugOverlay, handleUpdateFieldBbox])
 
   const updateSection = (section, key, val) => {
     setFormData(prev => ({
@@ -604,6 +748,41 @@ export default function ReviewPage() {
       }
     }))
     setDirty(true)
+
+    // Auto-locate & snap bounding box when pasting/typing value into form
+    const canonicalField = getCanonicalFieldName(section, key)
+    if (canonicalField && debugOverlay?.ocr_boxes && val && String(val).trim().length >= 2) {
+      const match = findOcrMatchesForValue(val, debugOverlay.ocr_boxes)
+      if (match) {
+        setDebugOverlay(prev => {
+          if (!prev) return prev
+          const evidence = prev.field_evidence?.[canonicalField] || {}
+          const newFieldEvidence = {
+            ...prev.field_evidence,
+            [canonicalField]: {
+              ...evidence,
+              field_name: canonicalField,
+              selected_value: String(val).trim(),
+              selected_source: 'human_pasted_snap',
+              confidence: 1.0,
+              bbox_norm: match.bbox_norm,
+              page: docPage + 1,
+              selection_reason: `Auto-snapped to OCR match "${match.matchedText}"`,
+              is_human_corrected: true,
+            }
+          }
+          return {
+            ...prev,
+            field_evidence: newFieldEvidence,
+            summary: {
+              ...prev.summary,
+              fields_located_count: Object.values(newFieldEvidence).filter(f => f.bbox_norm).length,
+            }
+          }
+        })
+        setActiveEvidenceField(canonicalField)
+      }
+    }
   }
 
   const updateItem = (index, field, val) => {
@@ -905,9 +1084,25 @@ export default function ReviewPage() {
     const isTrulyVerified = asVerified === true
     setSaving(true)
     try {
+      const fieldProvenance = {}
+      if (debugOverlay?.field_evidence) {
+        Object.entries(debugOverlay.field_evidence).forEach(([fn, ev]) => {
+          if (ev && ev.bbox_norm) {
+            fieldProvenance[fn] = {
+              bbox: ev.bbox_norm,
+              page: ev.page || (docPage + 1),
+              source: ev.selected_source || 'human_corrected',
+              confidence: 1.0,
+              value: ev.selected_value || getFieldValue(formData, fn),
+            }
+          }
+        })
+      }
+
       const payloadData = {
         ...formData,
         columns: columns,
+        field_provenance: fieldProvenance,
       }
       const { data } = await axios.patch(`/api/invoices/${jobId}`, {
         corrections: payloadData,
@@ -1518,6 +1713,33 @@ export default function ReviewPage() {
                   </button>
                 </div>
 
+                {/* Debug Layer Controls in Full Preview Mode */}
+                <DebugLayerControls
+                  isDebugMode={isDebugMode}
+                  setIsDebugMode={(val) => {
+                    setIsDebugMode(val)
+                    if (val) setShowEvidenceInspector(true)
+                  }}
+                  debugData={debugOverlay}
+                  isLoading={isLoadingDebug}
+                  showYolo={showYolo}
+                  setShowYolo={setShowYolo}
+                  showOcr={showOcr}
+                  setShowOcr={setShowOcr}
+                  showAnchors={showAnchors}
+                  setShowAnchors={setShowAnchors}
+                  showHandwriting={showHandwriting}
+                  setShowHandwriting={setShowHandwriting}
+                  showFields={showFields}
+                  setShowFields={setShowFields}
+                  activeField={activeEvidenceField}
+                  setActiveField={setActiveEvidenceField}
+                  isLocateMode={isLocateMode}
+                  setIsLocateMode={setIsLocateMode}
+                  isDrawMode={isDrawMode}
+                  setIsDrawMode={setIsDrawMode}
+                />
+
                 {docSource === 'original' && (
                   <div className="flex flex-wrap items-center gap-1.5">
                     {docTotalPages > 1 && (
@@ -1625,10 +1847,7 @@ export default function ReviewPage() {
               >
                 {docSource === 'original' ? (
                   <div className="w-full h-full flex items-center justify-center relative overflow-hidden">
-                    <img
-                      src={previewImageUrl}
-                      alt="Original Scanned Invoice"
-                      draggable={false}
+                    <div
                       style={{
                         width: `${zoomLevel}%`,
                         minWidth: `${zoomLevel}%`,
@@ -1638,9 +1857,44 @@ export default function ReviewPage() {
                         transition: isDragging ? 'none' : 'transform 0.12s cubic-bezier(0.4, 0, 0.2, 1), width 0.1s ease-out',
                         cursor: isDragging ? 'grabbing' : 'grab',
                         userSelect: 'none',
+                        position: 'relative',
+                        display: 'inline-block',
                       }}
-                      className="rounded-lg shadow-2xl bg-white border border-slate-800 select-none block pointer-events-auto"
-                    />
+                    >
+                      <img
+                        src={previewImageUrl}
+                        alt="Original Scanned Invoice"
+                        draggable={false}
+                        style={{ width: '100%', height: 'auto', display: 'block' }}
+                        className="rounded-lg shadow-2xl bg-white border border-slate-800 select-none pointer-events-auto"
+                      />
+
+                      {/* Interactive SVG Debug Bounding Box Overlay */}
+                      {isDebugMode && (
+                        <DebugOverlaySvg
+                          debugData={debugOverlay}
+                          showYolo={showYolo}
+                          showOcr={showOcr}
+                          showAnchors={showAnchors}
+                          showHandwriting={showHandwriting}
+                          showFields={showFields}
+                          activeField={activeEvidenceField}
+                          onSelectField={(f) => {
+                            setActiveEvidenceField(f)
+                            toast.success(`Inspecting field evidence: ${f}`, { duration: 1500 })
+                          }}
+                          hoveredElement={hoveredDebugElement}
+                          setHoveredElement={setHoveredDebugElement}
+                          isLocateMode={isLocateMode}
+                          onPickOcrBox={handlePickOcrBox}
+                          isDrawMode={isDrawMode}
+                          onUpdateFieldBbox={handleUpdateFieldBbox}
+                        />
+                      )}
+                    </div>
+
+                    {/* Interactive Debug Inspection Tooltip */}
+                    <DebugHoverTooltip hoveredElement={hoveredDebugElement} />
 
                     {/* Floating Pan & Zoom Hint */}
                     <div className="absolute bottom-3 right-3 bg-slate-900/85 backdrop-blur-xs text-[11px] text-slate-300 font-medium px-2.5 py-1 rounded-md border border-slate-700 pointer-events-none opacity-70">
@@ -1720,6 +1974,23 @@ export default function ReviewPage() {
                 
                 {/* Form Column */}
                 <div className={`${activeTab === 'split' ? 'xl:col-span-7 2xl:col-span-7' : 'w-full'} space-y-4`}>
+
+                  {/* ── Invoice Debug Mode: Field Evidence Inspector ── */}
+                  {isDebugMode && debugOverlay && showEvidenceInspector && (
+                    <FieldEvidenceInspector
+                      debugData={debugOverlay}
+                      activeField={activeEvidenceField}
+                      setActiveField={setActiveEvidenceField}
+                      formData={formData}
+                      onUpdateFieldBbox={handleUpdateFieldBbox}
+                      onUpdateFormField={handleUpdateFormField}
+                      isLocateMode={isLocateMode}
+                      setIsLocateMode={setIsLocateMode}
+                      isDrawMode={isDrawMode}
+                      setIsDrawMode={setIsDrawMode}
+                      onClose={() => setShowEvidenceInspector(false)}
+                    />
+                  )}
 
                 {/* Guided Stepper Header (When in Wizard Mode) */}
                 {isWizardMode && (
@@ -1808,13 +2079,24 @@ export default function ReviewPage() {
                           />
                         </div>
                         <div>
-                          <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Client / Agency Name <span className="text-red-500">*</span></label>
+                          <div className="flex items-center justify-between mb-1">
+                            <label className="block font-medium text-slate-600 dark:text-slate-400">Client / Agency Name <span className="text-red-500">*</span></label>
+                            <button
+                              type="button"
+                              onClick={() => locateFieldOnDocument('buyer_name', formData.client.name)}
+                              className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                              title="Locate & snap buyer name on invoice"
+                            >
+                              <Target size={11} /> Locate
+                            </button>
+                          </div>
                           <input
                             type="text"
                             className="field-input text-xs font-semibold text-slate-900 dark:text-white py-1.5"
                             placeholder="Recipient Agency Name"
                             value={formData.client.name}
                             onChange={e => updateSection('client', 'name', e.target.value)}
+                            onFocus={() => setActiveEvidenceField('buyer_name')}
                           />
                         </div>
                         <div>
@@ -1849,13 +2131,24 @@ export default function ReviewPage() {
                             />
                           </div>
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">GSTIN</label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">GSTIN</label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('buyer_gstin', formData.client.gstin)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap buyer GSTIN on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs uppercase font-mono py-1.5"
                               placeholder="19AAAAA0000A1Z5"
                               value={formData.client.gstin}
                               onChange={e => updateSection('client', 'gstin', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('buyer_gstin')}
                             />
                           </div>
                         </div>
@@ -1894,46 +2187,90 @@ export default function ReviewPage() {
 
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Invoice Number <span className="text-red-500">*</span></label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">Invoice Number <span className="text-red-500">*</span></label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('invoice_number', formData.meta.invoiceNo)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap invoice number on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs font-bold font-mono text-blue-700 dark:text-blue-400 py-1.5"
                               placeholder="INV-2024-001"
                               value={formData.meta.invoiceNo}
                               onChange={e => updateSection('meta', 'invoiceNo', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('invoice_number')}
                             />
                           </div>
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">PO / Work Order No.</label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">PO / Work Order No.</label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('po_number', formData.meta.poNumber)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap PO number on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs font-mono py-1.5"
                               placeholder="PO-2024-001"
                               value={formData.meta.poNumber || ''}
                               onChange={e => updateSection('meta', 'poNumber', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('po_number')}
                             />
                           </div>
                         </div>
 
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Invoice Date <span className="text-red-500">*</span></label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">Invoice Date <span className="text-red-500">*</span></label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('invoice_date', formData.meta.date)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap invoice date on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs py-1.5"
                               placeholder="DD/MM/YYYY"
                               value={formData.meta.date}
                               onChange={e => updateSection('meta', 'date', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('invoice_date')}
                             />
                           </div>
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Due Date</label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">Due Date</label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('due_date', formData.meta.dueDate)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap due date on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs py-1.5"
                               placeholder="DD/MM/YYYY"
                               value={formData.meta.dueDate}
                               onChange={e => updateSection('meta', 'dueDate', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('due_date')}
                             />
                           </div>
                         </div>
@@ -1966,13 +2303,24 @@ export default function ReviewPage() {
                       </div>
                       <div className="space-y-2.5 text-xs">
                         <div>
-                          <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Vendor / Company Name <span className="text-red-500">*</span></label>
+                          <div className="flex items-center justify-between mb-1">
+                            <label className="block font-medium text-slate-600 dark:text-slate-400">Vendor / Company Name <span className="text-red-500">*</span></label>
+                            <button
+                              type="button"
+                              onClick={() => locateFieldOnDocument('vendor_name', formData.company.name)}
+                              className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                              title="Locate & snap vendor name on invoice"
+                            >
+                              <Target size={11} /> Locate
+                            </button>
+                          </div>
                           <input
                             type="text"
                             className="field-input text-xs font-bold text-slate-900 dark:text-white py-1.5"
                             placeholder="Vendor Registered Name (Max 40 chars)"
                             value={formData.company.name}
                             onChange={e => updateSection('company', 'name', e.target.value)}
+                            onFocus={() => setActiveEvidenceField('vendor_name')}
                           />
                         </div>
                         <div>
@@ -2004,6 +2352,7 @@ export default function ReviewPage() {
                               placeholder="vendor@company.com"
                               value={formData.company.email}
                               onChange={e => updateSection('company', 'email', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('vendor_email')}
                             />
                           </div>
                           <div>
@@ -2019,23 +2368,45 @@ export default function ReviewPage() {
                         </div>
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">GSTIN</label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">GSTIN</label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('vendor_gstin', formData.company.gstin)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap vendor GSTIN on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs uppercase font-mono py-1.5"
                               placeholder="19AAAAA0000A1Z5"
                               value={formData.company.gstin}
                               onChange={e => updateSection('company', 'gstin', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('vendor_gstin')}
                             />
                           </div>
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">PAN</label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">PAN</label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('vendor_pan', formData.company.pan)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap vendor PAN on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs uppercase font-mono py-1.5"
                               placeholder="ABCDE1234F"
                               value={formData.company.pan}
                               onChange={e => updateSection('company', 'pan', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('vendor_pan')}
                             />
                           </div>
                         </div>
@@ -2051,13 +2422,24 @@ export default function ReviewPage() {
                       <div className="space-y-2.5 text-xs">
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">IFSC Code <span className="text-red-500">*</span></label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">IFSC Code <span className="text-red-500">*</span></label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('ifsc_code', formData.bankDetails.ifsc)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap IFSC code on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs uppercase font-mono font-semibold text-blue-700 dark:text-blue-400 py-1.5"
                               placeholder="SBIN0001234"
                               value={formData.bankDetails.ifsc}
                               onChange={e => updateSection('bankDetails', 'ifsc', e.target.value)}
+                              onFocus={() => setActiveEvidenceField('ifsc_code')}
                             />
                           </div>
                           <div>
@@ -2080,6 +2462,7 @@ export default function ReviewPage() {
                             placeholder="State Bank of India"
                             value={formData.bankDetails.bankName}
                             onChange={e => updateSection('bankDetails', 'bankName', e.target.value)}
+                            onFocus={() => setActiveEvidenceField('bank_name')}
                           />
                         </div>
 
@@ -2091,12 +2474,23 @@ export default function ReviewPage() {
                             placeholder="Vendor Company Name"
                             value={formData.bankDetails.accountName}
                             onChange={e => updateSection('bankDetails', 'accountName', e.target.value)}
+                            onFocus={() => setActiveEvidenceField('account_name')}
                           />
                         </div>
 
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <label className="block font-medium text-slate-600 dark:text-slate-400 mb-1">Account Number <span className="text-red-500">*</span></label>
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="block font-medium text-slate-600 dark:text-slate-400">Account Number <span className="text-red-500">*</span></label>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('account_number', formData.bankDetails.accountNumber)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap account number on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <input
                               type="text"
                               className="field-input text-xs font-mono font-semibold py-1.5"
@@ -2589,9 +2983,19 @@ export default function ReviewPage() {
                             </div>
                           )}
 
-                          <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800">
+                          <div className="flex justify-between items-center py-1 border-b border-slate-100 dark:border-slate-800">
                             <span className="text-slate-500 dark:text-slate-400">Taxable Amount</span>
-                            <span className="font-mono font-semibold text-slate-800 dark:text-slate-200">₹{formatAmount(formData.totals?.taxableAmount)}</span>
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-mono font-semibold text-slate-800 dark:text-slate-200">₹{formatAmount(formData.totals?.taxableAmount)}</span>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('subtotal', formData.totals?.taxableAmount)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 p-0.5 rounded transition-colors"
+                                title="Locate & snap taxable amount on invoice"
+                              >
+                                <Target size={11} />
+                              </button>
+                            </div>
                           </div>
 
                           <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800 text-slate-600 dark:text-slate-400">
@@ -2658,8 +3062,18 @@ export default function ReviewPage() {
                           </div>
 
                           {/* Grand Total */}
-                          <div className="flex justify-between pt-3 text-sm font-bold text-slate-900 dark:text-white border-t-2 border-slate-900 dark:border-slate-100">
-                            <span className="text-base">Grand Total</span>
+                          <div className="flex justify-between items-center pt-3 text-sm font-bold text-slate-900 dark:text-white border-t-2 border-slate-900 dark:border-slate-100">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-base">Grand Total</span>
+                              <button
+                                type="button"
+                                onClick={() => locateFieldOnDocument('grand_total', formData.totals?.grandTotal)}
+                                className="text-slate-400 hover:text-indigo-600 dark:hover:text-indigo-400 flex items-center gap-1 text-[10px] font-semibold transition-colors"
+                                title="Locate & snap Grand Total on invoice"
+                              >
+                                <Target size={11} /> Locate
+                              </button>
+                            </div>
                             <span className="font-mono text-lg text-blue-600 dark:text-blue-400">
                               Rs. {formatAmount(formData.totals?.grandTotal)}
                             </span>
@@ -2977,6 +3391,33 @@ export default function ReviewPage() {
                       </button>
                     </div>
 
+                    {/* Debug Layer Controls in Split View */}
+                    <DebugLayerControls
+                      isDebugMode={isDebugMode}
+                      setIsDebugMode={(val) => {
+                        setIsDebugMode(val)
+                        if (val) setShowEvidenceInspector(true)
+                      }}
+                      debugData={debugOverlay}
+                      isLoading={isLoadingDebug}
+                      showYolo={showYolo}
+                      setShowYolo={setShowYolo}
+                      showOcr={showOcr}
+                      setShowOcr={setShowOcr}
+                      showAnchors={showAnchors}
+                      setShowAnchors={setShowAnchors}
+                      showHandwriting={showHandwriting}
+                      setShowHandwriting={setShowHandwriting}
+                      showFields={showFields}
+                      setShowFields={setShowFields}
+                      activeField={activeEvidenceField}
+                      setActiveField={setActiveEvidenceField}
+                      isLocateMode={isLocateMode}
+                      setIsLocateMode={setIsLocateMode}
+                      isDrawMode={isDrawMode}
+                      setIsDrawMode={setIsDrawMode}
+                    />
+
                     {docSource === 'original' ? (
                       <div className="flex flex-wrap items-center gap-1">
                         {docTotalPages > 1 && (
@@ -3086,10 +3527,7 @@ export default function ReviewPage() {
                   >
                     {docSource === 'original' ? (
                       <div className="w-full h-full flex items-center justify-center relative overflow-hidden">
-                        <img
-                          src={previewImageUrl}
-                          alt="Original Scanned Document"
-                          draggable={false}
+                        <div
                           style={{
                             width: `${zoomLevel}%`,
                             minWidth: `${zoomLevel}%`,
@@ -3099,9 +3537,44 @@ export default function ReviewPage() {
                             transition: isDragging ? 'none' : 'transform 0.12s cubic-bezier(0.4, 0, 0.2, 1), width 0.1s ease-out',
                             cursor: isDragging ? 'grabbing' : 'grab',
                             userSelect: 'none',
+                            position: 'relative',
+                            display: 'inline-block',
                           }}
-                          className="rounded shadow-2xl bg-white border border-slate-800 select-none block pointer-events-auto"
-                        />
+                        >
+                          <img
+                            src={previewImageUrl}
+                            alt="Original Scanned Document"
+                            draggable={false}
+                            style={{ width: '100%', height: 'auto', display: 'block' }}
+                            className="rounded shadow-2xl bg-white border border-slate-800 select-none pointer-events-auto"
+                          />
+
+                          {/* Interactive SVG Debug Bounding Box Overlay */}
+                          {isDebugMode && (
+                            <DebugOverlaySvg
+                              debugData={debugOverlay}
+                              showYolo={showYolo}
+                              showOcr={showOcr}
+                              showAnchors={showAnchors}
+                              showHandwriting={showHandwriting}
+                              showFields={showFields}
+                              activeField={activeEvidenceField}
+                              onSelectField={(f) => {
+                                setActiveEvidenceField(f)
+                                toast.success(`Inspecting field evidence: ${f}`, { duration: 1500 })
+                              }}
+                              hoveredElement={hoveredDebugElement}
+                              setHoveredElement={setHoveredDebugElement}
+                              isLocateMode={isLocateMode}
+                              onPickOcrBox={handlePickOcrBox}
+                              isDrawMode={isDrawMode}
+                              onUpdateFieldBbox={handleUpdateFieldBbox}
+                            />
+                          )}
+                        </div>
+
+                        {/* Interactive Debug Inspection Tooltip */}
+                        <DebugHoverTooltip hoveredElement={hoveredDebugElement} />
 
                         {/* Floating Pan & Zoom Hint */}
                         <div className="absolute bottom-2 right-2 bg-slate-900/80 backdrop-blur-xs text-[10px] text-slate-400 font-medium px-2 py-0.5 rounded border border-slate-800 pointer-events-none opacity-60">

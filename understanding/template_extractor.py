@@ -235,10 +235,22 @@ class TemplateExtractor:
             )
 
             if res and res.value:
+                res_page = res.raw_tokens[0].page if res.raw_tokens else 1
+                source_label = "tie_template" if not is_family_match else "tie_family_anchor"
                 ext_field = ExtractedField(
                     value=str(res.value),
                     confidence=res.confidence,
-                    source="tie_template" if not is_family_match else "tie_family_anchor",
+                    source=source_label,
+                    page=res_page,
+                    bbox=res.bbox if res.bbox else None,
+                    selection_reason=f"TIE deterministic template rule ({res.strategy_used})" if not is_family_match else f"TIE family anchor spatial relative rule ({res.strategy_used})",
+                    candidates=[{
+                        "value": str(res.value),
+                        "source": source_label,
+                        "confidence": res.confidence,
+                        "page": res_page,
+                        "bbox": res.bbox,
+                    }]
                 )
                 setattr(extracted, f_name, ext_field)
                 field_confs[f_name] = res.confidence

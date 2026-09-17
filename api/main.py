@@ -113,6 +113,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+from api.debug_router import debug_router, cache_debug_overlay, build_debug_overlay_payload
+app.include_router(debug_router)
+
 
 # ------------------------------------------------------------------
 # Live Job Stage Progress Tracker
@@ -229,6 +232,7 @@ async def stream_all_jobs(request: Request):
 @app.post("/api/invoices/upload", response_model=JobResponse, tags=["Invoices"])
 async def upload_invoice(
     background_tasks: BackgroundTasks,
+    request: Request,
     file: UploadFile = File(...),
     settings: Settings = Depends(get_settings),
 ):
@@ -298,6 +302,7 @@ async def upload_invoice(
             logger.warning(f"Celery dispatch failed ({ce}), falling back to background runner")
 
     if not dispatched_celery:
+        pipeline = get_pipeline(request)
         background_tasks.add_task(
             _run_pipeline_task,
             job_id=job_id,
@@ -306,7 +311,7 @@ async def upload_invoice(
             storage_key=storage_key,
             db=db,
             minio=minio,
-            pipeline=app.state.pipeline,
+            pipeline=pipeline,
             settings=settings,
         )
         logger.info(f"Job queued in local worker pool: {job_id} ({filename})")
@@ -323,8 +328,9 @@ async def get_invoice_audit_trail(job_id: str):
 
 
 @app.post("/api/invoices/upload-batch", response_model=BatchJobResponse, tags=["Invoices"])
-async def upload_batch_invoices(
+async def upload_batch(
     background_tasks: BackgroundTasks,
+    request: Request,
     files: list[UploadFile] = File(...),
     settings: Settings = Depends(get_settings),
 ):
@@ -388,6 +394,7 @@ async def upload_batch_invoices(
                 logger.warning(f"[Batch] Celery dispatch failed ({ce}), falling back to background runner")
 
         if not dispatched_celery:
+            pipeline = get_pipeline(request)
             background_tasks.add_task(
                 _run_pipeline_task,
                 job_id=job_id,
@@ -396,7 +403,7 @@ async def upload_batch_invoices(
                 storage_key=storage_key,
                 db=db,
                 minio=minio,
-                pipeline=app.state.pipeline,
+                pipeline=pipeline,
                 settings=settings,
             )
             logger.info(f"[Batch] Queued job in local worker pool: {job_id} ({filename})")
@@ -1278,6 +1285,7 @@ def _get_raw_file_bytes(job_id: str, filename: str, storage_key: Optional[str] =
 async def reprocess_invoice(
     job_id: str,
     background_tasks: BackgroundTasks,
+    request: Request,
     settings: Settings = Depends(get_settings),
 ):
     """
@@ -1297,6 +1305,7 @@ async def reprocess_invoice(
     # Set status to processing
     await db.update_job(job_id, status="processing")
 
+    pipeline = get_pipeline(request)
     background_tasks.add_task(
         _run_pipeline_task,
         job_id=job_id,
@@ -1305,7 +1314,7 @@ async def reprocess_invoice(
         storage_key=record.storage_key,
         db=db,
         minio=minio,
-        pipeline=app.state.pipeline,
+        pipeline=pipeline,
         settings=settings,
     )
     return {"status": "processing", "job_id": job_id, "filename": record.filename}
@@ -1314,6 +1323,7 @@ async def reprocess_invoice(
 @app.post("/api/invoices/reprocess-all", tags=["Invoices"])
 async def reprocess_all_invoices(
     background_tasks: BackgroundTasks,
+    request: Request,
     only_unreviewed: bool = True,
     limit: int = 100,
     settings: Settings = Depends(get_settings),
@@ -1329,6 +1339,7 @@ async def reprocess_all_invoices(
 
     queued = []
     skipped = []
+    pipeline = get_pipeline(request)
 
     for r in records:
         if only_unreviewed and r.status == "reviewed":
@@ -1349,7 +1360,7 @@ async def reprocess_all_invoices(
             storage_key=r.storage_key,
             db=db,
             minio=minio,
-            pipeline=app.state.pipeline,
+            pipeline=pipeline,
             settings=settings,
         )
         queued.append({"job_id": r.job_id, "filename": r.filename})
@@ -1469,6 +1480,7 @@ async def get_template_details(version_id: str):
 async def retry_invoice(
     job_id: str,
     background_tasks: BackgroundTasks,
+    request: Request,
     settings: Settings = Depends(get_settings),
 ):
     """
@@ -1495,6 +1507,7 @@ async def retry_invoice(
         "stage_label": "Queued for retry: Waiting for worker slot...",
     })
 
+    pipeline = get_pipeline(request)
     background_tasks.add_task(
         _run_pipeline_task,
         job_id=job_id,
@@ -1503,7 +1516,7 @@ async def retry_invoice(
         storage_key=record.storage_key,
         db=db,
         minio=minio,
-        pipeline=app.state.pipeline,
+        pipeline=pipeline,
         settings=settings,
     )
     return {"status": "processing", "job_id": job_id, "filename": record.filename}
@@ -1512,6 +1525,7 @@ async def retry_invoice(
 @app.post("/api/invoices/retry-all-failed", tags=["Invoices"])
 async def retry_all_failed_invoices(
     background_tasks: BackgroundTasks,
+    request: Request,
     settings: Settings = Depends(get_settings),
 ):
     """
@@ -1522,6 +1536,7 @@ async def retry_all_failed_invoices(
     records, _ = await db.list_jobs(limit=200, status="failed")
 
     retried = []
+    pipeline = get_pipeline(request)
     for r in records:
         file_bytes = _get_raw_file_bytes(r.job_id, r.filename, r.storage_key, minio)
         if not file_bytes:
@@ -1544,7 +1559,7 @@ async def retry_all_failed_invoices(
             storage_key=r.storage_key,
             db=db,
             minio=minio,
-            pipeline=app.state.pipeline,
+            pipeline=pipeline,
             settings=settings,
         )
         retried.append({"job_id": r.job_id, "filename": r.filename})
@@ -1643,6 +1658,15 @@ async def _run_pipeline_task(
                 "stage_label": "Pre-processing: Initializing document...",
             })
 
+            # Ensure pipeline instance is ready even if background warmup is still running
+            if pipeline is None:
+                pipeline = getattr(app.state, "pipeline", None)
+            if pipeline is None:
+                logger.info(f"[{job_id}] Initializing InvoicePipeline on demand...")
+                from api.pipeline_runner import InvoicePipeline
+                pipeline = InvoicePipeline(settings, db_manager=db, minio_manager=minio)
+                app.state.pipeline = pipeline
+
             # Ensure TIE retriever index is loaded with active DB templates
             if pipeline and hasattr(pipeline, "template_retriever") and db:
                 if not pipeline.template_retriever._in_memory_index:
@@ -1660,6 +1684,18 @@ async def _run_pipeline_task(
 
             if result and getattr(result, "doc_profile", None):
                 _job_profiles[job_id] = result.doc_profile
+                try:
+                    for p_idx in range(getattr(result, "page_count", 1)):
+                        dbg_data = build_debug_overlay_payload(
+                            job_id=job_id,
+                            page_idx=p_idx,
+                            doc_profile=result.doc_profile,
+                            invoice_dict=result.invoice.model_dump(),
+                            validation_report=result.validation_report,
+                        )
+                        cache_debug_overlay(job_id, p_idx, dbg_data)
+                except Exception as dbg_ex:
+                    logger.debug(f"Failed to pre-cache debug overlay for {job_id}: {dbg_ex}")
 
         # Upload PDF to MinIO
         pdf_key = None

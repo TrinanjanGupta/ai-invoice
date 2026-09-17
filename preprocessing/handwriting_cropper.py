@@ -29,6 +29,11 @@ class FieldCrop:
     crop_source: str = "yolo_region"  # "yolo_region" | "tie_anchor" | "spatial_zone"
     page: int = 1
 
+    @property
+    def bbox(self) -> list[int]:
+        """Convenience alias for bbox_page."""
+        return self.bbox_page
+
 
 def expand_crop_margin(
     bbox: list[int] | tuple[int, int, int, int],
@@ -80,7 +85,8 @@ def crop_from_yolo_regions(
     crops: list[FieldCrop] = []
 
     for r in regions:
-        exp_bbox = expand_crop_margin(r.bbox, w, h, margin_pct=0.04)
+        r_b = getattr(r, "bbox", None) or getattr(r, "bbox_raw", [0, 0, 0, 0])
+        exp_bbox = expand_crop_margin(r_b, w, h, margin_pct=0.04)
         x1, y1, x2, y2 = exp_bbox
         orig_crop = img_arr[y1:y2, x1:x2]
         enh_crop = enh[y1:y2, x1:x2]
